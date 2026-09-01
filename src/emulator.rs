@@ -83,6 +83,20 @@ impl Emulator {
         let cycles = self.cpu.step(&mut self.mmu);
         self.instructions += 1;
         self.t_cycles += cycles as u64;
+
+        // --- Diagnostic de blocage HALT : "battement de cœur" toutes les 10 000 instructions ---
+        if self.cpu.halted && self.instructions.is_multiple_of(10000) {
+            log::debug!(
+                "[CPU] STUCK IN HALT: PC=${:04X}, IF={:02X}, IE={:02X}, IME={}, PPU_Mode={}, LY={}",
+                self.cpu.pc,
+                self.mmu.io[0x0F],
+                self.mmu.ie,
+                if self.cpu.ime { "ON" } else { "OFF" },
+                self.mmu.ppu.mode,
+                self.mmu.ppu.ly,
+            );
+        }
+
         // La PPU avance du même nombre de T-cycles (timing LY/mode, Pan Docs « Rendering »).
         let _frame_done = self.mmu.ppu.advance(cycles as u64);
 
