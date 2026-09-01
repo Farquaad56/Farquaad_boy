@@ -126,6 +126,7 @@ impl Serial {
     }
 
     /// Transcript complet des octets transmis (consommé — le buffer est vidé).
+    #[allow(dead_code)] // Utilisé uniquement par les tests dans la cible binaire
     pub fn take_transcript(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.transcript)
     }

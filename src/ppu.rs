@@ -1,8 +1,9 @@
 //! Pixel Processing Unit : registres PPU ($FF40-$FF4B), timing et framebuffer (160×144).
 //!
 //! Étape 1 — fondation : les douze registres 8 bits de la PPU ($FF40-$FF4B, dont le DMA OAM $FF46),
-//! leurs sémantiques de lecture/écriture (Pan Docs « LCDC », « STAT ») et l'état power-on
-//! (Pan Docs « Power-On Values » : LY = 0, LCDC = $91, BGP/OBP0/OBP1 = $FC).
+//! leurs sémantiques de lecture/écriture (Pan Docs « LCDC », « STAT ») et l'état post-boot ROM
+//! (PanDocs « Power Up Sequence » : LY = 0, LCDC = $91, BGP = $FC ; OBP0/OBP1 sont laissées non
+//! initialisées par le boot ROM — la valeur la plus fréquente, $FF, est retenue).
 //! Étape 2 — timing : la PPU avance en T-cycles (456 dots/ligne, 154 lignes/frame), suit LY et le mode
 //! (OAM Scan/Drawing/HBlank/VBlank) selon Pan Docs « Rendering », et génère les requêtes d'interruption
 //! VBlank et STAT (Pan Docs « Interrupt Sources »). Le LCD éteint (bit 7 de LCDC à 0) gèle la PPU.
@@ -127,8 +128,9 @@ pub struct PPU {
 }
 
 impl PPU {
-    /// Crée une PPU à l'état power-on (Pan Docs « Power-On Values ») : LCDC = $91 (LCD allumé,
-    /// fond activé, fenêtre éteinte), BGP/OBP0/OBP1 = $FC, les autres registres valent $00 ; LY = 0
+    /// Crée une PPU à l'état post-boot ROM (PanDocs « Power Up Sequence ») : LCDC = $91 (LCD allumé,
+    /// fond activé, fenêtre éteinte), BGP = $FC ; OBP0/OBP1 sont laissées non initialisées par le boot
+    /// ROM — la valeur la plus fréquente, $FF, est retenue. Les autres registres valent $00 ; LY = 0
     /// et le compteur de dots est à 0. Le LCD étant allumé au power-on, la PPU démarre en mode 2
     /// (OAM Scan) sur la ligne 0 ; le framebuffer est noir opaque (aucune frame rendue).
     pub fn new() -> Self {
@@ -141,8 +143,8 @@ impl PPU {
             lyc: 0x00,
             dma: 0x00,
             bgp: 0xFC,  // valeurs de pixel 0-1 → teinte claire, 2-3 → teinte foncée (Pan Docs « Power-On Values »)
-            obp0: 0xFC,
-            obp1: 0xFC,
+            obp0: 0xFF, // non initialisées par le boot ROM — valeur la plus fréquente (PanDocs « Power Up Sequence »)
+            obp1: 0xFF,
             wx: 0x00,
             wy: 0x00,
             dots: 0,    // début de la scanline 0
@@ -462,8 +464,8 @@ mod tests {
         assert_eq!(ppu.lyc, 0x00);
         assert_eq!(ppu.dma, 0x00);
         assert_eq!(ppu.bgp, 0xFC);
-        assert_eq!(ppu.obp0, 0xFC);
-        assert_eq!(ppu.obp1, 0xFC);
+        assert_eq!(ppu.obp0, 0xFF); // non initialisées par le boot ROM — valeur la plus fréquente (PanDocs « Power Up Sequence »)
+        assert_eq!(ppu.obp1, 0xFF);
         assert_eq!(ppu.wx, 0x00);
         assert_eq!(ppu.wy, 0x00);
         assert_eq!(ppu.dots, 0); // début de la scanline 0

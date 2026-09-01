@@ -41,7 +41,8 @@ enum ReloadState {
 
 pub struct Timer {
     /// Compteur système interne : s'incrémente à chaque T-cycle ; DIV = bits [15..8].
-    counter: u16,
+    /// Placé à $AB00 dans l'état post-boot ROM (DIV se lit alors $AB — PanDocs « Power Up Sequence »).
+    pub counter: u16,
     /// Registre TIMA ($FF05) : compteur de timer.
     tima: u8,
     /// Registre TMA ($FF06) : valeur rechargée dans TIMA au débordement.

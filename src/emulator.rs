@@ -2,6 +2,11 @@
 //!
 //! Partie 5 : rendu du Background ; la ROM chargée est exécutée directement à $0100 (état post-boot ROM).
 //! Partie 6 : opcodes CPU complets et bug HALT.
+//! Étape 2 : les registres I/O matériels repartent aux valeurs laissées par le boot ROM DMG au hand-off
+//! PC=$0100 (PanDocs « Power Up Sequence ») — P1 = $CF, SC = $7E, DIV = $AB, TAC = $F8, OBP0/OBP1 = $FF.
+//! Étape 3 : le rendu est forcé à chaque frontière de frame même LCD éteint (bit 7 de LCDC à 0) — la PPU
+//! gèle son timing mais le compteur global de T-cycles continue d'avancer, donc l'écran devient noir au
+//! lieu de rester figé (règle interne de `render_frame`).
 
 use crate::cpu::CPU;
 use crate::mmu::MMU;
@@ -23,14 +28,16 @@ pub struct Emulator {
 }
 
 impl Emulator {
-    /// Crée un émulateur à l'état power-on (aucune ROM chargée).
+    /// Crée un émulateur à l'état power-on post-boot ROM (aucune ROM chargée).
     pub fn new() -> Self {
-        Self {
+        let mut emu = Self {
             cpu: CPU::new(),
             mmu: MMU::new(),
             t_cycles: 0,
             instructions: 0,
-        }
+        };
+        emu.power_on(); // état post-boot ROM : CPU + registres I/O matériels (PanDocs « Power Up Sequence »)
+        emu
     }
 
     /// Charge une ROM `.gb` et redémarre le système à l'état power-on post-boot ROM ; la ROM est exécutée immédiatement à $0100.
@@ -44,12 +51,19 @@ impl Emulator {
         self.power_on();
     }
 
-    /// État power-on : CPU/PPU réinitialisés, prêt à exécuter la ROM chargée.
+    /// État power-on post-boot ROM : CPU/PPU/SCC/timer réinitialisés, registres I/O matériels aux valeurs
+    /// laissées par le boot ROM DMG au hand-off PC=$0100 (PanDocs « Power Up Sequence »), prêt à exécuter la ROM chargée.
     fn power_on(&mut self) {
         self.cpu = CPU::new(); // Contient déjà l'état post-boot ROM (PC=0x0100, SP=$FFFE, registres corrects)
-        self.mmu.ppu = PPU::default();
-        self.mmu.serial = Serial::default(); // la SCC repart à l'état power-on (transcript vidé)
-        self.mmu.timer = Timer::default(); // le timer repart à l'état power-on (DIV/TIMA/TMA/TAC = $00)
+        self.mmu.ppu = PPU::default(); // OBP0/OBP1 ($FF48/$FF49) valent $FF : non initialisées par le boot ROM → valeur la plus fréquente
+        self.mmu.serial = Serial::new(); // la SCC repart à l'état power-on (transcript vidé)
+        self.mmu.timer = Timer::new(); // le timer repart à l'état power-on (TIMA/TMA = $00, TAC se lit $F8 → désactivé)
+
+        // Registres I/O non remis à $00 par le boot ROM DMG (colonne DMG/MGB de PanDocs « Power Up Sequence »).
+        self.mmu.io[0x00] = 0xCF; // P1 ($FF00) : joypad, aucun bouton pressé
+        self.mmu.serial.sc = 0x7E; // SC ($FF02) : bits 6..1 non écriturables par le logiciel — la valeur post-boot est conservée telle quelle
+        self.mmu.timer.counter = (0xABu16) << 8; // DIV ($FF04) se lit $AB (dépend du timing sur le matériel réel ; valeur enregistrée au hand-off retenue)
+
         self.t_cycles = 0;
         self.instructions = 0;
     }
@@ -58,11 +72,15 @@ impl Emulator {
     pub fn step(&mut self) -> u32 {
         let cycles = self.cpu.step(&mut self.mmu);
         self.instructions += 1;
+        let prev_t_cycles = self.t_cycles;
         self.t_cycles += cycles as u64;
         // La PPU avance du même nombre de T-cycles (timing LY/mode, Pan Docs « Rendering »).
         let frame_done = self.mmu.ppu.advance(cycles as u64);
-        if frame_done {
+        if frame_done || prev_t_cycles / FRAME_TCYCLES != self.t_cycles / FRAME_TCYCLES {
             // Une frame vidéo est achevée : le rendu Background/Fenêtre/Sprites met à jour le framebuffer.
+            // Le LCD éteint (bit 7 de LCDC à 0) gèle la PPU — advance() renvoie alors false, mais le
+            // compteur global de T-cycles continue d'avancer : on force un rendu à chaque frontière de
+            // frame pour que la PPU applique sa règle interne (écran noir au lieu d'écran figé).
             self.mmu.ppu.render_frame(&self.mmu.vram, &self.mmu.oam);
         }
         // Les requêtes d'interruption PPU en attente lèvent les bits correspondants de IF ($FF0F).
@@ -152,6 +170,46 @@ mod tests {
     }
 
     #[test]
+    fn post_boot_io_registers_match_pandocs() {
+        let emu = Emulator::new();
+        // Valeurs I/O laissées par le boot ROM DMG au hand-off PC=$0100 (PanDocs « Power Up Sequence », colonne DMG/MGB).
+        assert_eq!(emu.mmu.read(0xFF00), 0xCF); // P1 : joypad, aucun bouton pressé
+        assert_eq!(emu.mmu.read(0xFF02), 0x7E); // SC : valeur post-boot (bits 6..1 non écriturables par le logiciel)
+        assert_eq!(emu.mmu.read(0xFF04), 0xAB); // DIV : valeur enregistrée au hand-off
+        assert_eq!(emu.mmu.read(0xFF05), 0x00); // TIMA
+        assert_eq!(emu.mmu.read(0xFF06), 0x00); // TMA
+        assert_eq!(emu.mmu.read(0xFF07), 0xF8); // TAC : bits 7-3 lus à 1, timer désactivé
+        assert_eq!(emu.mmu.read(0xFF48), 0xFF); // OBP0 : non initialisée par le boot ROM → valeur la plus fréquente
+        assert_eq!(emu.mmu.read(0xFF49), 0xFF); // OBP1
+
+        // L'état CPU post-boot ROM est inchangé.
+        assert_eq!(emu.cpu.pc, 0x0100);
+        assert_eq!(emu.cpu.sp, 0xFFFE);
+        assert_eq!(emu.cpu.af(), 0x01B0);
+    }
+
+    #[test]
+    fn reset_restores_post_boot_io_registers() {
+        let mut emu = Emulator::new();
+        emu.load_rom(vec![0xFF; 0x4000]);
+
+        // La ROM « salit » les registres I/O…
+        emu.mmu.write(0xFF00, 0x00);
+        emu.mmu.write(0xFF02, 0x81); // transfert série démarré
+        emu.mmu.timer.write_div(0x42); // le compteur système est remis à zéro → DIV = $00
+        emu.mmu.ppu.obp0 = 0xE4;
+
+        // …et un reset les ramène aux valeurs post-boot ROM.
+        emu.reset();
+        assert_eq!(emu.mmu.read(0xFF00), 0xCF);
+        assert_eq!(emu.mmu.read(0xFF02), 0x7E);
+        assert_eq!(emu.mmu.read(0xFF04), 0xAB);
+        assert_eq!(emu.mmu.read(0xFF07), 0xF8);
+        assert_eq!(emu.mmu.read(0xFF48), 0xFF);
+        assert_eq!(emu.mmu.read(0xFF49), 0xFF);
+    }
+
+    #[test]
     fn cpu_executes_test_program() {
         let mut emu = Emulator::new();
         emu.load_test_program();
@@ -179,6 +237,23 @@ mod tests {
         // La PPU a achevé exactement une frame : retour à la ligne 0, OAM Scan.
         assert_eq!(emu.mmu.ppu.ly, 0);
         assert_eq!(emu.mmu.ppu.mode, 2);
+    }
+
+    #[test]
+    fn lcd_off_renders_black_at_each_frame_boundary() {
+        let mut emu = Emulator::new();
+        emu.load_test_program(); // programme qui tourne en boucle de NOP/JR (LCD allumé au power-on)
+
+        emu.run_tcycles(FRAME_TCYCLES); // une frame LCD allumé : écran non noir (fond blanc, VRAM vide)
+        assert!(emu.mmu.ppu.framebuffer.iter().any(|&p| p != 0xFF00_0000));
+
+        emu.mmu.write(0xFF40, 0x11); // LCDC = $11 : LCD éteint (fond activé) — la PPU est gelée
+        emu.run_tcycles(FRAME_TCYCLES * 2); // ~2 frames : advance() renvoie false à chaque pas…
+        assert!(emu.mmu.ppu.framebuffer.iter().all(|&p| p == 0xFF00_0000)); // …mais le rendu forcé à la frontière de frame noircit l'écran
+
+        emu.mmu.write(0xFF40, 0x91); // LCD rallumé
+        emu.run_tcycles(FRAME_TCYCLES * 2);
+        assert!(emu.mmu.ppu.framebuffer.iter().any(|&p| p != 0xFF00_0000)); // l'écran se rend à nouveau
     }
 
     #[test]
@@ -256,7 +331,7 @@ mod tests {
 
         assert_eq!(emu.mmu.io[0x0F] & 0x04, 0x04); // bit 2 de IF levé par le débordement de TIMA
         assert_eq!(emu.mmu.read(0xFF05), 0x33); // TIMA rechargé depuis TMA
-        assert_eq!(emu.mmu.read(0xFF04), 1); // DIV a avancé d'un pas (256..511 T-cycles exécutés)
+        assert_eq!(emu.mmu.read(0xFF04), 0xAC); // DIV a avancé d'un pas : compteur $AB00 (post-boot) + ~300 T-cycles → $ACxx
     }
 
     #[test]
@@ -268,9 +343,9 @@ mod tests {
         rom[0x0100..0x0102].copy_from_slice(&[0x18, 0xFE]); // JR -2 → $0100 (boucle sur elle-même, 12 T-cycles par itération)
         emu.load_rom(rom);
 
-        assert_eq!(emu.mmu.read(0xFF04), 0); // DIV à l'état power-on avant exécution
+        assert_eq!(emu.mmu.read(0xFF04), 0xAB); // DIV à l'état post-boot ROM avant exécution (compteur $AB00)
         emu.run_tcycles(FRAME_TCYCLES * 2); // ~2 frames : le timer avance pendant l'exécution
-        assert_eq!(emu.mmu.read(0xFF04), (((FRAME_TCYCLES * 2) % 0x10000) as u16 >> 8) as u8); // = 36 (compteur système sur 16 bits)
+        assert_eq!(emu.mmu.read(0xFF04), 0xCF); // = (0xAB00 + FRAME_TCYCLES*2) mod $10000 → $CFAx (compteur système sur 16 bits, départ $AB00)
     }
 
     #[test]

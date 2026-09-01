@@ -910,8 +910,9 @@ pub fn execute_cb(cpu: &mut CPU, mmu: &mut MMU, sub_opcode: u8) -> u32 {
 
 /// Traite les interruptions pendantes avant la prochaine instruction.
 ///
-/// Renvoie `Some(20)` si une interruption est servied : IME est désactivé, le PC
-/// est poussé sur la pile et le CPU saute vers le vecteur de l'interruption
+/// Renvoie `Some(20)` si une interruption est servied : IME est désactivé, le bit IF
+/// correspondant à l'interruption acceptée est effacé automatiquement par le matériel,
+/// le PC est poussé sur la pile et le CPU saute vers le vecteur de l'interruption
 /// pendante+activée de plus bas (V-Blank $40, LC3C $48, Timer $50, Serial $58).
 ///
 /// HALT bug : si le CPU est en HALT et qu'une interruption est pendante (même si IME=false), l'état HALT est annulé ;
@@ -928,14 +929,26 @@ pub fn handle_interrupts(cpu: &mut CPU, mmu: &mut MMU) -> Option<u32> {
         return None;
     }
 
-    // Service de l'interruption (20 T-cycles) : IME désactivé, PC poussé, saut au vecteur.
+    // Service de l'interruption (20 T-cycles) : IME désactivé, le bit IF correspondant à
+    // l'interruption acceptée est effacé automatiquement par le matériel (Pan Docs « Interrupt Sources »),
+    // PC poussé, saut au vecteur.
     cpu.ime = false;
+    let mask = if pending & 0x01 != 0 {
+        0x01 // V-Blank (IF bit 0)
+    } else if pending & 0x02 != 0 {
+        0x02 // LC3C / STAT (IF bit 1)
+    } else if pending & 0x04 != 0 {
+        0x04 // Timer (IF bit 2)
+    } else {
+        0x08 // Serial (IF bit 3)
+    };
+    mmu.io[0x0F] &= !mask; // le matériel efface automatiquement le bit de l'interruption acceptée.
     push16(cpu, mmu, cpu.pc);
-    cpu.pc = match pending {
-        p if p & 0x01 != 0 => 0x40, // V-Blank (IF bit 0)
-        p if p & 0x02 != 0 => 0x48, // LC3C / STAT (IF bit 1)
-        p if p & 0x04 != 0 => 0x50, // Timer (IF bit 2)
-        _ => 0x58,                  // Serial (IF bit 3)
+    cpu.pc = match mask {
+        0x01 => 0x40,
+        0x02 => 0x48,
+        0x04 => 0x50,
+        _ => 0x58,
     };
     Some(20)
 }
@@ -1542,6 +1555,8 @@ mod tests {
         assert_eq!(cpu.sp, 0xFFFC); // FFFE - 2 (un u16 poussé)
         assert_eq!(mmu.read(0xFFFD), 0x01); // octet haut de l'adresse de retour
         assert_eq!(mmu.read(0xFFFC), 0x50);
+        // Le matériel efface automatiquement le bit IF de l'interruption acceptée.
+        assert_eq!(mmu.io[0x0F], 0x00);
 
         // Pas de service quand IME est faux (même interruption en attente).
         let mut cpu = CPU::new();
@@ -1555,12 +1570,16 @@ mod tests {
         mmu.io[0x0F] = 0x03; // V-Blank + LC3C
         assert_eq!(handle_interrupts(&mut cpu, &mut mmu), Some(20));
         assert_eq!(cpu.pc, 0x40);
+        // Seul le bit accepté est effacé : LC3C (bit 1) reste en attente.
+        assert_eq!(mmu.io[0x0F], 0x02);
 
         let mut cpu = CPU::new();
         cpu.ime = true;
         mmu.io[0x0F] = 0x06; // LC3C + Timer
         assert_eq!(handle_interrupts(&mut cpu, &mut mmu), Some(20));
         assert_eq!(cpu.pc, 0x48);
+        // Timer (bit 2) reste en attente.
+        assert_eq!(mmu.io[0x0F], 0x04);
 
         let mut cpu = CPU::new();
         cpu.ime = true;
@@ -1568,6 +1587,7 @@ mod tests {
         mmu.ie = 0x0F;       // toutes les interruptions activées
         assert_eq!(handle_interrupts(&mut cpu, &mut mmu), Some(20));
         assert_eq!(cpu.pc, 0x58);
+        assert_eq!(mmu.io[0x0F], 0x00); // le bit Serial est effacé
 
         // HALT bug : une interruption en attente sort du HALT même si IME=false (sans service).
         let mut cpu = CPU::new();
@@ -1624,7 +1644,7 @@ mod tests {
             let mut mmu = rom_with(&[]); // ROM remplie de $FF (valeurs des immédiats)
             let mut cpu = CPU::new();    // pc=$0100, F=$B0 (Z=0, C=1), SP=$FFFE
             let cycles = execute(&mut cpu, &mut mmu, opcode);
-            assert!(cycles >= 4 && cycles <= 24, "opcode ${:02X} : {} T-cycles", opcode, cycles);
+            assert!((4..=24).contains(&cycles), "opcode ${:02X} : {} T-cycles", opcode, cycles);
         }
 
         // La lecture d'un immédiat n16 doit avancer le PC de exactement 2 octets.
