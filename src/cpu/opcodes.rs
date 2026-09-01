@@ -447,13 +447,15 @@ fn ret_cond(cpu: &mut CPU, mmu: &mut MMU, taken: bool) -> u32 {
 
 /// RETI (16 T-cycles) : comme RET mais réactive IME.
 fn reti(cpu: &mut CPU, mmu: &mut MMU) -> u32 {
-    let return_pc = pop16(cpu, mmu);
-    cpu.pc = return_pc;
+    let return_addr = pop16(cpu, mmu);
     cpu.ime = true; // le drapeau IF correspondant a déjà été effacé à l'acceptation de l'interruption
+
     log::debug!(
-        "[CPU] RETI → PC=${:04X}, IME re-armed (IF={:02X})",
-        return_pc, mmu.io[0x0F],
+        "[CPU] RETI: returning to ${:04X}, IME re-enabled, IF={:02X}",
+        return_addr, mmu.io[0x0F],
     );
+
+    cpu.pc = return_addr;
     16
 }
 
@@ -590,8 +592,12 @@ fn pop_r16(cpu: &mut CPU, mmu: &mut MMU, idx: u8) -> u32 {
 }
 
 /// HALT (4 T-cycles) : le CPU s'arrête jusqu'à une interruption pendante.
-fn halt(cpu: &mut CPU) -> u32 {
+fn halt(cpu: &mut CPU, mmu: &MMU) -> u32 {
     cpu.halted = true;
+    log::debug!(
+        "[CPU] HALT entered: PC=${:04X}, IF={:02X}, IE={:02X}",
+        cpu.pc, mmu.io[0x0F], mmu.ie,
+    );
     4
 }
 
@@ -701,7 +707,7 @@ pub fn execute(cpu: &mut CPU, mmu: &mut MMU, opcode: u8) -> u32 {
             let src = opcode & 0x07;
             ld_r8(cpu, mmu, dst, src)
         }
-        0x76 => halt(cpu),                                // HALT (4) : le CPU s'arrête
+        0x76 => halt(cpu, mmu),                                // HALT (4) : le CPU s'arrête
 
         // --- Block 2 (0x80-0xBF) : ALU A, r8 (4 T-cycles) ---
         0x80..=0xBF => {
@@ -760,14 +766,14 @@ pub fn execute(cpu: &mut CPU, mmu: &mut MMU, opcode: u8) -> u32 {
         0xF0 => ldh_a8(cpu, mmu, false),                 // LDH A, [n8] (8)
         0xF1 => pop_r16(cpu, mmu, 3),                    // POP AF (12)
         0xF2 => ldh_c(cpu, mmu, false),                  // LDH A, [C] (12)
-        0xF3 => { cpu.ime = false; cpu.ei_delay = 0; 4 }, // DI (4) : IME désactivé immédiatement, annule tout retard d'EI en cours
+        0xF3 => { cpu.ime = false; cpu.ei_delay = 0; log::debug!("[CPU] DI: IME disabled"); 4 }, // DI (4) : IME désactivé immédiatement, annule tout retard d'EI en cours
         0xF4 | 0xFC | 0xFD => 4,                         // opcodes invalides (hard-lock sur le matériel)
         0xF5 => push_r16(cpu, mmu, 3),                   // PUSH AF (16)
         0xF6 => { let op = Alu8::from_bits((opcode & 0x38) >> 3); op.apply(cpu, mmu.read(cpu.pc)); cpu.pc = cpu.pc.wrapping_add(1); 8 } // OR A,n8 (8)
         0xF8 => { let e8 = mmu.read(cpu.pc) as i8; cpu.pc = cpu.pc.wrapping_add(1); ld_hl_sp(cpu, e8) } // LD HL, SP+e8 (12) : Z=0 N=0 H C
         0xF9 => { cpu.sp = cpu.hl(); 8 },                // LD SP, HL (8)
         0xFA => { let a16 = read_a16(mmu, cpu.pc); cpu.a = mmu.read(a16); cpu.pc = cpu.pc.wrapping_add(2); 16 } // LD A, (a16) (16)
-        0xFB => { cpu.ei_delay = 2; 4 },                 // EI (4) : IME réactivé après l'instruction suivante (Pan Docs)
+        0xFB => { cpu.ei_delay = 2; log::debug!("[CPU] EI: IME will be enabled after next instruction"); 4 },                 // EI (4) : IME réactivé après l'instruction suivante (Pan Docs)
         0xFE => { let op = Alu8::from_bits((opcode & 0x38) >> 3); op.apply(cpu, mmu.read(cpu.pc)); cpu.pc = cpu.pc.wrapping_add(1); 8 }, // CP A,n8 (8)
     }
 }

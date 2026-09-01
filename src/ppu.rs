@@ -221,6 +221,10 @@ impl PPU {
         // Requêtes d'interruption : détection des transitions franchies entre l'ancienne et la nouvelle position.
         if self.stat & STAT_IRQ_VBLANK != 0 && Self::crosses(prev_total, new_total, VBLANK_START_DOT) {
             self.pending_irq |= IRQ_VBLANK; // entrée en VBlank (début de la ligne 144) → bit 0 de IF
+            log::debug!(
+                "[PPU] VBlank entry detected! prev_total={}, new_total={}, VBLANK_START={}",
+                prev_total, new_total, VBLANK_START_DOT,
+            );
         }
         if self.stat & STAT_IRQ_LYC != 0
             && self.lyc <= 152
