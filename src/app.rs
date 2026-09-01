@@ -20,6 +20,8 @@ pub struct FarquaadGBApp {
     show_pattern_table: bool,
     /// Fenêtre de debug « Name Table » (carte de tuiles $9800).
     show_name_table: bool,
+    /// Fenêtre de debug « Processor » (registres/drapeaux CPU, style No$GBA/BGB).
+    show_processor: bool,
     /// Texture écran (framebuffer PPU, NEAREST pour le pixel art).
     texture: Option<egui::TextureHandle>,
 }
@@ -40,6 +42,7 @@ impl FarquaadGBApp {
             running: false,
             show_pattern_table: false,
             show_name_table: false,
+            show_processor: false,
             texture: None,
         }
     }
@@ -245,6 +248,156 @@ impl FarquaadGBApp {
             self.emulator.reset();
         }
     }
+
+    /// Dessine la fenêtre de debug « Processor » style No$GBA/BGB : drapeaux Z/N/H/C, registre F en binaire,
+    /// PC et SP (hexadécimal + binaire groupé par nibbles), registres A/F/B/C/D/E/H/L et état IME/HALT.
+    fn show_processor_window(&mut self, ctx: &egui::Context) {
+        egui::Window::new("🧠 Processor")
+            .open(&mut self.show_processor)
+            .resizable(false)
+            .show(ctx, |ui| {
+                let cpu = &self.emulator.cpu;
+
+                // Drapeaux Z N H C (levé = vert, baissé = rouge).
+                ui.horizontal(|ui| {
+                    let f = cpu.flags();
+                    for (name, flag) in [("Z", Flags::Z), ("N", Flags::N), ("H", Flags::H), ("C", Flags::C)] {
+                        let color = if f.contains(flag) { Color32::GREEN } else { Color32::RED };
+                        ui.label(egui::RichText::new(name).color(color));
+                    }
+                });
+
+                // Registre F en binaire (8 bits, MSB d'abord).
+                ui.horizontal(|ui| {
+                    for i in (0..8).rev() {
+                        let bit = (cpu.f >> i) & 1;
+                        ui.monospace(format!("{bit}"));
+                    }
+                });
+
+                ui.separator();
+
+                // PC : hexadécimal puis binaire groupé par nibbles.
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("PC").color(Color32::YELLOW));
+                    ui.monospace(format!("${:04X}", cpu.pc));
+                });
+                ui.horizontal(|ui| {
+                    for i in (0..16).rev() {
+                        let bit = (cpu.pc >> i) & 1;
+                        ui.monospace(format!("{bit}"));
+                        if i % 4 == 0 && i > 0 {
+                            ui.label(" ");
+                        }
+                    }
+                });
+
+                // SP : hexadécimal puis binaire groupé par nibbles.
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("SP").color(Color32::YELLOW));
+                    ui.monospace(format!("${:04X}", cpu.sp));
+                });
+                ui.horizontal(|ui| {
+                    for i in (0..16).rev() {
+                        let bit = (cpu.sp >> i) & 1;
+                        ui.monospace(format!("{bit}"));
+                        if i % 4 == 0 && i > 0 {
+                            ui.label(" ");
+                        }
+                    }
+                });
+
+                ui.separator();
+
+                // Registres A, F, B, C, D, E, H, L : hexadécimal + binaire (séparateur pleine largeur par paire).
+                egui::Grid::new("processor_registers").show(ui, |g| {
+                    g.label(egui::RichText::new("A").color(Color32::CYAN));
+                    g.monospace(format!("${:02X}", cpu.a));
+                    Self::show_binary_8bit(g, cpu.a);
+                    g.end_row();
+
+                    g.label(egui::RichText::new("F").color(Color32::CYAN));
+                    g.monospace(format!("${:02X}", cpu.f));
+                    Self::show_binary_8bit(g, cpu.f);
+                    g.end_row();
+
+                    // Séparateur pleine largeur : la ligne dépasse la cellule (clippée aux bords de la fenêtre).
+                    g.add(egui::Separator::default().grow(500.0));
+                    g.end_row();
+
+                    g.label(egui::RichText::new("B").color(Color32::CYAN));
+                    g.monospace(format!("${:02X}", cpu.b));
+                    Self::show_binary_8bit(g, cpu.b);
+                    g.end_row();
+
+                    g.label(egui::RichText::new("C").color(Color32::CYAN));
+                    g.monospace(format!("${:02X}", cpu.c));
+                    Self::show_binary_8bit(g, cpu.c);
+                    g.end_row();
+
+                    // Séparateur pleine largeur : la ligne dépasse la cellule (clippée aux bords de la fenêtre).
+                    g.add(egui::Separator::default().grow(500.0));
+                    g.end_row();
+
+                    g.label(egui::RichText::new("D").color(Color32::CYAN));
+                    g.monospace(format!("${:02X}", cpu.d));
+                    Self::show_binary_8bit(g, cpu.d);
+                    g.end_row();
+
+                    g.label(egui::RichText::new("E").color(Color32::CYAN));
+                    g.monospace(format!("${:02X}", cpu.e));
+                    Self::show_binary_8bit(g, cpu.e);
+                    g.end_row();
+
+                    // Séparateur pleine largeur : la ligne dépasse la cellule (clippée aux bords de la fenêtre).
+                    g.add(egui::Separator::default().grow(500.0));
+                    g.end_row();
+
+                    g.label(egui::RichText::new("H").color(Color32::CYAN));
+                    g.monospace(format!("${:02X}", cpu.h));
+                    Self::show_binary_8bit(g, cpu.h);
+                    g.end_row();
+
+                    g.label(egui::RichText::new("L").color(Color32::CYAN));
+                    g.monospace(format!("${:02X}", cpu.l));
+                    Self::show_binary_8bit(g, cpu.l);
+                    g.end_row();
+                });
+
+                ui.separator();
+
+                // IME et HALT.
+                ui.horizontal(|ui| {
+                    let ime_color = if cpu.ime { Color32::GREEN } else { Color32::RED };
+                    ui.label(egui::RichText::new("IME").color(ime_color));
+                    ui.label(if cpu.ime { "ON" } else { "OFF" });
+
+                    ui.separator();
+
+                    let halt_color = if cpu.halted { Color32::GREEN } else { Color32::RED };
+                    ui.label(egui::RichText::new(if cpu.halted { "HALT" } else { "RUN" }).color(halt_color));
+                });
+
+                ui.separator();
+
+                // Étiquettes statiques (style No$GBA/BGB).
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("DOUBLE SPEED").color(Color32::GRAY));
+                    ui.separator();
+                    ui.label(egui::RichText::new("BOOTROM").color(Color32::GRAY));
+                });
+            });
+    }
+
+    /// Affiche les 8 bits d'une valeur en binaire (MSB d'abord), en monospace.
+    fn show_binary_8bit(ui: &mut egui::Ui, value: u8) {
+        ui.horizontal(|ui| {
+            for i in (0..8).rev() {
+                let bit = (value >> i) & 1;
+                ui.monospace(format!("{bit}"));
+            }
+        });
+    }
 }
 
 impl eframe::App for FarquaadGBApp {
@@ -281,6 +434,7 @@ impl eframe::App for FarquaadGBApp {
                 }
                 ui.checkbox(&mut self.show_pattern_table, "🔍 Pattern Table");
                 ui.checkbox(&mut self.show_name_table, "🗺 Name Table");
+                ui.checkbox(&mut self.show_processor, "🧠 Processor");
                 ui.separator();
                 match &self.rom_name {
                     Some(name) => {
@@ -340,5 +494,9 @@ impl eframe::App for FarquaadGBApp {
                     self.show_name_table_debug(ui);
                 });
         }
+
+        // Fenêtre de debug « Processor » (registres/drapeaux CPU, style No$GBA/BGB) : la visibilité est
+        // pilotée par le bouton de fermeture via `.open(&mut self.show_processor)`.
+        self.show_processor_window(ctx);
     }
 }
