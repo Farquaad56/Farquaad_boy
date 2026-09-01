@@ -6,6 +6,8 @@
 //! Étape 1 : les registres PPU ($FF40-$FF4B, dont le DMA OAM $FF46) sont routés vers la structure
 //! [`ppu::PPU`] embarquée dans le MMU ; partie 7 : les registres SCC ($FF01-$FF02) vers
 //! [`serial::Serial`], et partie 9 : les registres Timer ($FF04-$FF07) vers [`timer::Timer`].
+//! Partie 10 : l'écriture du registre DMA OAM $FF46 déclenche le transfert des 160 octets d'OAM
+//! ($FE00-$FE9F) depuis l'adresse source `value << 8`, lue via la carte d'adresses (Pan Docs « DMA »).
 //! Le tableau `io` ne stocke que les valeurs brutes des autres registres (joypad… — parties 7+).
 
 use crate::ppu::PPU;
@@ -153,6 +155,11 @@ impl MMU {
             0xFF06 => self.timer.write_tma(value),
             0xFF07 => self.timer.write_tac(value),
             // Registres PPU (étape 1) : $FF40-$FF4B ; LY ($FF44) est en lecture seule — écriture ignorée.
+            0xFF46 => {
+                // DMA OAM : l'écriture de $FF46 copie les 160 octets d'OAM depuis l'adresse source (value << 8).
+                self.ppu.write_register(addr, value); // enregistre l'adresse source dans le registre DMA
+                self.dma_transfer(value);
+            }
             0xFF40..=0xFF4B => self.ppu.write_register(addr, value),
             // Autres registres I/O.
             0xFF00..=0xFF7F => self.io[(addr - 0xFF00) as usize] = value,
@@ -160,6 +167,16 @@ impl MMU {
             0xFF80..=0xFFFE => self.hram[(addr - 0xFF80) as usize] = value,
             // Registre Interrupt Enable.
             0xFFFF => self.ie = value,
+        }
+    }
+
+    /// Transfert DMA OAM (Pan Docs « DMA ») : l'écriture de $FF46 copie les 160 octets d'OAM
+    /// ($FE00-$FE9F) depuis l'adresse source `source << 8` ($0000-$FFFF), lue via la carte d'adresses.
+    fn dma_transfer(&mut self, source: u8) {
+        let base = (source as usize) << 8; // adresse source : $0000-$FFFF
+        for i in 0..self.oam.len() {
+            let byte = self.read((base + i) as u16);
+            self.oam[i] = byte;
         }
     }
 
@@ -374,5 +391,34 @@ mod tests {
         // Le DMA OAM ($FF46) est routé vers la PPU, pas vers `io`.
         mmu.write(0xFF46, 0xC0);
         assert_eq!(mmu.read(0xFF46), 0xC0);
+    }
+
+    #[test]
+    fn dma_oam_transfer_copies_from_source() {
+        let mut mmu = MMU::new();
+        // Source en WRAM : les 160 octets à $C000-$C09F (source byte $C0 → base $C000).
+        for i in 0..0xA0 {
+            mmu.write(0xC000 + i, (i as u8) ^ 0x5A);
+        }
+        // L'écriture de $FF46 = $C0 copie les 160 octets depuis $C000 vers OAM ($FE00-$FE9F).
+        mmu.write(0xFF46, 0xC0);
+
+        for i in 0..0xA0 {
+            assert_eq!(mmu.read(0xFE00 + i), (i as u8) ^ 0x5A); // OAM = contenu de $C000-$C09F
+        }
+        assert_eq!(mmu.read(0xFF46), 0xC0); // le registre DMA mémorise l'adresse source
+    }
+
+    #[test]
+    fn dma_oam_transfer_reads_through_full_address_map() {
+        let mut mmu = MMU::new();
+        // Source en VRAM : les 160 octets à $8200-$829F (source byte $82 → base $8200).
+        for i in 0..0xA0 {
+            mmu.write(0x8200 + i, 0x3C);
+        }
+        mmu.write(0xFF46, 0x82);
+
+        assert_eq!(mmu.read(0xFE00), 0x3C); // premier octet OAM = $8200
+        assert_eq!(mmu.read(0xFE9F), 0x3C); // dernier octet OAM = $829F
     }
 }
