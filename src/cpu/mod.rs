@@ -95,6 +95,12 @@ impl CPU {
         }
 
         let opcode = mmu.read(self.pc);
+
+        // LOG : tracer les instructions dans la zone des handlers d'interruption ($0040-$006F)
+        if (0x0040..=0x006F).contains(&self.pc) {
+            log::debug!("[CPU] ISR executing: PC=${:04X}, opcode=${:02X}", self.pc, opcode);
+        }
+
         self.pc = self.pc.wrapping_add(1);
         let cycles = opcodes::execute(self, mmu, opcode);
 
