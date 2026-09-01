@@ -56,13 +56,16 @@ impl Emulator {
     fn power_on(&mut self) {
         self.cpu = CPU::new(); // Contient déjà l'état post-boot ROM (PC=0x0100, SP=$FFFE, registres corrects)
         self.mmu.ppu = PPU::default(); // OBP0/OBP1 ($FF48/$FF49) valent $FF : non initialisées par le boot ROM → valeur la plus fréquente
-        self.mmu.serial = Serial::new(); // la SCC repart à l'état power-on (transcript vidé)
-        self.mmu.timer = Timer::new(); // le timer repart à l'état power-on (TIMA/TMA = $00, TAC se lit $F8 → désactivé)
+        self.mmu.serial = Serial::default(); // la SCC repart à l'état power-on (transcript vidé)
+        self.mmu.timer = Timer::default(); // le timer repart à l'état power-on (TIMA/TMA = $00, TAC se lit $F8 → désactivé)
 
-        // Registres I/O non remis à $00 par le boot ROM DMG (colonne DMG/MGB de PanDocs « Power Up Sequence »).
-        self.mmu.io[0x00] = 0xCF; // P1 ($FF00) : joypad, aucun bouton pressé
-        self.mmu.serial.sc = 0x7E; // SC ($FF02) : bits 6..1 non écriturables par le logiciel — la valeur post-boot est conservée telle quelle
-        self.mmu.timer.counter = (0xABu16) << 8; // DIV ($FF04) se lit $AB (dépend du timing sur le matériel réel ; valeur enregistrée au hand-off retenue)
+        // CORRECTION : Initialisation des registres I/O aux valeurs post-boot DMG (PanDocs « Power Up Sequence »)
+        self.mmu.write(0xFF00, 0xCF); // P1 ($FF00) : joypad, aucun bouton pressé
+        self.mmu.serial.sc = 0x7E; // SC ($FF02) : bits 6..1 non écriturables par le logiciel — la valeur post-boot est conservée telle quelle (mmu.write masquerait les bits 6..1)
+        self.mmu.timer.counter = (0xABu16) << 8; // DIV ($FF04) se lit $AB : write_div ignore la valeur écrite et remet le compteur à $0000, d'où l'écriture directe du compteur système
+        self.mmu.write(0xFF07, 0xF8); // TAC ($FF07) : bits 7-3 toujours lus à 1 → timer désactivé au hand-off
+        self.mmu.write(0xFF48, 0xFF); // OBP0 : non initialisée par le boot ROM → valeur la plus fréquente
+        self.mmu.write(0xFF49, 0xFF); // OBP1
 
         self.t_cycles = 0;
         self.instructions = 0;

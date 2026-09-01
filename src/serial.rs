@@ -39,6 +39,7 @@ pub struct Serial {
 
 impl Serial {
     /// Crée une SCC à l'état power-on (SB = $00, SC = $00, aucun transfert en cours).
+    #[allow(dead_code)] // Utilisé uniquement par les tests dans la cible binaire (power_on utilise Serial::default())
     pub fn new() -> Self {
         Self::default()
     }

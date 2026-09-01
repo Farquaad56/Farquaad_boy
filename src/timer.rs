@@ -55,6 +55,7 @@ pub struct Timer {
 
 impl Timer {
     /// Crée un timer à l'état power-on (DIV/TIMA/TMA/TAC = $00, timer désactivé).
+    #[allow(dead_code)] // Utilisé uniquement par les tests dans la cible binaire (power_on utilise Timer::default())
     pub fn new() -> Self {
         Self::default()
     }
