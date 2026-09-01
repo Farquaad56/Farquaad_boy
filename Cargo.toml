@@ -1,0 +1,29 @@
+[package]
+name = "FarquaadGB"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# UI et Rendu
+eframe = "0.31"
+egui = "0.31"
+egui_extras = "0.31"
+
+# Utilitaires de bas niveau et performance
+bytemuck = { version = "1.25", features = ["derive", "min_const_generics"] }
+bitflags = "2.9"
+num_enum = "0.7"
+thiserror = "2.0"
+parking_lot = "0.12"
+
+# I/O et Configuration
+rfd = "0.17"
+serde = { version = "1.0", features = ["derive"] }
+bincode = "1.3" # Pour les Save States rapides
+
+# Audio (Phase avancée)
+cpal = "0.16"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"

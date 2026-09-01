@@ -1,0 +1,328 @@
+//! Structure principale orchestrant les composants de l'émulateur (CPU, MMU, PPU, APU…).
+//!
+//! Partie 5 : rendu du Background ; la ROM chargée est exécutée directement à $0100 (état post-boot ROM).
+//! Partie 6 : opcodes CPU complets et bug HALT.
+
+use crate::cpu::CPU;
+use crate::mmu::MMU;
+use crate::ppu::{IRQ_STAT, IRQ_VBLANK, PPU};
+use crate::serial::Serial;
+use crate::timer::Timer;
+
+/// Nombre de T-cycles par frame vidéo (60 Hz) : 154 lignes × 456 dots (Pan Docs « Rendering »).
+pub const FRAME_TCYCLES: u64 = crate::ppu::FRAME_DOTS;
+
+/// État principal de l'émulateur.
+pub struct Emulator {
+    pub cpu: CPU,
+    pub mmu: MMU,
+    /// T-cycles exécutés depuis le boot (compteur debug).
+    pub t_cycles: u64,
+    /// Instructions exécutées depuis le boot (compteur debug).
+    pub instructions: u64,
+}
+
+impl Emulator {
+    /// Crée un émulateur à l'état power-on (aucune ROM chargée).
+    pub fn new() -> Self {
+        Self {
+            cpu: CPU::new(),
+            mmu: MMU::new(),
+            t_cycles: 0,
+            instructions: 0,
+        }
+    }
+
+    /// Charge une ROM `.gb` et redémarre le système à l'état power-on post-boot ROM ; la ROM est exécutée immédiatement à $0100.
+    pub fn load_rom(&mut self, data: Vec<u8>) {
+        self.mmu.load_rom(data);
+        self.power_on();
+    }
+
+    /// Redémarre le système à l'état power-on post-boot ROM ; la ROM chargée est conservée.
+    pub fn reset(&mut self) {
+        self.power_on();
+    }
+
+    /// État power-on : CPU/PPU réinitialisés, prêt à exécuter la ROM chargée.
+    fn power_on(&mut self) {
+        self.cpu = CPU::new(); // Contient déjà l'état post-boot ROM (PC=0x0100, SP=$FFFE, registres corrects)
+        self.mmu.ppu = PPU::default();
+        self.mmu.serial = Serial::default(); // la SCC repart à l'état power-on (transcript vidé)
+        self.mmu.timer = Timer::default(); // le timer repart à l'état power-on (DIV/TIMA/TMA/TAC = $00)
+        self.t_cycles = 0;
+        self.instructions = 0;
+    }
+
+    /// Exécute une instruction et renvoie les T-cycles consommés.
+    pub fn step(&mut self) -> u32 {
+        let cycles = self.cpu.step(&mut self.mmu);
+        self.instructions += 1;
+        self.t_cycles += cycles as u64;
+        // La PPU avance du même nombre de T-cycles (timing LY/mode, Pan Docs « Rendering »).
+        let frame_done = self.mmu.ppu.advance(cycles as u64);
+        if frame_done {
+            // Une frame vidéo est achevée : le rendu Background/Fenêtre met à jour le framebuffer.
+            self.mmu.ppu.render_frame(&self.mmu.vram);
+        }
+        // Les requêtes d'interruption PPU en attente lèvent les bits correspondants de IF ($FF0F).
+        let ppu_irq = self.mmu.ppu.take_interrupts();
+        if ppu_irq & IRQ_VBLANK != 0 {
+            self.mmu.io[0x0F] |= 0x01; // bit 0 de IF : interruption VBlank demandée (vecteur $40)
+        }
+        if ppu_irq & IRQ_STAT != 0 {
+            self.mmu.io[0x0F] |= 0x02; // bit 1 de IF : interruption STAT/LCD demandée (vecteur $48)
+        }
+        // La SCC avance du même nombre de T-cycles ; un transfert achevé lève le drapeau IF série.
+        if self.mmu.serial.tick(cycles) {
+            self.mmu.io[0x0F] |= 0x08; // bit 3 de IF ($FF0F) : interruption série demandée (Pan Docs « Interrupt Sources »)
+        }
+        // Le Timer avance du même nombre de T-cycles ; un débordement de TIMA lève le drapeau IF Timer.
+        if self.mmu.timer.tick(cycles) {
+            self.mmu.io[0x0F] |= 0x04; // bit 2 de IF ($FF0F) : interruption Timer demandée (Pan Docs « Interrupt Sources »)
+        }
+        cycles
+    }
+
+    /// Exécute exactement `n` T-cycles.
+    pub fn run_tcycles(&mut self, mut n: u64) {
+        while n > 0 {
+            let c = self.step() as u64;
+            n = n.saturating_sub(c);
+        }
+    }
+
+    /// Exécute une frame vidéo complète (70224 T-cycles).
+    pub fn run_frame(&mut self) {
+        self.run_tcycles(FRAME_TCYCLES);
+    }
+
+    /// Charge un programme test intégré qui exerce le jeu d'instructions de la partie 3.
+    pub fn load_test_program(&mut self) {
+        let mut rom = vec![0xFF; 0x4000];
+        rom[0x0134..0x013C].copy_from_slice(b"CPU TEST"); // titre affiché dans la barre de menu
+        // Le code est placé AVANT le titre (l'exécution démarre à 0x0100 et passe par 0x0134) :
+        // les octets du titre ne doivent pas être exécutés. $FF = RST $38 (opcode valide SM83),
+        // d'où un préfixe de NOP explicites pour atteindre le code sans boucle de RST infinie.
+        rom[0x0100..0x0108].fill(0x00); // 8 × NOP (32 T-cycles)
+        let code: &[u8] = &[
+            0x31, 0xFF, 0xDF, // 0x0108: LD SP, $DFFF (immédiat little-endian : FF puis DF)
+            0x06, 0x2A,       // 0x010B: LD B, $2A (42)
+            0x3C,             // 0x010D: INC A      ← début de la boucle
+            0x05,             // 0x010E: DEC B
+            0x20, 0xFC,       // 0x010F: JR NZ, -4 → retour à INC A (cible = 0x0111 + (-4) = 0x010D)
+            0x3C,             // 0x0111: INC A      (après la boucle)
+            0x00,             // 0x0112: NOP        ← début du spin infini
+            0x20, 0xFD,       // 0x0113: JR -3 → retour à NOP (cible = 0x0115 + (-3) = 0x0112)
+        ];
+        rom[0x0108..0x0115].copy_from_slice(code);
+        self.load_rom(rom);
+    }
+}
+
+impl Default for Emulator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cpu::flags::Flags;
+    use crate::ppu::{DOTS_PER_LINE, STAT_IRQ_LYC, STAT_IRQ_VBLANK};
+
+    #[test]
+    fn boot_state_after_load_rom() {
+        let mut emu = Emulator::new();
+        assert_eq!(emu.cpu.pc, 0x0100); // cible du vecteur de reset
+        assert_eq!(emu.cpu.sp, 0xFFFE);
+        assert_eq!(emu.cpu.af(), 0x01B0);
+
+        let mut rom = vec![0xFF; 0x4000];
+        rom[0x0134..0x013B].copy_from_slice(b"POKEMON");
+        emu.load_rom(rom);
+
+        // L'état de boot est restauré après le chargement.
+        assert_eq!(emu.cpu.pc, 0x0100);
+        assert_eq!(emu.cpu.sp, 0xFFFE);
+        // Le titre du jeu est lisible dans l'en-tête cartouche à 0x0134.
+        let title: Vec<u8> = (0..7).map(|i| emu.mmu.read(0x0134 + i)).collect();
+        assert_eq!(title, b"POKEMON");
+    }
+
+    #[test]
+    fn cpu_executes_test_program() {
+        let mut emu = Emulator::new();
+        emu.load_test_program();
+        assert_eq!(emu.cpu.pc, 0x0100); // état de boot avant exécution
+
+        emu.run_tcycles(FRAME_TCYCLES * 2); // ~2 frames : largement suffisant
+
+        assert_eq!(emu.cpu.a, 0x2C); // 0x01 + 42 (boucle) + 1
+        assert_eq!(emu.cpu.b, 0x00); // compte à rebours terminé
+        assert_eq!(emu.cpu.c, 0x13); // non modifié (valeur de reset)
+        assert_eq!(emu.cpu.sp, 0xDFFF);
+        // C est conservé depuis le power-on (F = $B0 → Z|H|C) ; Z/N/H sont effacés par le dernier INC A.
+        assert_eq!(emu.cpu.flags(), Flags::C);
+        assert!(emu.instructions > 42);
+    }
+
+    #[test]
+    fn run_frame_completes_one_ppu_frame() {
+        let mut emu = Emulator::new();
+        emu.load_test_program();
+        emu.run_frame(); // 70224 T-cycles : exactement une frame vidéo.
+
+        // La dernière instruction peut dépasser légèrement la cible (saturating_sub).
+        assert!(emu.t_cycles >= FRAME_TCYCLES && emu.t_cycles < FRAME_TCYCLES + 20);
+        // La PPU a achevé exactement une frame : retour à la ligne 0, OAM Scan.
+        assert_eq!(emu.mmu.ppu.ly, 0);
+        assert_eq!(emu.mmu.ppu.mode, 2);
+    }
+
+    #[test]
+    fn frame_render_updates_the_framebuffer() {
+        let mut emu = Emulator::new();
+        emu.load_test_program();
+
+        // Tuile 1 noire/blanche en $8010-$801F et carte du fond $9800-$9BFF pointant vers elle,
+        // le tout écrit via le MMU (routing VRAM $8000-$9FFF).
+        for row in 0..8 {
+            emu.mmu.write(0x8010 + 2 * row as u16, 0xFF); // moitié gauche → valeur 3
+            emu.mmu.write(0x8011 + 2 * row as u16, 0x00); // moitié droite → valeur 0
+        }
+        for addr in 0x9800..=0x9BFF {
+            emu.mmu.write(addr, 1);
+        }
+        emu.mmu.write(0xFF40, 0x90); // LCD allumé, fond activé ; tuiles $8000-$8FFF, carte $9800-$9BFF
+        emu.mmu.write(0xFF47, 0xE4); // BGP : teinte v pour une valeur de pixel v
+
+        emu.run_frame(); // une frame vidéo : le rendu est mis à jour à la frontière de frame
+
+        assert_eq!(emu.mmu.ppu.framebuffer[0], PPU::shade(3)); // moitié gauche de la tuile → teinte 3
+        assert_eq!(emu.mmu.ppu.framebuffer[4], PPU::shade(0)); // moitié droite → teinte 0
+    }
+
+    #[test]
+    fn ppu_interrupts_raise_if_bits() {
+        let mut emu = Emulator::new();
+        emu.load_test_program(); // programme qui tourne en boucle de NOP/JR
+
+        emu.mmu.ppu.stat = STAT_IRQ_VBLANK | STAT_IRQ_LYC; // active les interruptions VBlank + LYC==LY
+        emu.mmu.ppu.lyc = 145;
+
+        emu.run_tcycles(145 * DOTS_PER_LINE as u64 + 1); // franchit le début de la ligne 144 (VBlank) puis de la ligne 145 (ly == lyc)
+
+        assert_eq!(emu.mmu.io[0x0F] & 0x03, 0x03); // bits 0 (VBlank) + 1 (STAT) de IF levés
+    }
+
+    #[test]
+    fn timer_overflow_raises_the_if_flag() {
+        let mut emu = Emulator::new();
+        emu.load_test_program(); // programme qui tourne en boucle de NOP/JR
+
+        emu.mmu.write(0xFF06, 0x33); // TMA : rechargement au débordement
+        emu.mmu.write(0xFF05, 0xFF); // TIMA : déborde à la prochaine incrémentation
+        emu.mmu.write(0xFF07, 0x07); // TAC : timer activé, tick toutes les 256 T-cycles
+
+        assert_eq!(emu.mmu.io[0x0F] & 0x04, 0); // pas encore d'interruption Timer
+        emu.run_tcycles(300); // > 256 : le débordement a eu lieu (+ un cycle pour lever le drapeau)
+
+        assert_eq!(emu.mmu.io[0x0F] & 0x04, 0x04); // bit 2 de IF levé par le débordement de TIMA
+        assert_eq!(emu.mmu.read(0xFF05), 0x33); // TIMA rechargé depuis TMA
+        assert_eq!(emu.mmu.read(0xFF04), 1); // DIV a avancé d'un pas (256..511 T-cycles exécutés)
+    }
+
+    #[test]
+    fn timer_keeps_running_while_executing_a_rom() {
+        let mut emu = Emulator::new();
+        // Boucle de JR sur elle-même à $0100 (aucune écriture mémoire, aucun push de pile) :
+        // le timer avance uniquement avec les T-cycles exécutés.
+        let mut rom = vec![0x00; 0x4000];
+        rom[0x0100..0x0102].copy_from_slice(&[0x18, 0xFE]); // JR -2 → $0100 (boucle sur elle-même, 12 T-cycles par itération)
+        emu.load_rom(rom);
+
+        assert_eq!(emu.mmu.read(0xFF04), 0); // DIV à l'état power-on avant exécution
+        emu.run_tcycles(FRAME_TCYCLES * 2); // ~2 frames : le timer avance pendant l'exécution
+        assert_eq!(emu.mmu.read(0xFF04), (((FRAME_TCYCLES * 2) % 0x10000) as u16 >> 8) as u8); // = 36 (compteur système sur 16 bits)
+    }
+
+    #[test]
+    fn flags_roundtrip() {
+        let mut cpu = CPU::new(); // f = 0xB0 (Z|H|C — le carry est actif au power-on)
+        assert_eq!(cpu.flags(), Flags::Z | Flags::H | Flags::C);
+        cpu.set_flags(Flags::empty());
+        assert_eq!(cpu.f, 0x00);
+        cpu.set_flags(Flags::C);
+        assert_eq!(cpu.f, 0x10);
+    }
+
+    #[test]
+    fn step_counts_cycles_and_instructions() {
+        let mut emu = Emulator::new();
+        emu.load_test_program();
+        for _ in 0..13 {
+            emu.step();
+        }
+        // 8 × NOP (4) + LD SP (12) + LD B (8) + INC A (4) + DEC B (4) + JR pris (12) = 72.
+        assert_eq!(emu.instructions, 13);
+        assert_eq!(emu.t_cycles, 72);
+    }
+
+    #[test]
+    fn serial_output_of_rom_appears_in_transcript() {
+        // Mini-ROM qui imprime « Hello\n » sur le port link : pour chaque caractère,
+        // LD A,c puis LDH [$FF01],A (SB) et LDH [$FF02],A avec A=$81 (SC = $81,
+        // horloge interne / master) démarre un transfert de 64 T-cycles.
+        let mut rom = vec![0xFF; 0x4000];
+        rom[0x0134..0x013F].copy_from_slice(b"SERIAL TEST"); // titre affiché dans la barre de menu
+        let code: &[u8] = &[
+            0x31, 0xFF, 0xDF, // LD SP, $DFFF
+            0x3E, 0x48,       // LD A,'H'
+            0xE0, 0x01,       // LDH [$FF01],A → SB='H'
+            0x3E, 0x81,       // LD A,$81
+            0xE0, 0x02,       // LDH [$FF02],A → SC=$81 : transfert démarré ('H')
+            0x3E, 0x65, 0xE0, 0x01, 0x3E, 0x81, 0xE0, 0x02, // 'e'
+            0x3E, 0x6C, 0xE0, 0x01, 0x3E, 0x81, 0xE0, 0x02, // 'l' (premier)
+            0x3E, 0x6C, 0xE0, 0x01, 0x3E, 0x81, 0xE0, 0x02, // 'l' (deuxième)
+            0x3E, 0x6F, 0xE0, 0x01, 0x3E, 0x81, 0xE0, 0x02, // 'o'
+            0x3E, 0x0A, 0xE0, 0x01, 0x3E, 0x81, 0xE0, 0x02, // '\n' : la ligne « Hello » est émise dans le log hôte
+            0x00,             // NOP
+            0x20, 0xFD,       // JR -3 → boucle infinie (NOP + JR)
+        ];
+        rom[0x0100..0x0100 + code.len()].copy_from_slice(code);
+
+        let mut emu = Emulator::new();
+        emu.load_rom(rom);
+        emu.run_tcycles(FRAME_TCYCLES * 2); // largement suffisant (transferts de 64 T-cycles)
+
+        assert_eq!(emu.mmu.serial.take_transcript(), b"Hello\n");
+        assert_eq!(emu.mmu.serial.last_line(), "Hello");
+    }
+
+    #[test]
+    fn serial_completion_raises_if_bit_3() {
+        // Mini-ROM qui démarre un transfert série en mode master (SC = $81) puis tourne en boucle de NOP.
+        let mut rom = vec![0xFF; 0x4000];
+        let code: &[u8] = &[
+            0x31, 0xFF, 0xDF, // LD SP,$DFFF
+            0x3E, 0x42,       // LD A,'B'
+            0xE0, 0x01,       // LDH [$FF01],A → SB='B'
+            0x3E, 0x81,       // LD A,$81
+            0xE0, 0x02,       // LDH [$FF02],A → SC=$81 : transfert démarré (64 T-cycles)
+            0x00,             // NOP
+            0x20, 0xFD,       // JR -3 → boucle infinie (NOP + JR)
+        ];
+        rom[0x0100..0x0100 + code.len()].copy_from_slice(code);
+
+        let mut emu = Emulator::new();
+        emu.load_rom(rom); // exécution immédiate du code ROM (IME reste désactivé : le drapeau doit se lever quand même)
+
+        assert_eq!(emu.mmu.io[0x0F] & 0x08, 0); // pas encore d'interruption série
+        emu.run_tcycles(64 + 128); // le transfert de 64 T-cycles s'achève (avec une marge)
+
+        assert_eq!(emu.mmu.io[0x0F] & 0x08, 0x08); // bit 3 de IF levé par l'achèvement du transfert
+        assert_eq!(emu.mmu.io[0x0F] & 0x07, 0);    // bits 0-2 (V-Blank/LC3C/Timer) non touchés
+    }
+}
