@@ -54,21 +54,28 @@ impl Emulator {
     /// État power-on post-boot ROM : CPU/PPU/SCC/timer réinitialisés, registres I/O matériels aux valeurs
     /// laissées par le boot ROM DMG au hand-off PC=$0100 (PanDocs « Power Up Sequence »), prêt à exécuter la ROM chargée.
     fn power_on(&mut self) {
-        self.cpu = CPU::new(); // Contient déjà l'état post-boot ROM (PC=0x0100, SP=$FFFE, registres corrects)
-        self.mmu.ppu = PPU::default(); // OBP0/OBP1 ($FF48/$FF49) valent $FF : non initialisées par le boot ROM → valeur la plus fréquente
-        self.mmu.serial = Serial::default(); // la SCC repart à l'état power-on (transcript vidé)
-        self.mmu.timer = Timer::default(); // le timer repart à l'état power-on (TIMA/TMA = $00, TAC se lit $F8 → désactivé)
+        // Les sous-composants repartent chacun à leur état post-boot ROM :
+        // - CPU::new()       → PC=0x0100, SP=$FFFE, registres corrects (cpu.rs).
+        // - PPU::default()   → LCDC=$91 (LCD allumé, fond activé), BGP=$FC, SCY/SCX/LYC/WX/WY=$00, OBP0/OBP1=$FF (ppu.rs).
+        // - Serial::default()→ SB=$00, SC=$00, aucun transfert en cours (serial.rs).
+        // - Timer::default() → TIMA/TMA=$00, TAC se lit $F8 → timer désactivé (timer.rs).
+        self.cpu = CPU::new();
+        self.mmu.ppu = PPU::default();
+        self.mmu.serial = Serial::default();
+        self.mmu.timer = Timer::default();
 
-        // CORRECTION : Initialisation des registres I/O aux valeurs post-boot DMG (PanDocs « Power Up Sequence »)
-        self.mmu.write(0xFF00, 0xCF); // P1 ($FF00) : joypad, aucun bouton pressé
-        self.mmu.serial.sc = 0x7E; // SC ($FF02) : bits 6..1 non écriturables par le logiciel — la valeur post-boot est conservée telle quelle (mmu.write masquerait les bits 6..1)
-        self.mmu.timer.counter = (0xABu16) << 8; // DIV ($FF04) se lit $AB : write_div ignore la valeur écrite et remet le compteur à $0000, d'où l'écriture directe du compteur système
-        self.mmu.write(0xFF07, 0xF8); // TAC ($FF07) : bits 7-3 toujours lus à 1 → timer désactivé au hand-off
-        self.mmu.write(0xFF48, 0xFF); // OBP0 : non initialisée par le boot ROM → valeur la plus fréquente
-        self.mmu.write(0xFF49, 0xFF); // OBP1
+        // Registres I/O matériels aux valeurs post-boot DMG (PanDocs « Power Up Sequence »).
+        // Certains ne peuvent PAS être posés via mmu.write car le matériel masque des bits :
+        self.mmu.write(0xFF00, 0xCF); // P1 ($FF00) : joypad, aucun bouton pressé.
+        self.mmu.serial.sc = 0x7E; // SC ($FF02) : seuls les bits 7 et 0 sont écriturables — la valeur post-boot $7E (bits 6..1 à 1) est conservée telle quelle ; mmu.write(0xFF02, 0x7E) donnerait $00.
+        self.mmu.timer.counter = (0xABu16) << 8; // DIV ($FF04) se lit $AB : write_div ignore la valeur écrite et remet le compteur à $0000, d'où l'écriture directe du compteur ; mmu.write(0xFF04, 0xAB) donnerait DIV=$00.
+        self.mmu.write(0xFF07, 0xF8); // TAC ($FF07) : bits 7-3 toujours lus à 1 → timer désactivé au hand-off (seuls les bits 2-0 sont écrits).
+        self.mmu.ie = 0x00; // IE ($FFFF) : toutes les sources d'interruption désactivées au hand-off.
 
         self.t_cycles = 0;
         self.instructions = 0;
+
+        log::info!("Post-boot ROM initialization complete");
     }
 
     /// Exécute une instruction et renvoie les T-cycles consommés.
@@ -194,6 +201,7 @@ mod tests {
         assert_eq!(emu.mmu.read(0xFF07), 0xF8); // TAC : bits 7-3 lus à 1, timer désactivé
         assert_eq!(emu.mmu.read(0xFF48), 0xFF); // OBP0 : non initialisée par le boot ROM → valeur la plus fréquente
         assert_eq!(emu.mmu.read(0xFF49), 0xFF); // OBP1
+        assert_eq!(emu.mmu.read(0xFFFF), 0x00); // IE : toutes les sources d'interruption désactivées au hand-off
 
         // L'état CPU post-boot ROM est inchangé.
         assert_eq!(emu.cpu.pc, 0x0100);
@@ -211,6 +219,7 @@ mod tests {
         emu.mmu.write(0xFF02, 0x81); // transfert série démarré
         emu.mmu.timer.write_div(0x42); // le compteur système est remis à zéro → DIV = $00
         emu.mmu.ppu.obp0 = 0xE4;
+        emu.mmu.ie = 0xFF; // toutes les sources d'interruption activées
 
         // …et un reset les ramène aux valeurs post-boot ROM.
         emu.reset();
@@ -220,6 +229,7 @@ mod tests {
         assert_eq!(emu.mmu.read(0xFF07), 0xF8);
         assert_eq!(emu.mmu.read(0xFF48), 0xFF);
         assert_eq!(emu.mmu.read(0xFF49), 0xFF);
+        assert_eq!(emu.mmu.read(0xFFFF), 0x00); // IE : réinitialisé à $00 au hand-off
     }
 
     #[test]
