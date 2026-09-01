@@ -935,12 +935,19 @@ pub fn handle_interrupts(cpu: &mut CPU, mmu: &mut MMU) -> Option<u32> {
         // HALT bug : une interruption pendante sort du HALT même si IME est false.
         cpu.halted = false;
         log::debug!(
-            "[CPU] HALT exited due to pending interrupt: IF={:02X}, IE={:02X}",
-            mmu.io[0x0F], mmu.ie,
+            "[CPU] HALT exited: pending={:02X}, IF={:02X}, IE={:02X}",
+            pending, mmu.io[0x0F], mmu.ie,
         );
     }
 
     if !cpu.ime || pending == 0 {
+        // Log seulement si IME=OFF mais interruptions pendantes (debug)
+        if !cpu.ime && pending != 0 {
+            log::debug!(
+                "[CPU] Interrupts pending but IME=OFF: pending={:02X}, IF={:02X}, IE={:02X}",
+                pending, mmu.io[0x0F], mmu.ie,
+            );
+        }
         return None;
     }
 
@@ -953,7 +960,7 @@ pub fn handle_interrupts(cpu: &mut CPU, mmu: &mut MMU) -> Option<u32> {
     };
 
     log::debug!(
-        "[CPU] Interrupt accepted: PC=${:04X} → ${:04X}, IF={:02X}, IE={:02X}",
+        "[CPU] INTERRUPT ACCEPTED: PC=${:04X} → ${:04X}, IF={:02X}, IE={:02X}, IME=ON→OFF",
         cpu.pc, vector, mmu.io[0x0F], mmu.ie,
     );
 
