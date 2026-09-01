@@ -14,16 +14,12 @@ mod serial;
 mod timer;
 
 fn main() -> eframe::Result {
-    // Initialiser env_logger en respectant la variable d'environnement RUST_LOG.
-    // Par défaut, niveau "info" si RUST_LOG n'est pas défini (et sortie toujours colorisée).
-    env_logger::Builder::from_env(
-        env_logger::Env::default()
-            .default_filter_or("info") // niveau par défaut
-            .default_write_style_or("always"),
-    )
-    .init();
+    // 1. Initialisation robuste qui lit RUST_LOG, ou fallback sur "debug" si vide
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
 
-    log::info!("FarquaadGB starting...");
+    // 2. Message de test garanti pour vérifier que le logger fonctionne
+    log::info!("🚀 [TEST] FarquaadGB démarre ! Si tu vois ceci, les logs fonctionnent.");
+    log::debug!("🔍 [DEBUG] Ce message ne s'affiche que si le niveau debug est actif.");
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
