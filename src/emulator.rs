@@ -62,8 +62,8 @@ impl Emulator {
         // La PPU avance du même nombre de T-cycles (timing LY/mode, Pan Docs « Rendering »).
         let frame_done = self.mmu.ppu.advance(cycles as u64);
         if frame_done {
-            // Une frame vidéo est achevée : le rendu Background/Fenêtre met à jour le framebuffer.
-            self.mmu.ppu.render_frame(&self.mmu.vram);
+            // Une frame vidéo est achevée : le rendu Background/Fenêtre/Sprites met à jour le framebuffer.
+            self.mmu.ppu.render_frame(&self.mmu.vram, &self.mmu.oam);
         }
         // Les requêtes d'interruption PPU en attente lèvent les bits correspondants de IF ($FF0F).
         let ppu_irq = self.mmu.ppu.take_interrupts();
@@ -130,7 +130,7 @@ impl Default for Emulator {
 mod tests {
     use super::*;
     use crate::cpu::flags::Flags;
-    use crate::ppu::{DOTS_PER_LINE, STAT_IRQ_LYC, STAT_IRQ_VBLANK};
+    use crate::ppu::{DOTS_PER_LINE, SCREEN_WIDTH, STAT_IRQ_LYC, STAT_IRQ_VBLANK};
 
     #[test]
     fn boot_state_after_load_rom() {
@@ -202,6 +202,31 @@ mod tests {
 
         assert_eq!(emu.mmu.ppu.framebuffer[0], PPU::shade(3)); // moitié gauche de la tuile → teinte 3
         assert_eq!(emu.mmu.ppu.framebuffer[4], PPU::shade(0)); // moitié droite → teinte 0
+    }
+
+    #[test]
+    fn frame_render_updates_sprites_from_oam() {
+        let mut emu = Emulator::new();
+        emu.load_test_program();
+
+        // Tuile 1 noire en $8010-$801F, écrite via le MMU (routing VRAM $8000-$9FFF).
+        for row in 0..8 {
+            emu.mmu.write(0x8010 + 2 * row as u16, 0xFF); // toutes les valeurs de pixel valent 3
+            emu.mmu.write(0x8011 + 2 * row as u16, 0xFF);
+        }
+        emu.mmu.write(0xFF40, 0x93); // LCD allumé, fond activé + sprites activées (bit 1)
+        emu.mmu.write(0xFF48, 0xE4); // OBP0 : teinte v pour une valeur de pixel v
+
+        // Entrée OAM 0 ($FE00-$FE03), écrite via le MMU (routing $FE00-$FE9F) : Y = 16, X = 32, tuile 1.
+        emu.mmu.write(0xFE00, 16);
+        emu.mmu.write(0xFE01, 32);
+        emu.mmu.write(0xFE02, 1);
+
+        emu.run_frame(); // une frame vidéo : le rendu est mis à jour à la frontière de frame
+
+        assert_eq!(emu.mmu.ppu.framebuffer[15 * SCREEN_WIDTH + 32], PPU::shade(3)); // coin haut-gauche du sprite (ligne Y-1)
+        assert_eq!(emu.mmu.ppu.framebuffer[22 * SCREEN_WIDTH + 39], PPU::shade(3)); // coin bas-droite (ligne Y+6, colonne X+7)
+        assert_eq!(emu.mmu.ppu.framebuffer[15 * SCREEN_WIDTH + 40], PPU::shade(0)); // juste à droite du sprite : fond blanc
     }
 
     #[test]
