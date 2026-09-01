@@ -7,7 +7,7 @@ use crate::cpu::flags::Flags;
 use crate::cpu::opcodes::disasm;
 use crate::emulator::{Emulator, FRAME_TCYCLES};
 use crate::ppu::{PPU, SCREEN_HEIGHT, SCREEN_WIDTH};
-use egui::{Color32, Visuals};
+use egui::{Align2, Color32, FontId, Visuals};
 
 /// État de l'application FarquaadGB.
 pub struct FarquaadGBApp {
@@ -18,6 +18,8 @@ pub struct FarquaadGBApp {
     running: bool,
     /// Fenêtre de debug « Pattern Table » (VRAM $8000-$97FF).
     show_pattern_table: bool,
+    /// Fenêtre de debug « Name Table » (carte de tuiles $9800).
+    show_name_table: bool,
     /// Texture écran (framebuffer PPU, NEAREST pour le pixel art).
     texture: Option<egui::TextureHandle>,
 }
@@ -37,6 +39,7 @@ impl FarquaadGBApp {
             rom_name: None,
             running: false,
             show_pattern_table: false,
+            show_name_table: false,
             texture: None,
         }
     }
@@ -107,6 +110,43 @@ impl FarquaadGBApp {
         let image = egui::ColorImage::from_rgba_unmultiplied([width, height], bytemuck::cast_slice(&pixels));
         let texture = ui.ctx().load_texture("pattern_table", image, egui::TextureOptions::NEAREST);
         ui.add(egui::Image::new(&texture).fit_to_exact_size(egui::vec2(width as f32 * 3.0, height as f32 * 3.0)));
+    }
+
+    /// Dessine la fenêtre de debug « Name Table » : la carte de tuiles 32×32 en $9800, chaque cellule colorée
+    /// selon l'index (teintes DMG) et affichant la valeur numérique de la tuile en monospace.
+    fn show_name_table_debug(&self, ui: &mut egui::Ui) {
+        let vram = &self.emulator.mmu.vram;
+
+        const COLS: usize = 32; // carte de tuiles 32×32 ($9800-$9BFF)
+        const ROWS: usize = 32;
+        const MAP_OFFSET: usize = 0x9800 - 0x8000; // base de la carte dans vram
+        const CELL: egui::Vec2 = egui::vec2(20.0, 16.0);
+
+        egui::Grid::new("name_table_grid")
+            .spacing(egui::vec2(2.0, 2.0))
+            .show(ui, |g| {
+                for row in 0..ROWS {
+                    for col in 0..COLS {
+                        let index = vram[MAP_OFFSET + row * COLS + col];
+                        let [r, green, b] = crate::ppu::DMG_SHADES[(index & 0x03) as usize];
+                        // Cellule de taille fixe : fond coloré selon la teinte de la tuile.
+                        let (rect, _response) = g.allocate_exact_size(CELL, egui::Sense::hover());
+                        g.painter().rect_filled(rect, 0.0, Color32::from_rgb(r, green, b));
+                        // Texte monospace centré, lisible sur fond clair (noir) ou foncé (blanc).
+                        let text_color = if index & 0x03 < 2 { Color32::BLACK } else { Color32::WHITE };
+                        g.painter().text(
+                            rect.center(),
+                            Align2::CENTER_CENTER,
+                            index.to_string(),
+                            FontId::monospace(14.0),
+                            text_color,
+                        );
+                    }
+                    if row + 1 < ROWS {
+                        g.end_row();
+                    }
+                }
+            });
     }
 
     /// Dessine le panneau de debug CPU.
@@ -240,6 +280,7 @@ impl eframe::App for FarquaadGBApp {
                     self.load_test_program();
                 }
                 ui.checkbox(&mut self.show_pattern_table, "🔍 Pattern Table");
+                ui.checkbox(&mut self.show_name_table, "🗺 Name Table");
                 ui.separator();
                 match &self.rom_name {
                     Some(name) => {
@@ -289,6 +330,14 @@ impl eframe::App for FarquaadGBApp {
             egui::Window::new("🔍 Pattern Table (VRAM $8000)")
                 .show(ctx, |ui| {
                     self.show_pattern_table_debug(ui);
+                });
+        }
+
+        // Fenêtre de debug « Name Table » (carte de tuiles $9800).
+        if self.show_name_table {
+            egui::Window::new("🗺 Name Table (VRAM $9800)")
+                .show(ctx, |ui| {
+                    self.show_name_table_debug(ui);
                 });
         }
     }
