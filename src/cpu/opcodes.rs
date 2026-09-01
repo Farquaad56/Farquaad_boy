@@ -447,8 +447,13 @@ fn ret_cond(cpu: &mut CPU, mmu: &mut MMU, taken: bool) -> u32 {
 
 /// RETI (16 T-cycles) : comme RET mais réactive IME.
 fn reti(cpu: &mut CPU, mmu: &mut MMU) -> u32 {
-    cpu.pc = pop16(cpu, mmu);
-    cpu.ime = true;
+    let return_pc = pop16(cpu, mmu);
+    cpu.pc = return_pc;
+    cpu.ime = true; // le drapeau IF correspondant a déjà été effacé à l'acceptation de l'interruption
+    log::debug!(
+        "[CPU] RETI → PC=${:04X}, IME re-armed (IF={:02X})",
+        return_pc, mmu.io[0x0F],
+    );
     16
 }
 
@@ -923,6 +928,12 @@ pub fn handle_interrupts(cpu: &mut CPU, mmu: &mut MMU) -> Option<u32> {
     if cpu.halted && pending != 0 {
         // HALT bug : une interruption pendante sort du HALT même si IME est false.
         cpu.halted = false;
+        if !cpu.ime {
+            log::debug!(
+                "[CPU] HALT exited by pending IRQ (IF&IE={:02X}, IF={:02X}, IE={:02X}) but IME=OFF → no vector jump",
+                pending, mmu.io[0x0F], mmu.ie,
+            );
+        }
     }
 
     if !cpu.ime || pending == 0 {
@@ -930,6 +941,21 @@ pub fn handle_interrupts(cpu: &mut CPU, mmu: &mut MMU) -> Option<u32> {
     }
 
     // Service de l'interruption (20 T-cycles) : IME désactivé, PC poussé, saut au vecteur.
+    let vector = match pending {
+        p if p & 0x01 != 0 => 0x40, // V-Blank
+        p if p & 0x02 != 0 => 0x48, // LC3C / STAT
+        p if p & 0x04 != 0 => 0x50, // Timer
+        _ => 0x58,                  // Serial
+    };
+    let source = match pending {
+        p if p & 0x01 != 0 => "VBlank",
+        p if p & 0x02 != 0 => "STAT/LCD",
+        p if p & 0x04 != 0 => "Timer",
+        _ => "Serial",
+    };
+    let if_before = mmu.io[0x0F];
+    let return_pc = cpu.pc;
+
     cpu.ime = false;
     push16(cpu, mmu, cpu.pc);
 
@@ -942,12 +968,12 @@ pub fn handle_interrupts(cpu: &mut CPU, mmu: &mut MMU) -> Option<u32> {
     };
     mmu.io[0x0F] &= !bit_to_clear;
 
-    cpu.pc = match pending {
-        p if p & 0x01 != 0 => 0x40, // V-Blank
-        p if p & 0x02 != 0 => 0x48, // LC3C / STAT
-        p if p & 0x04 != 0 => 0x50, // Timer
-        _ => 0x58,                  // Serial
-    };
+    log::debug!(
+        "[CPU] IRQ accepted ({}): IME=ON, IF&IE={:02X}, IF {:02X}→{:02X} (cleared), jump PC ${:04X}→${:04X}",
+        source, pending, if_before, mmu.io[0x0F], return_pc, vector,
+    );
+
+    cpu.pc = vector;
     Some(20)
 }
 
