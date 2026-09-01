@@ -929,26 +929,24 @@ pub fn handle_interrupts(cpu: &mut CPU, mmu: &mut MMU) -> Option<u32> {
         return None;
     }
 
-    // Service de l'interruption (20 T-cycles) : IME désactivé, le bit IF correspondant à
-    // l'interruption acceptée est effacé automatiquement par le matériel (Pan Docs « Interrupt Sources »),
-    // PC poussé, saut au vecteur.
+    // Service de l'interruption (20 T-cycles) : IME désactivé, PC poussé, saut au vecteur.
     cpu.ime = false;
-    let mask = if pending & 0x01 != 0 {
-        0x01 // V-Blank (IF bit 0)
-    } else if pending & 0x02 != 0 {
-        0x02 // LC3C / STAT (IF bit 1)
-    } else if pending & 0x04 != 0 {
-        0x04 // Timer (IF bit 2)
-    } else {
-        0x08 // Serial (IF bit 3)
-    };
-    mmu.io[0x0F] &= !mask; // le matériel efface automatiquement le bit de l'interruption acceptée.
     push16(cpu, mmu, cpu.pc);
-    cpu.pc = match mask {
-        0x01 => 0x40,
-        0x02 => 0x48,
-        0x04 => 0x50,
-        _ => 0x58,
+
+    // CORRECTION CRITIQUE : Effacer le bit d'interruption dans le registre IF ($FF0F)
+    let bit_to_clear = match pending {
+        p if p & 0x01 != 0 => 0x01, // V-Blank
+        p if p & 0x02 != 0 => 0x02, // STAT/LCD
+        p if p & 0x04 != 0 => 0x04, // Timer
+        _ => 0x08,                  // Serial
+    };
+    mmu.io[0x0F] &= !bit_to_clear;
+
+    cpu.pc = match pending {
+        p if p & 0x01 != 0 => 0x40, // V-Blank
+        p if p & 0x02 != 0 => 0x48, // LC3C / STAT
+        p if p & 0x04 != 0 => 0x50, // Timer
+        _ => 0x58,                  // Serial
     };
     Some(20)
 }
