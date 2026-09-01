@@ -14,7 +14,16 @@ mod serial;
 mod timer;
 
 fn main() -> eframe::Result {
-    env_logger::init();
+    // Initialiser env_logger en respectant la variable d'environnement RUST_LOG.
+    // Par défaut, niveau "info" si RUST_LOG n'est pas défini (et sortie toujours colorisée).
+    env_logger::Builder::from_env(
+        env_logger::Env::default()
+            .default_filter_or("info") // niveau par défaut
+            .default_write_style_or("always"),
+    )
+    .init();
+
+    log::info!("FarquaadGB starting...");
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
