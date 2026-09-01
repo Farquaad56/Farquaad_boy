@@ -8,12 +8,12 @@
 //!   valeur de TAC (« DIV is always counting »).
 //! - Quand le timer est activé (bit 2 de TAC), TIMA ($FF05) s'incrémente à la période
 //!   sélectionnée par les bits 1-0 de TAC :
-//!     | TAC bits 1-0 | période    | fréquence |
-//!     |--------------|------------|-----------|
-//!     | 00           | 1024 T-cyc | 1024 Hz   |
-//!     | 01           | 16 T-cycles| 65536 Hz  |
-//!     | 10           | 64 T-cycles| 16384 Hz  |
-//!     | 11           | 256 T-cycles| 4096 Hz   |
+//!     | TAC bits 1-0 | période      | fréquence  |
+//!     |--------------|--------------|------------|
+//!     | 00           | 1024 T-cycles| 4096 Hz    |
+//!     | 01           | 16 T-cycles  | 262144 Hz  |
+//!     | 10           | 64 T-cycles  | 65536 Hz   |
+//!     | 11           | 256 T-cycles | 16384 Hz   |
 //! - Quand TIMA déborde (passe de $FF à $00), il est rechargé depuis TMA ($FF06) et le
 //!   drapeau Timer (bit 2 de IF, $FF0F) est levé un cycle plus tard.
 //! - Comportement obscur : écrire $FF04 remet tout le compteur système à zéro ; si le bit
@@ -157,6 +157,7 @@ impl Timer {
     /// Incrémente TIMA ; un débordement le recharge depuis TMA et met l'interruption en attente (levée au prochain `tick`).
     fn increment_tima(&mut self) {
         if self.tima == 0xFF {
+            log::debug!("TIMA débordement : rechargé depuis TMA=${:02X}, interruption Timer en attente (levée au prochain tick)", self.tma);
             self.tima = self.tma;
             self.pending_irq = true;
         } else {
