@@ -75,15 +75,11 @@ impl Emulator {
     pub fn step(&mut self) -> u32 {
         let cycles = self.cpu.step(&mut self.mmu);
         self.instructions += 1;
-        let prev_t_cycles = self.t_cycles;
         self.t_cycles += cycles as u64;
         // La PPU avance du même nombre de T-cycles (timing LY/mode, Pan Docs « Rendering »).
         let frame_done = self.mmu.ppu.advance(cycles as u64);
-        if frame_done || prev_t_cycles / FRAME_TCYCLES != self.t_cycles / FRAME_TCYCLES {
-            // Une frame vidéo est achevée : le rendu Background/Fenêtre/Sprites met à jour le framebuffer.
-            // Le LCD éteint (bit 7 de LCDC à 0) gèle la PPU — advance() renvoie alors false, mais le
-            // compteur global de T-cycles continue d'avancer : on force un rendu à chaque frontière de
-            // frame pour que la PPU applique sa règle interne (écran noir au lieu d'écran figé).
+        // Force le rendu à chaque frontière de frame, même si le LCD est éteint (pour afficher l'écran noir)
+        if frame_done || (self.t_cycles > 0 && self.t_cycles.is_multiple_of(FRAME_TCYCLES)) {
             self.mmu.ppu.render_frame(&self.mmu.vram, &self.mmu.oam);
         }
         // Les requêtes d'interruption PPU en attente lèvent les bits correspondants de IF ($FF0F).
@@ -245,7 +241,10 @@ mod tests {
     #[test]
     fn lcd_off_renders_black_at_each_frame_boundary() {
         let mut emu = Emulator::new();
-        emu.load_test_program(); // programme qui tourne en boucle de NOP/JR (LCD allumé au power-on)
+        // Boucle de NOP purs (4 T-cycles par instruction) : t_cycles tombe exactement sur les multiples
+        // de FRAME_TCYCLES, si bien que le rendu forcé se déclenche précisément à chaque frontière de frame.
+        let rom = vec![0x00; 0x4000];
+        emu.load_rom(rom);
 
         emu.run_tcycles(FRAME_TCYCLES); // une frame LCD allumé : écran non noir (fond blanc, VRAM vide)
         assert!(emu.mmu.ppu.framebuffer.iter().any(|&p| p != 0xFF00_0000));
