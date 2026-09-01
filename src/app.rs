@@ -6,7 +6,7 @@
 use crate::cpu::flags::Flags;
 use crate::cpu::opcodes::disasm;
 use crate::emulator::{Emulator, FRAME_TCYCLES};
-use crate::ppu::{SCREEN_HEIGHT, SCREEN_WIDTH};
+use crate::ppu::{PPU, SCREEN_HEIGHT, SCREEN_WIDTH};
 use egui::{Color32, Visuals};
 
 /// État de l'application FarquaadGB.
@@ -16,6 +16,8 @@ pub struct FarquaadGBApp {
     rom_name: Option<String>,
     /// Exécution automatique : une frame par update UI.
     running: bool,
+    /// Fenêtre de debug « Pattern Table » (VRAM $8000-$97FF).
+    show_pattern_table: bool,
     /// Texture écran (framebuffer PPU, NEAREST pour le pixel art).
     texture: Option<egui::TextureHandle>,
 }
@@ -34,6 +36,7 @@ impl FarquaadGBApp {
             emulator: Emulator::new(),
             rom_name: None,
             running: false,
+            show_pattern_table: false,
             texture: None,
         }
     }
@@ -71,6 +74,39 @@ impl FarquaadGBApp {
             .collect::<String>()
             .trim_end()
             .to_string()
+    }
+
+    /// Dessine la fenêtre de debug « Pattern Table » : les 384 tuiles de la VRAM ($8000-$97FF) en grille
+    /// de 16×24, colorées selon la palette BGP (teintes DMG).
+    fn show_pattern_table_debug(&self, ui: &mut egui::Ui) {
+        let vram = &self.emulator.mmu.vram;
+        let bgp = self.emulator.mmu.ppu.bgp;
+
+        const TILE_COLS: usize = 16; // 16 colonnes de tuiles (16 × 24 = 384 tuiles)
+        const TILE_ROWS: usize = 24;
+        const PITCH: usize = 9; // tuile de 8 px + séparateur noir de 1 px
+
+        let width = TILE_COLS * PITCH - 1; // 143 px
+        let height = TILE_ROWS * PITCH - 1; // 215 px
+        let mut pixels = vec![0xFF00_0000u32; width * height];
+
+        for tile in 0..(TILE_COLS * TILE_ROWS) {
+            let addr = tile * 16; // offset depuis $8000 dans vram
+            let col = (tile % TILE_COLS) * PITCH;
+            let row = (tile / TILE_COLS) * PITCH;
+            for ty in 0..8usize {
+                let upper = vram[addr + ty]; // bitplan 1 : MSB de chaque paire de pixels
+                let lower = vram[addr + 8 + ty]; // bitplan 2 : LSB de chaque paire de pixels
+                for tx in 0..8usize {
+                    let value = (((upper >> (7 - tx)) & 1) << 1) | ((lower >> (7 - tx)) & 1);
+                    pixels[(row + ty) * width + col + tx] = PPU::shade(bgp >> (value * 2));
+                }
+            }
+        }
+
+        let image = egui::ColorImage::from_rgba_unmultiplied([width, height], bytemuck::cast_slice(&pixels));
+        let texture = ui.ctx().load_texture("pattern_table", image, egui::TextureOptions::NEAREST);
+        ui.add(egui::Image::new(&texture).fit_to_exact_size(egui::vec2(width as f32 * 3.0, height as f32 * 3.0)));
     }
 
     /// Dessine le panneau de debug CPU.
@@ -203,6 +239,7 @@ impl eframe::App for FarquaadGBApp {
                 if ui.button("🧪 CPU Test").clicked() {
                     self.load_test_program();
                 }
+                ui.checkbox(&mut self.show_pattern_table, "🔍 Pattern Table");
                 ui.separator();
                 match &self.rom_name {
                     Some(name) => {
@@ -246,5 +283,13 @@ impl eframe::App for FarquaadGBApp {
             .show(ctx, |ui| {
                 self.show_cpu_debug(ui);
             });
+
+        // Fenêtre de debug « Pattern Table » (VRAM $8000-$97FF).
+        if self.show_pattern_table {
+            egui::Window::new("🔍 Pattern Table (VRAM $8000)")
+                .show(ctx, |ui| {
+                    self.show_pattern_table_debug(ui);
+                });
+        }
     }
 }
