@@ -43,6 +43,7 @@ impl Emulator {
     /// Charge une ROM `.gb` et redémarre le système à l'état power-on post-boot ROM ; la ROM est exécutée immédiatement à $0100.
     pub fn load_rom(&mut self, data: Vec<u8>) {
         self.mmu.load_rom(data);
+        dump_rom_handlers(&self.mmu); // diagnostic : contenu des 4 vecteurs d'interruption ($0040/$0048/$0050/$0058)
         self.power_on();
     }
 
@@ -175,6 +176,19 @@ impl Emulator {
 impl Default for Emulator {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Diagnostic : affiche les 8 octets de chaque vecteur d'interruption ($0040/$0048/$0050/$0058) pour vérifier
+/// que les handlers de la ROM sont bien là où on s'attend (Pan Docs « Interrupt Sources »).
+fn dump_rom_handlers(mmu: &MMU) {
+    log::info!("=== ROM Handler Dump ===");
+    for addr in [0x0040u16, 0x0048, 0x0050, 0x0058] {
+        let bytes: Vec<u8> = (0..8).map(|i| mmu.read(addr + i)).collect();
+        log::info!(
+            "Handler ${:04X}: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+            addr, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]
+        );
     }
 }
 

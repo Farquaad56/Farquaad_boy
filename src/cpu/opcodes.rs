@@ -78,6 +78,7 @@ fn read_a16(mmu: &MMU, at: u16) -> u16 {
 
 /// PUSH d'une valeur 16 bits (octet haut à SP-1, octet bas à SP-2).
 fn push16(cpu: &mut CPU, mmu: &mut MMU, value: u16) {
+    log::debug!("[CPU] PUSH: SP=${:04X} → ${:04X}, value=${:04X}", cpu.sp, cpu.sp.wrapping_sub(2), value);
     let sp = cpu.sp.wrapping_sub(1);
     mmu.write(sp, (value >> 8) as u8);
     let sp = sp.wrapping_sub(1);
@@ -89,8 +90,10 @@ fn push16(cpu: &mut CPU, mmu: &mut MMU, value: u16) {
 fn pop16(cpu: &mut CPU, mmu: &mut MMU) -> u16 {
     let lo = mmu.read(cpu.sp);
     let hi = mmu.read(cpu.sp.wrapping_add(1));
+    let value = u16::from_be_bytes([hi, lo]);
+    log::debug!("[CPU] POP: SP=${:04X} → ${:04X}, value=${:04X}", cpu.sp, cpu.sp.wrapping_add(2), value);
     cpu.sp = cpu.sp.wrapping_add(2);
-    u16::from_be_bytes([hi, lo])
+    value
 }
 
 // ---------------------------------------------------------------------------
@@ -451,8 +454,8 @@ fn reti(cpu: &mut CPU, mmu: &mut MMU) -> u32 {
     cpu.ime = true; // le drapeau IF correspondant a déjà été effacé à l'acceptation de l'interruption
 
     log::debug!(
-        "[CPU] RETI: returning to ${:04X}, IME re-enabled, IF={:02X}",
-        return_addr, mmu.io[0x0F],
+        "[CPU] RETI: return_addr=${:04X}, SP=${:04X}, IME re-enabled, IF={:02X}",
+        return_addr, cpu.sp, mmu.io[0x0F],
     );
 
     cpu.pc = return_addr;
@@ -929,7 +932,7 @@ pub fn execute_cb(cpu: &mut CPU, mmu: &mut MMU, sub_opcode: u8) -> u32 {
 /// HALT bug : si le CPU est en HALT et qu'une interruption est pendante (même si IME=false), l'état HALT est annulé ;
 /// si IME est également vrai, l'interruption est servied.
 pub fn handle_interrupts(cpu: &mut CPU, mmu: &mut MMU) -> Option<u32> {
-    let pending = mmu.io[0x0F] & mmu.ie; // IF ($FF0F) & IE ($FFFF)
+    let pending = mmu.io[0x0F] & mmu.ie; // IF ($FF0F) & IE
 
     if cpu.halted && pending != 0 {
         // HALT bug : une interruption pendante sort du HALT même si IME est false.
@@ -941,7 +944,6 @@ pub fn handle_interrupts(cpu: &mut CPU, mmu: &mut MMU) -> Option<u32> {
     }
 
     if !cpu.ime || pending == 0 {
-        // Log seulement si IME=OFF mais interruptions pendantes (debug)
         if !cpu.ime && pending != 0 {
             log::debug!(
                 "[CPU] Interrupts pending but IME=OFF: pending={:02X}, IF={:02X}, IE={:02X}",
@@ -951,12 +953,12 @@ pub fn handle_interrupts(cpu: &mut CPU, mmu: &mut MMU) -> Option<u32> {
         return None;
     }
 
-    // Service de l'interruption (20 T-cycles) : IME désactivé, PC poussé, saut au vecteur.
-    let vector = match pending {
-        p if p & 0x01 != 0 => 0x40, // V-Blank (IF bit 0)
-        p if p & 0x02 != 0 => 0x48, // LC3C / STAT (IF bit 1)
-        p if p & 0x04 != 0 => 0x50, // Timer (IF bit 2)
-        _ => 0x58,                  // Serial (IF bit 3)
+    // ✅ On récupère à la fois l'adresse du vecteur ET le bit précis à effacer dans IF
+    let (vector, bit_to_clear) = match pending {
+        p if p & 0x01 != 0 => (0x40, 0x01), // V-Blank (IF bit 0)
+        p if p & 0x02 != 0 => (0x48, 0x02), // LCDC / STAT (IF bit 1)
+        p if p & 0x04 != 0 => (0x50, 0x04), // Timer (IF bit 2)
+        _ => (0x58, 0x08),                  // Serial (IF bit 3)
     };
 
     log::debug!(
@@ -964,19 +966,17 @@ pub fn handle_interrupts(cpu: &mut CPU, mmu: &mut MMU) -> Option<u32> {
         cpu.pc, vector, mmu.io[0x0F], mmu.ie,
     );
 
-    cpu.ime = false;
-    push16(cpu, mmu, cpu.pc);
-
-    // Effacer le bit d'interruption dans le registre IF ($FF0F)
-    let bit_to_clear = match pending {
-        p if p & 0x01 != 0 => 0x01,
-        p if p & 0x02 != 0 => 0x02,
-        p if p & 0x04 != 0 => 0x04,
-        _ => 0x08,
-    };
+    // ✅ On efface le bit d'interruption dans le registre IF pour éviter la boucle infinie !
     mmu.io[0x0F] &= !bit_to_clear;
 
+    cpu.ime = false;
+    // ✅ Comportement matériel (Pan Docs « Interrupt Sources ») : l'adresse de retour est poussée sur la pile
+    // avant le saut au vecteur — ici `cpu.pc` pointe sur la prochaine instruction à exécuter (fetch pas encore
+    // fait), donc RETI repart exactement là où le code a été interrompu. Sans ce push, RETI poppe de la
+    // poubelle en RAM ($0000) et le CPU reste bloqué dans une boucle d'interruptions.
+    push16(cpu, mmu, cpu.pc);
     cpu.pc = vector;
+
     Some(20)
 }
 

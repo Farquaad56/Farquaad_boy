@@ -39,7 +39,7 @@ pub struct CPU {
 impl CPU {
     /// État de reset power-on (valeurs finales du boot ROM DMG).
     pub fn new() -> Self {
-        Self {
+        let cpu = Self {
             a: 0x01,
             f: 0xB0,
             b: 0x00,
@@ -48,12 +48,14 @@ impl CPU {
             e: 0xD8,
             h: 0x01,
             l: 0x4D,
-            sp: 0xFFFE,
+            sp: 0xFFFE, // valeur post-boot ROM DMG (Pan Docs « Power Up Sequence »)
             pc: 0x0100, // cible du vecteur de reset
             ime: false,
             halted: false,
             ei_delay: 0,
-        }
+        };
+        log::info!("[CPU] Initial state: SP=${:04X}, PC=${:04X}", cpu.sp, cpu.pc);
+        cpu
     }
 
     /// Registre AF combiné (A haut, F bas).
