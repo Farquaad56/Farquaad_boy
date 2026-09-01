@@ -5,6 +5,8 @@
 //! et les instructions d'interruption EI/DI/RETI (PanDocs « CPU Instruction Set »,
 //! gbdev « GameBoy CPU »).
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use crate::cpu::flags::Flags;
 use crate::cpu::CPU;
 use crate::mmu::MMU;
@@ -945,10 +947,16 @@ pub fn handle_interrupts(cpu: &mut CPU, mmu: &mut MMU) -> Option<u32> {
 
     if !cpu.ime || pending == 0 {
         if !cpu.ime && pending != 0 {
-            log::debug!(
-                "[CPU] Interrupts pending but IME=OFF: pending={:02X}, IF={:02X}, IE={:02X}",
-                pending, mmu.io[0x0F], mmu.ie,
-            );
+            // Throttle : loggue une occurrence sur 4096 pour éviter le spam instruction par instruction,
+            // tout en révélant où le CPU tourne avec IME éteint (PC constant = boucle bloquée).
+            static IRQ_OFF_COUNT: AtomicU32 = AtomicU32::new(0);
+            let n = IRQ_OFF_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            if n % 4096 == 1 {
+                log::debug!(
+                    "[CPU] Interrupts pending but IME=OFF: PC=${:04X}, opcode=${:02X}, pending={:02X}, IF={:02X}, IE={:02X}",
+                    cpu.pc, mmu.read(cpu.pc), pending, mmu.io[0x0F], mmu.ie,
+                );
+            }
         }
         return None;
     }
