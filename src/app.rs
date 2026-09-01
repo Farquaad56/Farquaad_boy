@@ -176,6 +176,9 @@ impl eframe::App for FarquaadGBApp {
         // Exécution automatique : une frame par update UI (~60 FPS).
         if self.running && self.emulator.mmu.rom_size() > 0 {
             self.emulator.run_frame();
+            // Force egui à se redessiner sans attendre un événement souris/clavier :
+            // sinon l'application passe en veille et le CPU n'avance que sur les événements UI.
+            ctx.request_repaint();
         }
 
         // Texture écran (zero-copy via bytemuck, NEAREST pour le pixel art).
