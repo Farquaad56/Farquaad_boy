@@ -88,8 +88,18 @@ impl Emulator {
         }
         // Les requêtes d'interruption PPU en attente lèvent les bits correspondants de IF ($FF0F).
         let ppu_irq = self.mmu.ppu.take_interrupts();
+        if ppu_irq != 0 {
+            log::debug!(
+                "[PPU] IRQ raised: {:02X}, IF before: {:02X}, LY={}, mode={}",
+                ppu_irq,
+                self.mmu.io[0x0F],
+                self.mmu.ppu.ly,
+                self.mmu.ppu.mode,
+            );
+        }
         if ppu_irq & IRQ_VBLANK != 0 {
             self.mmu.io[0x0F] |= 0x01; // bit 0 de IF : interruption VBlank demandée (vecteur $40)
+            log::debug!("[VBlank] IF set bit 0, new IF={:02X}", self.mmu.io[0x0F]);
         }
         if ppu_irq & IRQ_STAT != 0 {
             self.mmu.io[0x0F] |= 0x02; // bit 1 de IF : interruption STAT/LCD demandée (vecteur $48)
