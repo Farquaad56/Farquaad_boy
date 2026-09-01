@@ -6,6 +6,7 @@
 use crate::cpu::flags::Flags;
 use crate::cpu::opcodes::disasm;
 use crate::emulator::{Emulator, FRAME_TCYCLES};
+use crate::mmu::MMU;
 use crate::ppu::{PPU, SCREEN_HEIGHT, SCREEN_WIDTH};
 use egui::{Align2, Color32, FontId, Visuals};
 
@@ -22,6 +23,8 @@ pub struct FarquaadGBApp {
     show_name_table: bool,
     /// Fenêtre de debug « Processor » (registres/drapeaux CPU, style No$GBA/BGB).
     show_processor: bool,
+    /// Fenêtre de debug « IO Map » (carte des registres I/O $FF00-$FFFF).
+    show_io_map: bool,
     /// Texture écran (framebuffer PPU, NEAREST pour le pixel art).
     texture: Option<egui::TextureHandle>,
 }
@@ -43,6 +46,7 @@ impl FarquaadGBApp {
             show_pattern_table: false,
             show_name_table: false,
             show_processor: false,
+            show_io_map: false,
             texture: None,
         }
     }
@@ -398,6 +402,144 @@ impl FarquaadGBApp {
             }
         });
     }
+
+    /// Dessine la fenêtre de debug « IO Map » : carte des registres I/O $FF00-$FFFF groupés par section
+    /// (interruptions, LCD, timer, entrée, série), avec valeur hexadécimale et binaire.
+    fn show_io_map_window(&mut self, ctx: &egui::Context) {
+        egui::Window::new("🔌 IO Map")
+            .open(&mut self.show_io_map)
+            .resizable(true)
+            .show(ctx, |ui| {
+                let mmu = &self.emulator.mmu;
+
+                egui::Grid::new("io_map_grid").show(ui, |g| {
+                    // Section INTERRUPTS.
+                    g.label(egui::RichText::new("INTERRUPTS:").color(Color32::MAGENTA));
+                    g.end_row();
+
+                    Self::show_io_register(g, mmu, "$FFFF", "IE", 0xFFFF);
+                    g.end_row();
+                    Self::show_io_register(g, mmu, "$FF0F", "IF", 0xFF0F);
+                    g.end_row();
+
+                    Self::show_interrupt_line(g, mmu, "VBLNK", 0);
+                    g.end_row();
+                    Self::show_interrupt_line(g, mmu, "STAT", 1);
+                    g.end_row();
+                    Self::show_interrupt_line(g, mmu, "TIMER", 2);
+                    g.end_row();
+                    Self::show_interrupt_line(g, mmu, "SERIAL", 3);
+                    g.end_row();
+                    Self::show_interrupt_line(g, mmu, "JOYPAD", 4);
+                    g.end_row();
+
+                    // Séparateur pleine largeur : la ligne dépasse la cellule (clippée aux bords de la fenêtre).
+                    g.add(egui::Separator::default().grow(500.0));
+                    g.end_row();
+
+                    // Section LCD.
+                    g.label(egui::RichText::new("LCD:").color(Color32::CYAN));
+                    g.end_row();
+
+                    Self::show_io_register(g, mmu, "$FF40", "LCDC", 0xFF40);
+                    g.end_row();
+                    Self::show_io_register(g, mmu, "$FF41", "STAT", 0xFF41);
+                    g.end_row();
+                    Self::show_io_register(g, mmu, "$FF42", "SCY", 0xFF42);
+                    g.end_row();
+                    Self::show_io_register(g, mmu, "$FF43", "SCX", 0xFF43);
+                    g.end_row();
+                    Self::show_io_register(g, mmu, "$FF44", "LY", 0xFF44);
+                    g.end_row();
+                    Self::show_io_register(g, mmu, "$FF45", "LYC", 0xFF45);
+                    g.end_row();
+                    Self::show_io_register(g, mmu, "$FF46", "DMA", 0xFF46);
+                    g.end_row();
+                    Self::show_io_register(g, mmu, "$FF47", "BGP", 0xFF47);
+                    g.end_row();
+                    Self::show_io_register(g, mmu, "$FF48", "OBP0", 0xFF48);
+                    g.end_row();
+                    Self::show_io_register(g, mmu, "$FF49", "OBP1", 0xFF49);
+                    g.end_row();
+                    Self::show_io_register(g, mmu, "$FF4A", "WY", 0xFF4A);
+                    g.end_row();
+                    Self::show_io_register(g, mmu, "$FF4B", "WX", 0xFF4B);
+                    g.end_row();
+
+                    // Séparateur pleine largeur : la ligne dépasse la cellule (clippée aux bords de la fenêtre).
+                    g.add(egui::Separator::default().grow(500.0));
+                    g.end_row();
+
+                    // Section TIMER.
+                    g.label(egui::RichText::new("TIMER:").color(Color32::YELLOW));
+                    g.end_row();
+
+                    Self::show_io_register(g, mmu, "$FF04", "DIV", 0xFF04);
+                    g.end_row();
+                    Self::show_io_register(g, mmu, "$FF05", "TIMA", 0xFF05);
+                    g.end_row();
+                    Self::show_io_register(g, mmu, "$FF06", "TMA", 0xFF06);
+                    g.end_row();
+                    Self::show_io_register(g, mmu, "$FF07", "TAC", 0xFF07);
+                    g.end_row();
+
+                    // Séparateur pleine largeur : la ligne dépasse la cellule (clippée aux bords de la fenêtre).
+                    g.add(egui::Separator::default().grow(500.0));
+                    g.end_row();
+
+                    // Section INPUT.
+                    g.label(egui::RichText::new("INPUT:").color(Color32::GREEN));
+                    g.end_row();
+
+                    Self::show_io_register(g, mmu, "$FF00", "JOYP", 0xFF00);
+                    g.end_row();
+
+                    // Séparateur pleine largeur : la ligne dépasse la cellule (clippée aux bords de la fenêtre).
+                    g.add(egui::Separator::default().grow(500.0));
+                    g.end_row();
+
+                    // Section SERIAL.
+                    g.label(egui::RichText::new("SERIAL:").color(Color32::LIGHT_BLUE));
+                    g.end_row();
+
+                    Self::show_io_register(g, mmu, "$FF01", "SB", 0xFF01);
+                    g.end_row();
+                    Self::show_io_register(g, mmu, "$FF02", "SC", 0xFF02);
+                    g.end_row();
+                });
+            });
+    }
+
+    /// Affiche un registre I/O : adresse, nom, valeur hexadécimale et binaire (8 bits).
+    fn show_io_register(ui: &mut egui::Ui, mmu: &MMU, addr_str: &str, name: &str, addr: u16) {
+        let value = mmu.read(addr);
+
+        ui.label(egui::RichText::new(addr_str).color(Color32::CYAN));
+        ui.label(name);
+        ui.monospace(format!("${value:02X}"));
+        ui.monospace(format!("({value:08b})"));
+    }
+
+    /// Affiche une ligne d'interruption : état du bit dans IF (pendant) et IE (masque).
+    fn show_interrupt_line(ui: &mut egui::Ui, mmu: &MMU, name: &str, bit: usize) {
+        let if_reg = mmu.read(0xFF0F);
+        let ie_reg = mmu.read(0xFFFF);
+
+        let if_bit = ((if_reg >> bit) & 1) == 1;
+        let ie_bit = ((ie_reg >> bit) & 1) == 1;
+
+        ui.label(name);
+        ui.horizontal(|ui| {
+            ui.label("IF:");
+            let color = if if_bit { Color32::GREEN } else { Color32::RED };
+            ui.label(egui::RichText::new(if if_bit { "1" } else { "0" }).color(color));
+        });
+        ui.horizontal(|ui| {
+            ui.label("IE:");
+            let color = if ie_bit { Color32::GREEN } else { Color32::RED };
+            ui.label(egui::RichText::new(if ie_bit { "1" } else { "0" }).color(color));
+        });
+    }
 }
 
 impl eframe::App for FarquaadGBApp {
@@ -435,6 +577,7 @@ impl eframe::App for FarquaadGBApp {
                 ui.checkbox(&mut self.show_pattern_table, "🔍 Pattern Table");
                 ui.checkbox(&mut self.show_name_table, "🗺 Name Table");
                 ui.checkbox(&mut self.show_processor, "🧠 Processor");
+                ui.checkbox(&mut self.show_io_map, "🔌 IO Map");
                 ui.separator();
                 match &self.rom_name {
                     Some(name) => {
@@ -498,5 +641,8 @@ impl eframe::App for FarquaadGBApp {
         // Fenêtre de debug « Processor » (registres/drapeaux CPU, style No$GBA/BGB) : la visibilité est
         // pilotée par le bouton de fermeture via `.open(&mut self.show_processor)`.
         self.show_processor_window(ctx);
+
+        // Fenêtre de debug « IO Map » (carte des registres I/O $FF00-$FFFF).
+        self.show_io_map_window(ctx);
     }
 }
