@@ -355,6 +355,96 @@ mod tests {
     }
 
     #[test]
+    fn vblank_interrupt_wakes_halted_cpu() {
+        // Mini-ROM qui active l'interruption VBlank (bit 3 de STAT), IE = $01, EI puis HALT :
+        // le CPU doit se réveiller au vecteur $40 à l'entrée en VBlank de la frame courante.
+        let mut rom = vec![0xFF; 0x4000];
+        let code: &[u8] = &[
+            0x31, 0xFF, 0xDF, // LD SP,$DFFF
+            0x3E, 0x08,       // LD A,$08
+            0xE0, 0x41,       // LDH [$FF41],A → STAT = $08 : bit 3 posé (interruption VBlank activée)
+            0x3E, 0x01,       // LD A,$01
+            0xE0, 0xFF,       // LDH [$FFFF],A → IE = $01 : VBlank uniquement
+            0xFB,             // EI (IME effectif après l'instruction suivante)
+            0x76,             // HALT
+        ];
+        rom[0x0100..0x0100 + code.len()].copy_from_slice(code);
+        rom[0x40] = 0xE0; // LDH [$FFC0],A : marqueur du handler VBlank
+        rom[0x41] = 0xC0;
+        rom[0x42] = 0xC9; // RET
+
+        let mut emu = Emulator::new();
+        emu.load_rom(rom);
+        assert_eq!(emu.mmu.read(0xFFC0), 0); // marqueur vide avant exécution
+
+        emu.run_frame(); // l'entrée en VBlank (dot 65664) a lieu dans cette frame → bit 0 de IF → le CPU halté se réveille à $40
+        assert_eq!(emu.mmu.read(0xFFC0), 0x01); // handler VBlank exécuté (A = $01)
+    }
+
+    #[test]
+    fn timer_interrupt_wakes_halted_cpu() {
+        // Mini-ROM qui active le timer (TAC = $FC : bit 2 posé, sélection 00), TIMA = $FF, IE = $04 puis HALT :
+        // le débordement de TIMA doit réveiller le CPU au vecteur $50.
+        let mut rom = vec![0xFF; 0x4000];
+        let code: &[u8] = &[
+            0x31, 0xFF, 0xDF, // LD SP,$DFFF
+            0x3E, 0xFC,       // LD A,$FC
+            0xE0, 0x07,       // LDH [$FF07],A → TAC = $FC : timer activé (bit 2), sélection 00
+            0x3E, 0xFF,       // LD A,$FF
+            0xE0, 0x05,       // LDH [$FF05],A → TIMA = $FF : débordement au prochain tick
+            0x3E, 0x04,       // LD A,$04
+            0xE0, 0xFF,       // LDH [$FFFF],A → IE = $04 : Timer uniquement
+            0xFB,             // EI (IME effectif après l'instruction suivante)
+            0x76,             // HALT
+        ];
+        rom[0x0100..0x0100 + code.len()].copy_from_slice(code);
+        rom[0x50] = 0xE0; // LDH [$FFC0],A : marqueur du handler Timer
+        rom[0x51] = 0xC0;
+        rom[0x52] = 0xC9; // RET
+
+        let mut emu = Emulator::new();
+        emu.load_rom(rom);
+        assert_eq!(emu.mmu.read(0xFFC0), 0); // marqueur vide avant exécution
+
+        emu.run_frame();
+        assert_eq!(emu.mmu.read(0xFFC0), 0x04); // handler Timer exécuté (A = $04)
+    }
+
+    #[test]
+    fn vblank_interrupt_wakes_cpu_on_consecutive_frames() {
+        // Mini-ROM qui active l'interruption VBlank (bit 3 de STAT), IE = $01, EI puis boucle HALT :
+        // le CPU doit se réveiller au vecteur $40 à CHAQUE entrée en VBlank (une par frame).
+        let mut rom = vec![0xFF; 0x4000];
+        let code: &[u8] = &[
+            0x31, 0xFF, 0xDF, // LD SP,$DFFF
+            0x3E, 0x08,       // LD A,$08
+            0xE0, 0x41,       // LDH [$FF41],A → STAT = $08 : bit 3 posé (interruption VBlank activée)
+            0x3E, 0x01,       // LD A,$01
+            0xE0, 0xFF,       // LDH [$FFFF],A → IE = $01 : VBlank uniquement
+            0xFB,             // EI (IME effectif après l'instruction suivante)
+            0x76,             // HALT ($010C)
+            0x76,             // HALT ($010D) : ré-entrée en HALT après le RETI du handler
+        ];
+        rom[0x0100..0x0100 + code.len()].copy_from_slice(code);
+        // Handler VBlank à $40 : incrémente un compteur dans HRAM puis RETI (IME réactivé).
+        rom[0x40] = 0xF0; // LDH A,[$FFC0] (8)
+        rom[0x41] = 0xC0;
+        rom[0x42] = 0x3C; // INC A (4)
+        rom[0x43] = 0xE0; // LDH [$FFC0],A (8)
+        rom[0x44] = 0xC0;
+        rom[0x45] = 0xD9; // RETI (16) : retour à $010D + IME réactivé
+
+        let mut emu = Emulator::new();
+        emu.load_rom(rom);
+        assert_eq!(emu.mmu.read(0xFFC0), 0); // compteur vide avant exécution
+
+        for frame in 0..3 {
+            emu.run_frame();
+            assert_eq!(emu.mmu.read(0xFFC0), (frame + 1) as u8); // un réveil VBlank par frame
+        }
+    }
+
+    #[test]
     fn flags_roundtrip() {
         let mut cpu = CPU::new(); // f = 0xB0 (Z|H|C — le carry est actif au power-on)
         assert_eq!(cpu.flags(), Flags::Z | Flags::H | Flags::C);
