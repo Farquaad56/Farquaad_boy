@@ -1,18 +1,19 @@
 //! Timer : registres DIV ($FF04), TIMA ($FF05), TMA ($FF06) et TAC ($FF07).
 //!
 //! Partie 9 : émulé sur la base des T-cycles, d'après Pan Docs « Timer and Divider
-//! Registers » et « Timer Obscure Behaviour » (modèle identique à sameboy/mGBA/mooneye-gb) :
+//! Registers » et « Timer Obscure Behaviour » (périodes, rechargement TMA et comportements
+//! d'écriture conformes) :
 //! - Un compteur système interne de 16 bits s'incrémente à chaque T-cycle. DIV ($FF04) en est
 //!   le haut (bits [15..8]) : il change de valeur toutes les 256 T-cycles, quelle que soit la
 //!   valeur de TAC (« DIV is always counting »).
-//! - TIMA ($FF05) s'incrémente sur l'edge descendant du bit du compteur sélectionné par TAC
-//!   (bits 1-0), quand le timer est activé (bit 2) :
-//!     | TAC bits 1-0 | bit du compteur | période    | fréquence |
-//!     |--------------|-----------------|------------|-----------|
-//!     | 00           | 9               | 1024 T-cyc | 1024 Hz   |
-//!     | 01           | 3               | 16 T-cycles| 65536 Hz  |
-//!     | 10           | 5               | 64 T-cycles| 16384 Hz  |
-//!     | 11           | 7               | 256 T-cycles| 4096 Hz   |
+//! - Quand le timer est activé (bit 2 de TAC), TIMA ($FF05) s'incrémente à la période
+//!   sélectionnée par les bits 1-0 de TAC :
+//!     | TAC bits 1-0 | période    | fréquence |
+//!     |--------------|------------|-----------|
+//!     | 00           | 1024 T-cyc | 1024 Hz   |
+//!     | 01           | 16 T-cycles| 65536 Hz  |
+//!     | 10           | 64 T-cycles| 16384 Hz  |
+//!     | 11           | 256 T-cycles| 4096 Hz   |
 //! - Quand TIMA déborde (passe de $FF à $00), il est rechargé depuis TMA ($FF06) et le
 //!   drapeau Timer (bit 2 de IF, $FF0F) est levé un cycle plus tard.
 //! - Comportement obscur : écrire $FF04 remet tout le compteur système à zéro ; si le bit
@@ -23,25 +24,13 @@
 /// Bits du compteur système sélectionnés par TAC (bits 1-0) pour l'incrément de TIMA.
 const TAC_TRIGGER_BITS: [u16; 4] = [1 << 9, 1 << 3, 1 << 5, 1 << 7];
 
-/// État du rechargement de TIMA après un débordement (Pan Docs « Timer Obscure Behaviour »).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum ReloadState {
-    /// Timer normal : les écritures de TIMA/TMA prennent effet immédiatement.
-    #[default]
-    Running,
-    /// Cycle du débordement : TIMA vient d'être rechargé depuis TMA ; l'interruption est en attente.
-    Reloading,
-    /// Cycle suivant le débordement : le drapeau IF vient d'être levé ; une écriture de TIMA est ignorée.
-    Reloaded,
-}
-
 /// Timer de l'émulateur (registres $FF04-$FF07), synchronisé sur les T-cycles.
 #[allow(clippy::upper_case_acronyms)]
 #[derive(Default)]
 
 pub struct Timer {
-    /// Compteur système interne : s'incrémente à chaque T-cycle ; DIV = bits [15..8].
-    /// Placé à $AB00 dans l'état post-boot ROM (DIV se lit alors $AB — PanDocs « Power Up Sequence »).
+    /// Compteur système interne : s'incrémente à chaque T-cycle quelle que soit la valeur de TAC ;
+    /// DIV = bits [15..8]. Placé à $AB00 dans l'état post-boot ROM (DIV se lit alors $AB — PanDocs « Power Up Sequence »).
     pub counter: u16,
     /// Registre TIMA ($FF05) : compteur de timer.
     tima: u8,
@@ -49,8 +38,10 @@ pub struct Timer {
     tma: u8,
     /// Registre TAC ($FF07) : seuls les bits 2-0 sont écriturables (bit 2 = enable).
     tac: u8,
-    /// État du rechargement de TIMA après un débordement.
-    reload_state: ReloadState,
+    /// Accumulateur de phase : T-cycles écoulés depuis le dernier tick de TIMA.
+    timer_counter: u32,
+    /// Débordement en attente : l'interruption Timer sera levée au prochain `tick` (un cycle plus tard).
+    pending_irq: bool,
 }
 
 impl Timer {
@@ -95,24 +86,13 @@ impl Timer {
     }
 
     /// Écriture de TIMA ($FF05).
-    ///
-    /// Ignorée pendant le cycle « reloaded » qui suit un débordement : le registre est alors
-    /// constamment recopié depuis TMA (Pan Docs « Timer Obscure Behaviour »).
     pub fn write_tima(&mut self, value: u8) {
-        if self.reload_state != ReloadState::Reloaded {
-            self.tima = value;
-        }
+        self.tima = value;
     }
 
     /// Écriture de TMA ($FF06).
-    ///
-    /// Pendant la fenêtre de rechargement qui suit un débordement, la nouvelle valeur est aussi
-    /// copiée dans TIMA (Pan Docs « Timer Obscure Behaviour »).
     pub fn write_tma(&mut self, value: u8) {
         self.tma = value;
-        if self.reload_state != ReloadState::Running {
-            self.tima = value;
-        }
     }
 
     /// Écriture de TAC ($FF07) : seuls les bits 2-0 sont pris en compte.
@@ -133,15 +113,34 @@ impl Timer {
     }
 
     /// Fait avancer le timer de `cycles` T-cycles.
-    /// Renvoie true si un débordement de TIMA a demandé l'interruption Timer pendant ce pas
-    /// (l'appelant doit alors poser le bit 2 du registre IF).
+    /// Renvoie true si l'interruption Timer doit être levée (l'appelant doit alors poser le bit 2 du registre IF).
     pub fn tick(&mut self, cycles: u32) -> bool {
+        // Débordement en attente (depuis un tick précédent ou une écriture DIV/TAC) : levé maintenant,
+        // soit « un cycle plus tard » par rapport au débordement — Pan Docs « Timer Obscure Behaviour ».
         let mut interrupt = false;
-        for _ in 0..cycles {
-            if self.step_cycle() {
-                interrupt = true;
+        if self.pending_irq {
+            self.pending_irq = false;
+            interrupt = true;
+        }
+
+        // DIV compte toujours (« DIV is always counting ») : le compteur système avance quelle que soit la valeur de TAC.
+        self.counter = self.counter.wrapping_add(cycles as u16);
+
+        if self.is_enabled() {
+            let freq = match self.tac & 0x03 {
+                0 => 1024,
+                1 => 16,
+                2 => 64,
+                _ => 256,
+            };
+
+            self.timer_counter += cycles;
+            while self.timer_counter >= freq {
+                self.timer_counter -= freq;
+                self.increment_tima();
             }
         }
+
         interrupt
     }
 
@@ -155,38 +154,13 @@ impl Timer {
         TAC_TRIGGER_BITS[(tac & 0x03) as usize]
     }
 
-    /// Un T-cycle : machine d'état du rechargement, puis incrément du compteur système.
-    /// Renvoie true si le drapeau IF Timer doit être levé ce cycle (un cycle après un débordement).
-    fn step_cycle(&mut self) -> bool {
-        // Le drapeau est levé un cycle après le débordement (Pan Docs « Timer Obscure Behaviour »).
-        let mut interrupt = false;
-        match self.reload_state {
-            ReloadState::Reloaded => self.reload_state = ReloadState::Running,
-            ReloadState::Reloading => {
-                interrupt = true;
-                self.reload_state = ReloadState::Reloaded;
-            }
-            ReloadState::Running => {}
-        }
-
-        let old = self.counter;
-        self.counter = old.wrapping_add(1);
-        // TIMA s'incrémente sur l'edge descendant du bit sélectionné par TAC.
-        if self.is_enabled() {
-            let triggers = old & !self.counter;
-            if (triggers & Self::trigger_bit(self.tac)) != 0 {
-                self.increment_tima();
-            }
-        }
-        interrupt
-    }
-
-    /// Incrémente TIMA ; un débordement le recharge depuis TMA et met l'interruption en attente.
+    /// Incrémente TIMA ; un débordement le recharge depuis TMA et met l'interruption en attente (levée au prochain `tick`).
     fn increment_tima(&mut self) {
-        self.tima = self.tima.wrapping_add(1);
-        if self.tima == 0 {
+        if self.tima == 0xFF {
             self.tima = self.tma;
-            self.reload_state = ReloadState::Reloading;
+            self.pending_irq = true;
+        } else {
+            self.tima += 1;
         }
     }
 }
@@ -348,22 +322,21 @@ mod tests {
     }
 
     #[test]
-    fn reload_window_write_behaviour() {
+    fn overflow_reload_then_plain_writes() {
         let mut t = Timer::new();
         t.write_tac(0x07); // select 11 : tick toutes les 256 T-cycles
         t.write_tma(0x33);
         t.write_tima(0xFF);
 
-        t.tick(256); // débordement : TIMA = TMA, interruption en attente (état « reloading »)
+        assert!(!t.tick(256)); // débordement : TIMA rechargé depuis TMA, interruption en attente…
         assert_eq!(t.read_tima(), 0x33);
+        assert!(t.tick(1)); // …levée un cycle plus tard
 
-        t.write_tma(0x44); // pendant la fenêtre de rechargement…
+        t.write_tma(0x44); // écriture simple : pas de fenêtre de rechargement particulière…
         assert_eq!(t.read_tma(), 0x44);
-        assert_eq!(t.read_tima(), 0x44); // …la nouvelle valeur est aussi copiée dans TIMA
-
-        assert!(t.tick(1)); // interruption demandée, état « reloaded »
-        t.write_tima(0x55); // ignorée : TIMA est recopié depuis TMA
-        assert_eq!(t.read_tima(), 0x44);
+        assert_eq!(t.read_tima(), 0x33); // …TIMA n'est pas recopié depuis TMA avant le prochain tick
+        t.write_tima(0x55); // écriture simple : prise en compte immédiatement
+        assert_eq!(t.read_tima(), 0x55);
     }
 }
 
