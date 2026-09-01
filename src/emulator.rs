@@ -77,9 +77,13 @@ impl Emulator {
         self.instructions += 1;
         self.t_cycles += cycles as u64;
         // La PPU avance du même nombre de T-cycles (timing LY/mode, Pan Docs « Rendering »).
-        let frame_done = self.mmu.ppu.advance(cycles as u64);
-        // Force le rendu à chaque frontière de frame, même si le LCD est éteint (pour afficher l'écran noir)
-        if frame_done || (self.t_cycles > 0 && self.t_cycles.is_multiple_of(FRAME_TCYCLES)) {
+        let _frame_done = self.mmu.ppu.advance(cycles as u64);
+
+        // CORRECTION CRITIQUE : Rendre à chaque frame, pas seulement à la frontière exacte — dès que
+        // t_cycles franchit un multiple de FRAME_TCYCLES (même si le LCD est éteint et la PPU gelée),
+        // le rendu est forcé : écran noir au lieu d'écran figé.
+        let frame_tcycle = self.t_cycles % FRAME_TCYCLES;
+        if frame_tcycle < cycles as u64 {
             self.mmu.ppu.render_frame(&self.mmu.vram, &self.mmu.oam);
         }
         // Les requêtes d'interruption PPU en attente lèvent les bits correspondants de IF ($FF0F).
@@ -241,10 +245,10 @@ mod tests {
     #[test]
     fn lcd_off_renders_black_at_each_frame_boundary() {
         let mut emu = Emulator::new();
-        // Boucle de NOP purs (4 T-cycles par instruction) : t_cycles tombe exactement sur les multiples
-        // de FRAME_TCYCLES, si bien que le rendu forcé se déclenche précisément à chaque frontière de frame.
-        let rom = vec![0x00; 0x4000];
-        emu.load_rom(rom);
+        // Programme qui tourne en boucle de NOP/JR (LCD allumé au power-on) : les T-cycles par instruction
+        // ne s'alignent pas sur FRAME_TCYCLES — le rendu forcé doit donc se déclencher à chaque franchissement
+        // de frontière, et non seulement quand t_cycles tombe pile sur un multiple.
+        emu.load_test_program();
 
         emu.run_tcycles(FRAME_TCYCLES); // une frame LCD allumé : écran non noir (fond blanc, VRAM vide)
         assert!(emu.mmu.ppu.framebuffer.iter().any(|&p| p != 0xFF00_0000));
