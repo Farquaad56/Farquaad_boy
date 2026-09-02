@@ -73,10 +73,14 @@ impl Emulator {
         self.mmu.write(0xFF07, 0xF8); // TAC ($FF07) : bits 7-3 toujours lus à 1 → timer désactivé au hand-off (seuls les bits 2-0 sont écrits).
         self.mmu.ie = 0x00; // IE ($FFFF) : toutes les sources d'interruption désactivées au hand-off.
 
+        // CORRECTION CRITIQUE : Activer VBlank interrupt dans STAT
+        // $20 = 00100000 = bit 5 (VBlank IRQ enable)
+        self.mmu.write(0xFF41, 0x20); // STAT
+
         self.t_cycles = 0;
         self.instructions = 0;
 
-        log::info!("Post-boot ROM initialization complete");
+        log::info!("[Emulator] Post-boot initialization: STAT=$20 (VBlank IRQ enabled)");
     }
 
     /// Exécute une instruction et renvoie les T-cycles consommés.
@@ -84,9 +88,10 @@ impl Emulator {
         let cycles = self.cpu.step(&mut self.mmu);
         self.instructions += 1;
         self.t_cycles += cycles as u64;
+        self.cpu.t_cycles = self.t_cycles; // garde le compteur du CPU synchronisé (throttle des logs par frame)
 
         // --- Diagnostic de blocage HALT : "battement de cœur" toutes les 10 000 instructions ---
-        if self.cpu.halted && self.instructions.is_multiple_of(10000) {
+        if self.cpu.halted && self.instructions % 10000 == 0 {
             log::debug!(
                 "[CPU] STUCK IN HALT: PC=${:04X}, IF={:02X}, IE={:02X}, IME={}, PPU_Mode={}, LY={}",
                 self.cpu.pc,
@@ -99,29 +104,35 @@ impl Emulator {
         }
 
         // La PPU avance du même nombre de T-cycles (timing LY/mode, Pan Docs « Rendering »).
-        let _frame_done = self.mmu.ppu.advance(cycles as u64);
+        let frame_done = self.mmu.ppu.advance(cycles as u64);
 
         // CORRECTION CRITIQUE : Rendre à chaque frame, pas seulement à la frontière exacte — dès que
         // t_cycles franchit un multiple de FRAME_TCYCLES (même si le LCD est éteint et la PPU gelée),
-        // le rendu est forcé : écran noir au lieu d'écran figé.
+        // le rendu est forcé : écran noir au lieu d'écran figé. Le test `frame_tcycle < cycles` détecte
+        // le franchissement quelle que soit la longueur des instructions (un modulo == 0 ne tomberait
+        // jamais juste avec des instructions de 1 à 20 T-cycles).
         let frame_tcycle = self.t_cycles % FRAME_TCYCLES;
-        if frame_tcycle < cycles as u64 {
+        if frame_done || frame_tcycle < cycles as u64 {
             self.mmu.ppu.render_frame(&self.mmu.vram, &self.mmu.oam);
+            log::debug!("[PPU] Frame rendered at t_cycles={}", self.t_cycles);
         }
         // Les requêtes d'interruption PPU en attente lèvent les bits correspondants de IF ($FF0F).
         let ppu_irq = self.mmu.ppu.take_interrupts();
+
+        // LOG CRITIQUE
         if ppu_irq != 0 {
             log::debug!(
-                "[PPU] IRQ raised: {:02X}, IF before: {:02X}, LY={}, mode={}",
+                "[PPU] IRQ raised: ${:02X}, IF before: ${:02X}, LY={}, mode={}",
                 ppu_irq,
                 self.mmu.io[0x0F],
                 self.mmu.ppu.ly,
                 self.mmu.ppu.mode,
             );
         }
+
         if ppu_irq & IRQ_VBLANK != 0 {
             self.mmu.io[0x0F] |= 0x01; // bit 0 de IF : interruption VBlank demandée (vecteur $40)
-            log::debug!("[VBlank] IF set bit 0, new IF={:02X}", self.mmu.io[0x0F]);
+            log::debug!("[VBlank] IF bit 0 set, new IF=${:02X}", self.mmu.io[0x0F]);
         }
         if ppu_irq & IRQ_STAT != 0 {
             self.mmu.io[0x0F] |= 0x02; // bit 1 de IF : interruption STAT/LCD demandée (vecteur $48)
@@ -404,13 +415,13 @@ mod tests {
 
     #[test]
     fn vblank_interrupt_wakes_halted_cpu() {
-        // Mini-ROM qui active l'interruption VBlank (bit 3 de STAT), IE = $01, EI puis HALT :
+        // Mini-ROM qui active l'interruption VBlank (bit 5 de STAT), IE = $01, EI puis HALT :
         // le CPU doit se réveiller au vecteur $40 à l'entrée en VBlank de la frame courante.
         let mut rom = vec![0xFF; 0x4000];
         let code: &[u8] = &[
             0x31, 0xFF, 0xDF, // LD SP,$DFFF
-            0x3E, 0x08,       // LD A,$08
-            0xE0, 0x41,       // LDH [$FF41],A → STAT = $08 : bit 3 posé (interruption VBlank activée)
+            0x3E, 0x20,       // LD A,$20
+            0xE0, 0x41,       // LDH [$FF41],A → STAT = $20 : bit 5 posé (interruption VBlank activée)
             0x3E, 0x01,       // LD A,$01
             0xE0, 0xFF,       // LDH [$FFFF],A → IE = $01 : VBlank uniquement
             0xFB,             // EI (IME effectif après l'instruction suivante)
@@ -460,13 +471,13 @@ mod tests {
 
     #[test]
     fn vblank_interrupt_wakes_cpu_on_consecutive_frames() {
-        // Mini-ROM qui active l'interruption VBlank (bit 3 de STAT), IE = $01, EI puis boucle HALT :
+        // Mini-ROM qui active l'interruption VBlank (bit 5 de STAT), IE = $01, EI puis boucle HALT :
         // le CPU doit se réveiller au vecteur $40 à CHAQUE entrée en VBlank (une par frame).
         let mut rom = vec![0xFF; 0x4000];
         let code: &[u8] = &[
             0x31, 0xFF, 0xDF, // LD SP,$DFFF
-            0x3E, 0x08,       // LD A,$08
-            0xE0, 0x41,       // LDH [$FF41],A → STAT = $08 : bit 3 posé (interruption VBlank activée)
+            0x3E, 0x20,       // LD A,$20
+            0xE0, 0x41,       // LDH [$FF41],A → STAT = $20 : bit 5 posé (interruption VBlank activée)
             0x3E, 0x01,       // LD A,$01
             0xE0, 0xFF,       // LDH [$FFFF],A → IE = $01 : VBlank uniquement
             0xFB,             // EI (IME effectif après l'instruction suivante)

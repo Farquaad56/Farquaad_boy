@@ -157,7 +157,7 @@ impl Timer {
     /// Incrémente TIMA ; un débordement le recharge depuis TMA et met l'interruption en attente (levée au prochain `tick`).
     fn increment_tima(&mut self) {
         if self.tima == 0xFF {
-            log::debug!("TIMA débordement : rechargé depuis TMA=${:02X}, interruption Timer en attente (levée au prochain tick)", self.tma);
+            log::debug!("TIMA débordement : rechargé depuis TMA=${:02X}, interruption Timer en attente", self.tma);
             self.tima = self.tma;
             self.pending_irq = true;
         } else {

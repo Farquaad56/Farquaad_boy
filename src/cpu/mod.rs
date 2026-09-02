@@ -6,6 +6,7 @@
 pub mod flags;
 pub mod opcodes;
 
+use crate::emulator::FRAME_TCYCLES;
 use crate::mmu::MMU;
 use flags::Flags;
 
@@ -34,6 +35,10 @@ pub struct CPU {
     /// Retard d'activation de IME après un EI : IME n'est réactivé qu'une fois l'instruction
     /// suivant l'EI exécutée (Pan Docs « CPU Instruction Set »). 0 = pas de retard en cours.
     pub ei_delay: u8,
+    /// T-cycles écoulés au total — maintenu par `Emulator::step` (sert à throttler les logs par frame).
+    pub t_cycles: u64,
+    /// Index de la dernière frame où un log ISR a été émis (throttle 1/frame ; MAX = jamais émis).
+    pub isr_log_frame: u32,
 }
 
 impl CPU {
@@ -53,6 +58,8 @@ impl CPU {
             ime: false,
             halted: false,
             ei_delay: 0,
+            t_cycles: 0,
+            isr_log_frame: u32::MAX,
         };
         log::info!("[CPU] Initial state: SP=${:04X}, PC=${:04X}", cpu.sp, cpu.pc);
         cpu
@@ -98,9 +105,16 @@ impl CPU {
 
         let opcode = mmu.read(self.pc);
 
-        // LOG : tracer les instructions dans la zone des handlers d'interruption ($0040-$006F)
+        // LOG : tracer les instructions dans la zone des handlers d'interruption ($0040-$006F),
+        // throttlé à 1 log par frame (70224 T-cycles) : seul le premier opcode ISR de chaque frame est tracé.
+        // Un simple `t_cycles % FRAME_TCYCLES == 0` ne se déclencherait jamais — les instructions de longueur
+        // variable ne tombent jamais pile sur un multiple de 70224 ; d'où la détection par index de frame.
         if (0x0040..=0x006F).contains(&self.pc) {
-            log::debug!("[CPU] ISR executing: PC=${:04X}, opcode=${:02X}", self.pc, opcode);
+            let frame = self.t_cycles / FRAME_TCYCLES;
+            if frame != self.isr_log_frame as u64 {
+                self.isr_log_frame = frame as u32;
+                log::debug!("[CPU] ISR executing (1/frame): PC=${:04X}, opcode=${:02X}", self.pc, opcode);
+            }
         }
 
         self.pc = self.pc.wrapping_add(1);

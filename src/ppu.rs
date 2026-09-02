@@ -32,12 +32,12 @@ pub const FRAME_DOTS: u64 = FRAME_LINES as u64 * DOTS_PER_LINE as u64; // 70224
 /// Dot auquel commence le VBlank : début de la ligne 144 (Pan Docs « Rendering »).
 pub const VBLANK_START_DOT: u64 = SCREEN_HEIGHT as u64 * DOTS_PER_LINE as u64; // 65664
 
-/// Bit 3 du STAT : activation de l'interruption VBlank (mode 1).
-pub const STAT_IRQ_VBLANK: u8 = 1 << 3;
+/// Bit 3 du STAT : activation de l'interruption LYC==LY.
+pub const STAT_IRQ_LYC: u8 = 1 << 3;
 /// Bit 4 du STAT : activation de l'interruption mode 0 (HBlank).
 pub const STAT_IRQ_MODE0: u8 = 1 << 4;
-/// Bit 5 du STAT : activation de l'interruption LYC==LY.
-pub const STAT_IRQ_LYC: u8 = 1 << 5;
+/// Bit 5 du STAT : activation de l'interruption VBlank (mode 1).
+pub const STAT_IRQ_VBLANK: u8 = 1 << 5;
 /// Bit 6 du STAT : activation de l'interruption mode 2 (OAM Scan).
 pub const STAT_IRQ_MODE2: u8 = 1 << 6;
 
@@ -155,21 +155,16 @@ impl PPU {
         }
     }
 
-    /// Lit un registre PPU ($FF40-$FF4B). Les bits en lecture seule sont calculés : les drapeaux de
-    /// mode du STAT (bit 0 = HBlank, bit 1 = VBlank) et le drapeau LYC==LY (bit 2), la ligne courante.
+    /// Lit un registre PPU ($FF40-$FF4B). Le STAT renvoie les bits d'activation écrits (bits 3..6)
+    /// plus le drapeau LYC==LY en bit 7 (lecture seule, constamment mis à jour) ; les bits 0-2 sont
+    /// inutilisés sur le DMG et se lisent à 0. La ligne courante est lue via $FF44.
     pub fn read_register(&self, addr: u16) -> u8 {
         match addr {
             0xFF40 => self.lcdc,
             0xFF41 => {
                 let mut value = self.stat & 0x78; // bits d'activation des interruptions (bits 3..6)
-                if self.mode == 0 {
-                    value |= 1 << 0; // drapeau mode 0 (HBlank) — lecture seule
-                }
-                if self.mode == 1 {
-                    value |= 1 << 1; // drapeau mode 1 (VBlank) — lecture seule
-                }
                 if self.ly == self.lyc {
-                    value |= 1 << 2; // drapeau LYC==LY (lecture seule, constamment mis à jour)
+                    value |= 1 << 7; // drapeau LYC==LY (lecture seule, constamment mis à jour)
                 }
                 value
             }
@@ -192,7 +187,17 @@ impl PPU {
     pub fn write_register(&mut self, addr: u16, value: u8) {
         match addr {
             0xFF40 => self.lcdc = value,
-            0xFF41 => self.stat = value & 0x78, // bits 3..6 seulement (les bits 0-2 sont en lecture seule)
+            0xFF41 => {
+                log::debug!(
+                    "[PPU] STAT write: ${:02X} (VBlank IRQ: {}, LYC IRQ: {}, Mode0: {}, Mode2: {})",
+                    value,
+                    (value & 0x20) != 0, // bit 5 = VBlank
+                    (value & 0x08) != 0, // bit 3 = LYC
+                    (value & 0x10) != 0, // bit 4 = Mode 0 (HBlank)
+                    (value & 0x40) != 0, // bit 6 = Mode 2 (OAM Scan)
+                );
+                self.stat = value & 0x78; // bits 3..6 seulement (les bits 0-2 sont en lecture seule)
+            }
             0xFF42 => self.scy = value,
             0xFF43 => self.scx = value,
             0xFF44 => {} // LY : en lecture seule — l'écriture est ignorée
@@ -218,13 +223,20 @@ impl PPU {
         let prev_total = self.line as u64 * DOTS_PER_LINE as u64 + self.dots as u64;
         let new_total = prev_total + cycles;
 
+        // LOG CRITIQUE : Détecter le passage en VBlank (utilise crosses() pour gérer les wrap-around)
+        if Self::crosses(prev_total, new_total, VBLANK_START_DOT) {
+            log::debug!(
+                "[PPU] VBlank boundary crossed! STAT=${:02X}, VBlank bit: {}",
+                self.stat,
+                (self.stat & STAT_IRQ_VBLANK) != 0,
+            );
+        }
+
         // Requêtes d'interruption : détection des transitions franchies entre l'ancienne et la nouvelle position.
+        // Vérifier que l'interruption VBlank est bien levée
         if self.stat & STAT_IRQ_VBLANK != 0 && Self::crosses(prev_total, new_total, VBLANK_START_DOT) {
             self.pending_irq |= IRQ_VBLANK; // entrée en VBlank (début de la ligne 144) → bit 0 de IF
-            log::debug!(
-                "[PPU] VBlank entry detected! prev_total={}, new_total={}, VBLANK_START={}",
-                prev_total, new_total, VBLANK_START_DOT,
-            );
+            log::debug!("[PPU] VBlank IRQ pending set! pending_irq=${:02X}", self.pending_irq);
         }
         if self.stat & STAT_IRQ_LYC != 0
             && self.lyc <= 152
@@ -511,21 +523,16 @@ mod tests {
     }
 
     #[test]
-    fn stat_read_reports_mode_flags_and_lyc() {
+    fn stat_read_reports_written_bits_and_lyc_flag() {
         let mut ppu = PPU::new();
-        // Au power-on : mode 2 (OAM Scan) + drapeau LYC==LY (ly == lyc == 0). Le mode 2 ne pose aucun bit de drapeau.
-        assert_eq!(ppu.read_register(0xFF41), 0x04);
+        // Au power-on : aucun bit d'activation écrit + drapeau LYC==LY (ly == lyc == 0) en bit 7.
+        assert_eq!(ppu.read_register(0xFF41), 0x80);
 
         ppu.write_register(0xFF41, 0x78); // bits d'activation des interruptions
-        assert_eq!(ppu.read_register(0xFF41), 0x7C); // bits écrits + drapeau LYC==LY
+        assert_eq!(ppu.read_register(0xFF41), 0xF8); // bits écrits + drapeau LYC==LY (bit 7)
 
         ppu.lyc = 5; // ly (0) != lyc (5) : le drapeau s'efface
         assert_eq!(ppu.read_register(0xFF41), 0x78);
-
-        ppu.mode = 0; // drapeau mode 0 (bit 0, HBlank)
-        assert_eq!(ppu.read_register(0xFF41), 0x79);
-        ppu.mode = 1; // drapeau mode 1 (bit 1, VBlank)
-        assert_eq!(ppu.read_register(0xFF41), 0x7A);
     }
 
     #[test]
@@ -1032,7 +1039,7 @@ mod tests {
 
         ppu.advance(1); // début de la ligne 145 : ly == lyc
         assert_eq!(ppu.ly, 145);
-        assert_eq!(ppu.read_register(0xFF41) & (1 << 2), 1 << 2); // drapeau LYC==LY posé dans STAT
+        assert_eq!(ppu.read_register(0xFF41) & (1 << 7), 1 << 7); // drapeau LYC==LY posé en bit 7 du STAT
         assert_eq!(ppu.take_interrupts(), IRQ_STAT); // → bit 1 de IF
 
         ppu.advance(DOTS_PER_LINE as u64); // ligne 146 : ly != lyc à nouveau, pas de re-déclenchement

@@ -80,7 +80,6 @@ fn read_a16(mmu: &MMU, at: u16) -> u16 {
 
 /// PUSH d'une valeur 16 bits (octet haut à SP-1, octet bas à SP-2).
 fn push16(cpu: &mut CPU, mmu: &mut MMU, value: u16) {
-    log::debug!("[CPU] PUSH: SP=${:04X} → ${:04X}, value=${:04X}", cpu.sp, cpu.sp.wrapping_sub(2), value);
     let sp = cpu.sp.wrapping_sub(1);
     mmu.write(sp, (value >> 8) as u8);
     let sp = sp.wrapping_sub(1);
@@ -93,7 +92,6 @@ fn pop16(cpu: &mut CPU, mmu: &mut MMU) -> u16 {
     let lo = mmu.read(cpu.sp);
     let hi = mmu.read(cpu.sp.wrapping_add(1));
     let value = u16::from_be_bytes([hi, lo]);
-    log::debug!("[CPU] POP: SP=${:04X} → ${:04X}, value=${:04X}", cpu.sp, cpu.sp.wrapping_add(2), value);
     cpu.sp = cpu.sp.wrapping_add(2);
     value
 }

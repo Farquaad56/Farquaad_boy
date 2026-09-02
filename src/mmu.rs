@@ -155,6 +155,7 @@ impl MMU {
             0xFF06 => self.timer.write_tma(value),
             0xFF07 => self.timer.write_tac(value),
             // Registres PPU (étape 1) : $FF40-$FF4B ; LY ($FF44) est en lecture seule — écriture ignorée.
+            0xFF41 => self.ppu.write_register(addr, value), // STAT : bits d'activation des interruptions (bits 3..6) routés vers la PPU
             0xFF46 => {
                 // DMA OAM : l'écriture de $FF46 copie les 160 octets d'OAM depuis l'adresse source (value << 8).
                 self.ppu.write_register(addr, value); // enregistre l'adresse source dans le registre DMA
@@ -384,9 +385,9 @@ mod tests {
         mmu.write(0xFF44, 99);
         assert_eq!(mmu.read(0xFF44), 0);
 
-        // STAT ($FF41) : seuls les bits 3..6 sont écrits ; la lecture renvoie les bits d'activation + drapeaux.
+        // STAT ($FF41) : seuls les bits 3..6 sont écrits ; la lecture renvoie les bits d'activation + le drapeau LYC==LY (bit 7).
         mmu.write(0xFF41, 0x78);
-        assert_eq!(mmu.read(0xFF41), 0x7C); // bits écrits 0x78 + drapeau LYC==LY (0==0) ; le mode 2 ne pose aucun bit de drapeau.
+        assert_eq!(mmu.read(0xFF41), 0xF8); // bits écrits 0x78 + drapeau LYC==LY en bit 7 (ly == lyc == 0) ; les bits 0-2 se lisent à 0.
 
         // Le DMA OAM ($FF46) est routé vers la PPU, pas vers `io`.
         mmu.write(0xFF46, 0xC0);
