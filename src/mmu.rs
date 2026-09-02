@@ -39,8 +39,6 @@ pub struct MMU {
     pub serial: Serial,
     /// Timer (registres $FF04-$FF07), synchronisé sur les T-cycles.
     pub timer: Timer,
-    /// PC de l'instruction en cours d'exécution par le CPU — maintenu par `CPU::step`, traçage debug uniquement.
-    pub cpu_pc: u16,
 
     // --- Contrôleur MBC cartouche (PanDocs « MBCs ») ---
     /// État unifié du contrôleur de mémoire : type détecté ($0147), banques ROM/SRAM,
@@ -54,11 +52,6 @@ pub struct MMU {
 impl MMU {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// PC de l'instruction en cours d'exécution (maintenu par `CPU::step`) — traçage debug uniquement.
-    fn cpu_pc_for_debug(&self) -> u16 {
-        self.cpu_pc
     }
 
     /// Charge une ROM `.gb` et réinitialise la mémoire à l'état power-on.
@@ -156,16 +149,6 @@ impl MMU {
     /// Écrit un octet sur toute la carte d'adresses 16 bits.
     #[allow(dead_code)] // Utilisé à partir de la partie 3 (le CPU écrit en mémoire).
     pub fn write(&mut self, addr: u16, value: u8) {
-        // TEMP (diagnostic) : trace TOUTES les écritures du CPU vers les registres I/O ($FF00-$FF4B et $FFFF),
-        // avec le PC de l'instruction en cours — pour reconstituer la séquence d'initialisation complète du jeu.
-        if (0xFF00..=0xFF4B).contains(&addr) || addr == 0xFFFF {
-            log::debug!(
-                "[IO TRACE] CPU (PC=${:04X}) écrit ${:02X} → ${:04X}",
-                self.cpu_pc_for_debug(),
-                value,
-                addr
-            );
-        }
         match addr {
             // Région ROM : les écritures vont aux registres du contrôleur MBC actif (la ROM est en lecture seule).
             // Le routage exact des adresses dépend du type détecté ($0147) — PanDocs « MBCs » / « MBC2 ».
@@ -191,18 +174,6 @@ impl MMU {
             0xFF06 => self.timer.write_tma(value),
             0xFF07 => self.timer.write_tac(value),
             // Registres PPU (étape 1) : $FF40-$FF4B ; LY ($FF44) est en lecture seule — écriture ignorée.
-            0xFF41 => {
-                // STAT ($FF41) : trace INCONDITIONNELLE de TOUTES les écritures du CPU (même la valeur $00),
-                // avec le PC de l'instruction en cours — pour identifier qui efface le bit d'activation
-                // VBlank (bit 5) et condamnerait le jeu à une boucle infinie réveillée par le Timer.
-                log::debug!(
-                    "[MMU TRACE] CPU (PC=${:04X}) écrit dans STAT ($FF41) : valeur=${:02X} (VBlank IRQ enable: {})",
-                    self.cpu_pc_for_debug(),
-                    value,
-                    (value & 0x20) != 0
-                );
-                self.ppu.write_register(addr, value); // bits d'activation des interruptions (bits 3..6) routés vers la PPU
-            }
             0xFF46 => {
                 // DMA OAM : l'écriture de $FF46 copie les 160 octets d'OAM depuis l'adresse source (value << 8).
                 self.ppu.write_register(addr, value); // enregistre l'adresse source dans le registre DMA
@@ -251,7 +222,6 @@ impl Default for MMU {
             ppu: PPU::new(),
             serial: Serial::default(),
             timer: Timer::default(),
-            cpu_pc: 0, // maintenu par `CPU::step` (traçage debug uniquement) ; $0000 à l'initialisation.
             mbc: Mbc::new(MbcType::RomOnly), // état power-up ; remplacé par le type détecté dans `load_rom`.
             cartridge: None, // remplacé par l'en-tête analysé dans `load_rom`.
         }

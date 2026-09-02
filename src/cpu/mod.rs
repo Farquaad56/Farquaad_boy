@@ -93,11 +93,6 @@ impl CPU {
     /// Le retard d'EI est décrémenté après chaque instruction exécutée : IME n'est
     /// réactivé qu'une fois l'instruction EI suivante exécutée (Pan Docs).
     pub fn step(&mut self, mmu: &mut MMU) -> u32 {
-        // Maintains the PC for MMU debug tracing (e.g., unconditional trace of $FF41 writes):
-        // `self.pc` is the address of the instruction about to be executed — including the first
-        // ISR instruction, since `handle_interrupts` already moved `pc` to the vector.
-        mmu.cpu_pc = self.pc;
-
         // Check for interrupts before fetching the next opcode.
         if let Some(cycles) = opcodes::handle_interrupts(self, mmu) {
             return cycles;

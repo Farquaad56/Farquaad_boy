@@ -1209,20 +1209,6 @@ mod tests {
     }
 
     #[test]
-    fn cpu_step_maintains_mmu_cpu_pc_for_stat_trace() {
-        // LDH [$FF41], A (0xE0 0x41) à $0100 : la trace MMU des écritures de STAT doit pouvoir
-        // rapporter le PC de l'instruction en cours d'exécution.
-        let mut mmu = rom_with(&[0xE0, 0x41]);
-        let mut cpu = CPU::new();
-        cpu.a = 0x20; // bit d'activation VBlank
-
-        cpu.step(&mut mmu);
-
-        assert_eq!(mmu.cpu_pc, 0x0100); // PC de l'instruction exécutée (maintenu par `CPU::step`)
-        assert_eq!(mmu.read(0xFF41), 0xA0); // STAT = $20 + drapeau bit 7 (ly == lyc == 0)
-    }
-
-    #[test]
     fn inc_dec8_half_carry_and_zero_flags() {
         let mut mmu = MMU::new();
         let mut cpu = CPU::new();

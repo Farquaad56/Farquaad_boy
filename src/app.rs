@@ -59,8 +59,6 @@ impl FarquaadGBApp {
         if let Some(path) = initial_rom {
             this.load_rom_file(std::path::Path::new(&path));
         }
-
-        eprintln!("[DIAG] FarquaadGBApp::new() terminé"); // TEMP (diagnostic)
         this
     }
 
@@ -77,16 +75,12 @@ impl FarquaadGBApp {
     /// Charge une ROM depuis le disque dans l'émulateur (partagée entre la boîte de dialogue
     /// et l'argument de ligne de commande).
     fn load_rom_file(&mut self, path: &std::path::Path) {
-        eprintln!("[DIAG] load_rom_file début : {:?}", path); // TEMP (diagnostic)
         match std::fs::read(path) {
             Ok(data) => {
-                eprintln!("[DIAG] ROM lue : {} octets", data.len()); // TEMP (diagnostic)
                 self.emulator.load_rom(data);
-                eprintln!("[DIAG] emulator.load_rom terminé"); // TEMP (diagnostic)
                 self.rom_name = path.file_name().and_then(|n| n.to_str()).map(String::from);
                 self.running = true; // démarrage immédiat (séquence de boot + jeu)
                 log::info!("ROM chargée : {:?}", path);
-                eprintln!("[DIAG] load_rom_file terminé"); // TEMP (diagnostic)
             }
             Err(err) => log::error!("Échec de la lecture de {:?} : {err}", path),
         }
@@ -567,8 +561,6 @@ impl FarquaadGBApp {
 
 impl eframe::App for FarquaadGBApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // TEMP (diagnostic) : marqueur non tamponné pour localiser le stack overflow.
-        eprintln!("[DIAG] update() t_cycles={}", self.emulator.t_cycles);
         // Exécution automatique : une frame par update UI (~60 FPS).
         if self.running && self.emulator.mmu.rom_size() > 0 {
             self.emulator.run_frame();

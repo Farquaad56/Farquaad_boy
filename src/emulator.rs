@@ -44,13 +44,8 @@ impl Emulator {
 
     /// Charge une ROM `.gb` et redémarre le système à l'état power-on post-boot ROM ; la ROM est exécutée immédiatement à $0100.
     pub fn load_rom(&mut self, data: Vec<u8>) {
-        eprintln!("[DIAG] Emulator::load_rom début ({} octets)", data.len()); // TEMP (diagnostic)
         self.mmu.load_rom(data);
-        eprintln!("[DIAG] mmu.load_rom terminé"); // TEMP (diagnostic)
-        dump_rom_handlers(&self.mmu); // diagnostic : contenu des 4 vecteurs d'interruption ($0040/$0048/$0050/$0058)
-        eprintln!("[DIAG] dump_rom_handlers terminé"); // TEMP (diagnostic)
         self.power_on();
-        eprintln!("[DIAG] power_on terminé"); // TEMP (diagnostic)
     }
 
     /// Redémarre le système à l'état power-on post-boot ROM ; la ROM chargée est conservée.
@@ -170,10 +165,6 @@ impl Emulator {
     /// Exécute exactement `n` T-cycles.
     pub fn run_tcycles(&mut self, mut n: u64) {
         while n > 0 {
-            // TEMP (diagnostic) : marqueur non tamponné pour localiser le stack overflow.
-            if self.instructions % 20_000 == 0 {
-                eprintln!("[DIAG] run_tcycles instr={} pc={:04X}", self.instructions, self.cpu.pc);
-            }
             let c = self.step() as u64;
             n = n.saturating_sub(c);
         }
@@ -213,53 +204,11 @@ impl Default for Emulator {
     }
 }
 
-/// Diagnostic : affiche les 8 octets de chaque vecteur d'interruption ($0040/$0048/$0050/$0058) pour vérifier
-/// que les handlers de la ROM sont bien là où on s'attend (Pan Docs « Interrupt Sources »).
-fn dump_rom_handlers(mmu: &MMU) {
-    log::info!("=== ROM Handler Dump ===");
-    for addr in [0x0040u16, 0x0048, 0x0050, 0x0058] {
-        let bytes: Vec<u8> = (0..8).map(|i| mmu.read(addr + i)).collect();
-        log::info!(
-            "Handler ${:04X}: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
-            addr, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]
-        );
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cpu::flags::Flags;
     use crate::ppu::{DOTS_PER_LINE, SCREEN_WIDTH, STAT_IRQ_LYC, STAT_IRQ_VBLANK};
-    use log::LevelFilter; // le trait `Log` est utilisé en chemin qualifié (`impl log::Log for CaptureLogger`)
-    use std::sync::Mutex;
-
-    // --- Capture partagée des traces log par les tests Dr. Mario : un seul logger global est possible
-    //     par processus (log::set_boxed_logger), donc les deux tests partagent le même static CAPTURE.
-    static CAPTURE: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    struct CaptureLogger;
-    impl log::Log for CaptureLogger {
-        fn enabled(&self, _metadata: &log::Metadata) -> bool {
-            true
-        }
-        fn log(&self, record: &log::Record) {
-            let msg = format!("{}", record.args());
-            if msg.contains("[IO TRACE]") || msg.contains("[MMU TRACE]") {
-                let mut cap = CAPTURE.lock().unwrap();
-                if cap.last() != Some(&msg) { // skip consecutive duplicates (spin loops)
-                    cap.push(msg);
-                }
-            }
-        }
-        fn flush(&self) {}
-    }
-
-    /// Installe le logger de capture global (une seule fois par processus) ; les deux tests Dr. Mario
-    /// y contribuent et s'y lisent, quel que soit celui qui a obtenu le slot global.
-    fn install_capture_logger() {
-        let _ = log::set_boxed_logger(Box::new(CaptureLogger)); // perd silencieusement si un autre test l'a déjà installé
-        log::set_max_level(LevelFilter::Debug);
-    }
 
     #[test]
     fn boot_state_after_load_rom() {
@@ -278,100 +227,6 @@ mod tests {
         // Le titre du jeu est lisible dans l'en-tête cartouche à 0x0134.
         let title: Vec<u8> = (0..7).map(|i| emu.mmu.read(0x0134 + i)).collect();
         assert_eq!(title, b"POKEMON");
-    }
-
-    #[test]
-    fn dr_mario_stat_writes_are_traced_with_pc() {
-        // Trace agressive de $FF41 (STAT) : exécute Dr. Mario ~60 frames et capture TOUTES les
-        // écritures du CPU dans STAT, avec le PC de l'instruction qui les effectue.
-        // ROM absente sur la machine → test sauté silencieusement.
-        let rom_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../rom/Dr. Mario (World) (Rev 1).gb");
-        let data = match std::fs::read(&rom_path) {
-            Ok(data) => data,
-            Err(_) => return,
-        };
-
-        install_capture_logger(); // logger global partagé (un seul slot par processus)
-
-        let mut emu = Emulator::new();
-        emu.load_rom(data);
-        for _ in 0..(600 * FRAME_TCYCLES) { // TEMP (diagnostic) : 10 s de jeu — à remettre à 60.
-            emu.step();
-        }
-
-        let lines: Vec<String> = CAPTURE.lock().unwrap().clone();
-        assert!(
-            !lines.is_empty(),
-            "attendait au moins une ligne [MMU TRACE] pour les écritures de $FF41 (STAT)"
-        );
-        for line in lines.iter() { // TEMP (diagnostic) : toutes les lignes — à remettre à take(30).
-            eprintln!("{line}");
-        }
-
-        // TEMP (diagnostic) : octets ROM autour de $0205 — à retirer.
-        let bytes: Vec<u8> = (0x01F8..=0x0217).map(|a| emu.mmu.read(a as u16)).collect();
-        eprintln!(
-            "ROM $01F8-$0217: {}",
-            bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ")
-        );
-
-        // TEMP (diagnostic) : octets ROM autour de $0359 (PC bloqué en HALT) — à retirer.
-        let bytes: Vec<u8> = (0x0340..=0x037F).map(|a| emu.mmu.read(a as u16)).collect();
-        eprintln!(
-            "ROM $0340-$037F: {}",
-            bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ")
-        );
-
-        // TEMP (diagnostic) : les 4 vecteurs d'interruption + handlers — à retirer.
-        let bytes: Vec<u8> = (0x0040..=0x009F).map(|a| emu.mmu.read(a as u16)).collect();
-        eprintln!(
-            "ROM $0040-$009F: {}",
-            bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ")
-        );
-
-        // TEMP (diagnostic) : VBlank ISR ($01A6) + Timer ISR ($205D), 16 octets/ligne — à retirer.
-        let dump_region = |base: u16, len: usize, label: &str| {
-            for start in (base..(base + len as u16)).step_by(16) {
-                let count = std::cmp::min(16usize, len - (start - base) as usize);
-                let bytes: Vec<u8> = (start..start + count as u16).map(|a| emu.mmu.read(a)).collect();
-                eprintln!(
-                    "{} ${:04X}: {}",
-                    label,
-                    start,
-                    bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ")
-                );
-            }
-        };
-        dump_region(0x01A6, 94, "VBlankISR");
-        dump_region(0x205D, 64, "TimerISR");
-    }
-
-    #[test]
-    fn dr_mario_io_write_sequence_is_traced() {
-        // TEMP (diagnostic) : capture TOUTES les écritures du CPU vers les registres I/O ($FF00-$FF4B, $FFFF)
-        // avec le PC de l'instruction — pour reconstituer la séquence d'initialisation complète de Dr. Mario
-        // et vérifier que le Timer (TAC/TIMA/TMA) est bien configuré par le jeu. Consecutive duplicates removed.
-        let rom_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../rom/Dr. Mario (World) (Rev 1).gb");
-        let data = match std::fs::read(&rom_path) {
-            Ok(data) => data,
-            Err(_) => return,
-        };
-
-        install_capture_logger(); // logger global partagé (un seul slot par processus)
-
-        let mut emu = Emulator::new();
-        emu.load_rom(data);
-        for _ in 0..(600 * FRAME_TCYCLES) { // TEMP (diagnostic) : 10 s de jeu.
-            emu.step();
-        }
-
-        let lines: Vec<String> = CAPTURE.lock().unwrap().clone();
-        eprintln!("=== {} unique I/O write events over 600 frames ===", lines.len());
-        for line in &lines {
-            eprintln!("{line}");
-        }
     }
 
     #[test]
