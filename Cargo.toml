@@ -9,6 +9,12 @@ eframe = "0.31"
 egui = "0.31"
 egui_extras = "0.31"
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Même version que celle d'eframe : `EventLoopBuilderExtWindows::any_thread` permet de créer la boucle
+# d'événements winit sur un thread dédié (la pile du thread main Windows, 1 Mio par défaut, est trop
+# petite pour les structures volumineuses de l'émulateur en build debug).
+winit = { version = "0.30", default-features = false }
+
 # Utilitaires de bas niveau et performance
 bytemuck = { version = "1.25", features = ["derive", "min_const_generics"] }
 bitflags = "2.9"

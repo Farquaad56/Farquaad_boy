@@ -7,6 +7,8 @@
 //! Étape 3 : le rendu est forcé à chaque frontière de frame même LCD éteint (bit 7 de LCDC à 0) — la PPU
 //! gèle son timing mais le compteur global de T-cycles continue d'avancer, donc l'écran devient noir au
 //! lieu de rester figé (règle interne de `render_frame`).
+//! Étape 4 : STAT est forcé à $20 au hand-off (VBlank IRQ activée) — état laissé par le boot ROM,
+//! pour que les jeux qui ne configurent jamais STAT reçoivent quand même l'interruption VBlank.
 
 use crate::cpu::CPU;
 use crate::mmu::MMU;
@@ -42,9 +44,13 @@ impl Emulator {
 
     /// Charge une ROM `.gb` et redémarre le système à l'état power-on post-boot ROM ; la ROM est exécutée immédiatement à $0100.
     pub fn load_rom(&mut self, data: Vec<u8>) {
+        eprintln!("[DIAG] Emulator::load_rom début ({} octets)", data.len()); // TEMP (diagnostic)
         self.mmu.load_rom(data);
+        eprintln!("[DIAG] mmu.load_rom terminé"); // TEMP (diagnostic)
         dump_rom_handlers(&self.mmu); // diagnostic : contenu des 4 vecteurs d'interruption ($0040/$0048/$0050/$0058)
+        eprintln!("[DIAG] dump_rom_handlers terminé"); // TEMP (diagnostic)
         self.power_on();
+        eprintln!("[DIAG] power_on terminé"); // TEMP (diagnostic)
     }
 
     /// Redémarre le système à l'état power-on post-boot ROM ; la ROM chargée est conservée.
@@ -57,30 +63,43 @@ impl Emulator {
     fn power_on(&mut self) {
         // Les sous-composants repartent chacun à leur état post-boot ROM :
         // - CPU::new()       → PC=0x0100, SP=$FFFE, registres corrects (cpu.rs).
-        // - PPU::default()   → LCDC=$91 (LCD allumé, fond activé), BGP=$FC, SCY/SCX/LYC/WX/WY=$00, OBP0/OBP1=$FF (ppu.rs).
+        // - PPU::default()   → LCDC=$91 (LCD allumé, background and window enabled — bit 0), BGP=$FC, SCY/SCX/LYC/WX/WY=$00, OBP0/OBP1=$FF (ppu.rs).
         // - Serial::default()→ SB=$00, SC=$00, aucun transfert en cours (serial.rs).
         // - Timer::default() → TIMA/TMA=$00, TAC se lit $F8 → timer désactivé (timer.rs).
         self.cpu = CPU::new();
         self.mmu.ppu = PPU::default();
         self.mmu.serial = Serial::default();
         self.mmu.timer = Timer::default();
-
-        // Registres I/O matériels aux valeurs post-boot DMG (PanDocs « Power Up Sequence »).
-        // Certains ne peuvent PAS être posés via mmu.write car le matériel masque des bits :
-        self.mmu.write(0xFF00, 0xCF); // P1 ($FF00) : joypad, aucun bouton pressé.
-        self.mmu.serial.sc = 0x7E; // SC ($FF02) : seuls les bits 7 et 0 sont écriturables — la valeur post-boot $7E (bits 6..1 à 1) est conservée telle quelle ; mmu.write(0xFF02, 0x7E) donnerait $00.
-        self.mmu.timer.counter = (0xABu16) << 8; // DIV ($FF04) se lit $AB : write_div ignore la valeur écrite et remet le compteur à $0000, d'où l'écriture directe du compteur ; mmu.write(0xFF04, 0xAB) donnerait DIV=$00.
-        self.mmu.write(0xFF07, 0xF8); // TAC ($FF07) : bits 7-3 toujours lus à 1 → timer désactivé au hand-off (seuls les bits 2-0 sont écrits).
-        self.mmu.ie = 0x00; // IE ($FFFF) : toutes les sources d'interruption désactivées au hand-off.
-
-        // CORRECTION CRITIQUE : Activer VBlank interrupt dans STAT
-        // $20 = 00100000 = bit 5 (VBlank IRQ enable)
-        self.mmu.write(0xFF41, 0x20); // STAT
-
         self.t_cycles = 0;
         self.instructions = 0;
 
-        log::info!("[Emulator] Post-boot initialization: STAT=$20 (VBlank IRQ enabled)");
+        // Initialisation post-boot ROM (PanDocs « Power Up Sequence ») :
+        // ces valeurs simulent l'état laissé par le boot ROM DMG au hand-off PC=$0100.
+        // Certains registres ne peuvent PAS être posés via mmu.write car le matériel masque des bits.
+
+        // Registres I/O de base
+        self.mmu.write(0xFF00, 0xCF); // P1 ($FF00) : joypad, tous les boutons relâchés.
+        self.mmu.timer.counter = (0xABu16) << 8; // DIV ($FF04) se lit $AB : write_div ignore la valeur écrite et remet le compteur à $0000, d'où l'écriture directe du compteur ; mmu.write(0xFF04, 0xAB) donnerait DIV=$00.
+        self.mmu.write(0xFF07, 0xF8); // TAC ($FF07) : bits 7-3 toujours lus à 1 → timer désactivé au hand-off (seuls les bits 2-0 sont écrits).
+
+        // Registres PPU
+        self.mmu.write(0xFF40, 0x91); // LCDC ($FF40) : LCD ON (bit 7), background and window enabled (bit 0), tuiles non signées $8000-$8FFF (bit 4), carte $9800-$9BFF.
+        // CORRECTION CRITIQUE : Activer l'interruption VBlank dans STAT — état laissé par le boot ROM.
+        // $20 = 00100000 = bit 5 (Mode 1/VBlank Interrupt Selection).
+        // Sans cela, les jeux qui ne configurent jamais STAT restent bloqués en HALT (IF n'est jamais levé).
+        self.mmu.write(0xFF41, 0x20); // STAT ($FF41) : VBlank IRQ enabled.
+        self.mmu.write(0xFF47, 0xFC); // BGP ($FF47) : palette background (valeur post-boot standard).
+        self.mmu.write(0xFF48, 0xFF); // OBP0 ($FF48) : palette sprite 0.
+        self.mmu.write(0xFF49, 0xFF); // OBP1 ($FF49) : palette sprite 1.
+
+        // Registres Serial
+        self.mmu.write(0xFF01, 0x00); // SB ($FF01).
+        self.mmu.serial.sc = 0x7E; // SC ($FF02) : seuls les bits 7 et 0 sont écriturables — la valeur post-boot $7E (bits 6..1 à 1) est conservée telle quelle ; mmu.write(0xFF02, 0x7E) donnerait $00.
+
+        // Interrupt Enable : Désactivé au hand-off (le jeu le configurera).
+        self.mmu.ie = 0x00; // IE ($FFFF) : toutes les sources d'interruption désactivées au hand-off.
+
+        log::info!("[Emulator] Post-boot initialization complete: STAT=$20 (VBlank IRQ enabled)");
     }
 
     /// Exécute une instruction et renvoie les T-cycles consommés.
@@ -151,6 +170,10 @@ impl Emulator {
     /// Exécute exactement `n` T-cycles.
     pub fn run_tcycles(&mut self, mut n: u64) {
         while n > 0 {
+            // TEMP (diagnostic) : marqueur non tamponné pour localiser le stack overflow.
+            if self.instructions % 20_000 == 0 {
+                eprintln!("[DIAG] run_tcycles instr={} pc={:04X}", self.instructions, self.cpu.pc);
+            }
             let c = self.step() as u64;
             n = n.saturating_sub(c);
         }
@@ -208,6 +231,35 @@ mod tests {
     use super::*;
     use crate::cpu::flags::Flags;
     use crate::ppu::{DOTS_PER_LINE, SCREEN_WIDTH, STAT_IRQ_LYC, STAT_IRQ_VBLANK};
+    use log::LevelFilter; // le trait `Log` est utilisé en chemin qualifié (`impl log::Log for CaptureLogger`)
+    use std::sync::Mutex;
+
+    // --- Capture partagée des traces log par les tests Dr. Mario : un seul logger global est possible
+    //     par processus (log::set_boxed_logger), donc les deux tests partagent le même static CAPTURE.
+    static CAPTURE: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    struct CaptureLogger;
+    impl log::Log for CaptureLogger {
+        fn enabled(&self, _metadata: &log::Metadata) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record) {
+            let msg = format!("{}", record.args());
+            if msg.contains("[IO TRACE]") || msg.contains("[MMU TRACE]") {
+                let mut cap = CAPTURE.lock().unwrap();
+                if cap.last() != Some(&msg) { // skip consecutive duplicates (spin loops)
+                    cap.push(msg);
+                }
+            }
+        }
+        fn flush(&self) {}
+    }
+
+    /// Installe le logger de capture global (une seule fois par processus) ; les deux tests Dr. Mario
+    /// y contribuent et s'y lisent, quel que soit celui qui a obtenu le slot global.
+    fn install_capture_logger() {
+        let _ = log::set_boxed_logger(Box::new(CaptureLogger)); // perd silencieusement si un autre test l'a déjà installé
+        log::set_max_level(LevelFilter::Debug);
+    }
 
     #[test]
     fn boot_state_after_load_rom() {
@@ -226,6 +278,100 @@ mod tests {
         // Le titre du jeu est lisible dans l'en-tête cartouche à 0x0134.
         let title: Vec<u8> = (0..7).map(|i| emu.mmu.read(0x0134 + i)).collect();
         assert_eq!(title, b"POKEMON");
+    }
+
+    #[test]
+    fn dr_mario_stat_writes_are_traced_with_pc() {
+        // Trace agressive de $FF41 (STAT) : exécute Dr. Mario ~60 frames et capture TOUTES les
+        // écritures du CPU dans STAT, avec le PC de l'instruction qui les effectue.
+        // ROM absente sur la machine → test sauté silencieusement.
+        let rom_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../rom/Dr. Mario (World) (Rev 1).gb");
+        let data = match std::fs::read(&rom_path) {
+            Ok(data) => data,
+            Err(_) => return,
+        };
+
+        install_capture_logger(); // logger global partagé (un seul slot par processus)
+
+        let mut emu = Emulator::new();
+        emu.load_rom(data);
+        for _ in 0..(600 * FRAME_TCYCLES) { // TEMP (diagnostic) : 10 s de jeu — à remettre à 60.
+            emu.step();
+        }
+
+        let lines: Vec<String> = CAPTURE.lock().unwrap().clone();
+        assert!(
+            !lines.is_empty(),
+            "attendait au moins une ligne [MMU TRACE] pour les écritures de $FF41 (STAT)"
+        );
+        for line in lines.iter() { // TEMP (diagnostic) : toutes les lignes — à remettre à take(30).
+            eprintln!("{line}");
+        }
+
+        // TEMP (diagnostic) : octets ROM autour de $0205 — à retirer.
+        let bytes: Vec<u8> = (0x01F8..=0x0217).map(|a| emu.mmu.read(a as u16)).collect();
+        eprintln!(
+            "ROM $01F8-$0217: {}",
+            bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ")
+        );
+
+        // TEMP (diagnostic) : octets ROM autour de $0359 (PC bloqué en HALT) — à retirer.
+        let bytes: Vec<u8> = (0x0340..=0x037F).map(|a| emu.mmu.read(a as u16)).collect();
+        eprintln!(
+            "ROM $0340-$037F: {}",
+            bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ")
+        );
+
+        // TEMP (diagnostic) : les 4 vecteurs d'interruption + handlers — à retirer.
+        let bytes: Vec<u8> = (0x0040..=0x009F).map(|a| emu.mmu.read(a as u16)).collect();
+        eprintln!(
+            "ROM $0040-$009F: {}",
+            bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ")
+        );
+
+        // TEMP (diagnostic) : VBlank ISR ($01A6) + Timer ISR ($205D), 16 octets/ligne — à retirer.
+        let dump_region = |base: u16, len: usize, label: &str| {
+            for start in (base..(base + len as u16)).step_by(16) {
+                let count = std::cmp::min(16usize, len - (start - base) as usize);
+                let bytes: Vec<u8> = (start..start + count as u16).map(|a| emu.mmu.read(a)).collect();
+                eprintln!(
+                    "{} ${:04X}: {}",
+                    label,
+                    start,
+                    bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ")
+                );
+            }
+        };
+        dump_region(0x01A6, 94, "VBlankISR");
+        dump_region(0x205D, 64, "TimerISR");
+    }
+
+    #[test]
+    fn dr_mario_io_write_sequence_is_traced() {
+        // TEMP (diagnostic) : capture TOUTES les écritures du CPU vers les registres I/O ($FF00-$FF4B, $FFFF)
+        // avec le PC de l'instruction — pour reconstituer la séquence d'initialisation complète de Dr. Mario
+        // et vérifier que le Timer (TAC/TIMA/TMA) est bien configuré par le jeu. Consecutive duplicates removed.
+        let rom_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../rom/Dr. Mario (World) (Rev 1).gb");
+        let data = match std::fs::read(&rom_path) {
+            Ok(data) => data,
+            Err(_) => return,
+        };
+
+        install_capture_logger(); // logger global partagé (un seul slot par processus)
+
+        let mut emu = Emulator::new();
+        emu.load_rom(data);
+        for _ in 0..(600 * FRAME_TCYCLES) { // TEMP (diagnostic) : 10 s de jeu.
+            emu.step();
+        }
+
+        let lines: Vec<String> = CAPTURE.lock().unwrap().clone();
+        eprintln!("=== {} unique I/O write events over 600 frames ===", lines.len());
+        for line in &lines {
+            eprintln!("{line}");
+        }
     }
 
     #[test]
@@ -335,7 +481,7 @@ mod tests {
         for addr in 0x9800..=0x9BFF {
             emu.mmu.write(addr, 1);
         }
-        emu.mmu.write(0xFF40, 0x90); // LCD allumé, fond activé ; tuiles $8000-$8FFF, carte $9800-$9BFF
+        emu.mmu.write(0xFF40, 0x91); // LCD allumé + background and window enabled (bit 0) ; tuiles non signées $8000-$8FFF (bit 4), carte $9800-$9BFF
         emu.mmu.write(0xFF47, 0xE4); // BGP : teinte v pour une valeur de pixel v
 
         emu.run_frame(); // une frame vidéo : le rendu est mis à jour à la frontière de frame

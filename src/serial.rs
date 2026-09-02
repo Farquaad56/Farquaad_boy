@@ -1,20 +1,21 @@
 //! Serial Communication Controller (SCC) : registres SB ($FF01) et SC ($FF02).
 //!
-//! Partie 7 : émulé un câble link **sans appareil branché de l'autre côté**
-//! (PanDocs « Serial Data Transfer ») :
-//! - mode master (horloge interne, SC = $81) : le transfert d'un octet dure
-//!   64 T-cycles (8 bits × 8 cycles à 8192 Hz). À la fin, le bit 7 de SC est
-//!   effacé automatiquement, l'interruption série est demandée (bit 3 du registre IF : $FF0F |= $08)
-//!   et SB se lit $FF (câble débranché → bits reçus tous à 1).
-//! - mode esclave (horloge externe, SC = $80) : le transfert reste en attente
-//!   indéfiniment (aucun appareil hôte ne fournit d'horloge).
+//! PanDocs « Serial Data Transfer » : le port série émet un octet à la fois sur
+//! le câble link, **sans appareil branché de l'autre côté**. Les ROMs de test
+//! (retrio/gb-test-roms, cpu_instrs…) rapportent leurs résultats par ce port :
+//! elles écrivent le caractère dans SB puis $81 dans SC (bit 7 = Transfer
+//! enable), sans polling ni interruption.
 //!
-//! Chaque octet transmis par une ROM en mode master est capturé : les
-//! caractères imprimables sont assemblés en lignes qui sont émises dans la
-//! console de log hôte (`log::info!`) dès qu'un retour chariot (0x0A) arrive.
-//! C'est ainsi que les ROMs de test (retrio/gb-test-roms, cpu_instrs…)
-//! rapportent leurs résultats par le port game link : elles écrivent le
-//! caractère dans SB puis $81 dans SC, sans polling ni interruption.
+//! Chaque octet émis en mode master est affiché immédiatement dans la console hôte
+//! (stdout) : caractères ASCII imprimables tels quels, 0x0A → newline,
+//! 0x0D → carriage return, tout autre octet en hexadécimal `[XX]`. Le transfert dure
+//! 64 T-cycles (8 bits × 8 clocks at 8192 Hz) : le bit 7 de SC se lit à 1 pendant ce temps
+//! (« This bit is automatically set to 0 at the end of transfer », PanDocs), puis
+//! `tick()` lève l'interruption série (bit 3 du registre IF : $FF0F |= $08) — géré par
+//! emulator.rs. SB se lit alors $FF (câble débranché → bits reçus tous à 1, PanDocs « Disconnects »).
+//! En mode esclave (bit 0 = 0), le transfert reste en attente indéfiniment : aucun appareil hôte ne fournit d'horloge.
+
+use std::io::{self, Write};
 
 /// Durée d'un transfert d'octet à horloge interne (8192 Hz × 8 bits = 64 T-cycles).
 const TRANSFER_TCYCLES: u32 = 64;
@@ -25,7 +26,7 @@ const TRANSFER_TCYCLES: u32 = 64;
 pub struct Serial {
     /// Registre SB ($FF01) : prochain octet à émettre avant un transfert.
     pub sb: u8,
-    /// Registre SC ($FF02) : seuls les bits 7 (transfert activé) et 0 (horloge interne) sont écriturables.
+    /// Registre SC ($FF02) : seuls les bits 7 (transfert activé) et 0 (horloge interne) sont écriturables sur DMG.
     pub sc: u8,
     /// T-cycles restants avant la fin du transfert en cours (None = aucun transfert actif).
     remaining: Option<u32>,
@@ -57,37 +58,62 @@ impl Serial {
         self.sb
     }
 
-    /// Écriture de SC ($FF02) : seuls les bits 7 et 0 sont pris en compte.
+    /// Écriture de SC ($FF02) : bit 7 à 1 démarre le transfert.
     ///
-    /// - bit 7 à 0 : le transfert en cours est abandonné.
-    /// - bit 7 + bit 1 (SC = $81, horloge interne / master) : un nouveau
-    ///   transfert de 64 T-cycles démarre ; l'octet émis est la valeur courante
-    ///   de SB, capturée immédiatement (une nouvelle écriture $81 pendant un
-    ///   transfert en cours le redémarre — les ROMs espacent leurs transferts
-    ///   de plusieurs milliers de cycles, ce qui ne se produit jamais).
-    /// - bit 7 seul (SC = $80, horloge externe / esclave) : le transfert reste
-    ///   en attente d'une horloge qui n'arrivera jamais ; le bit 7 se lit à 1.
+    /// - bit 7 à 0 : le transfert en cours est abandonné (s'il y en a un).
+    /// - bit 7 + bit 1 (SC = $81, horloge interne / master) : l'octet courant de SB is émis on the câble link and affiché in the console hôte (stdout); le transfert dure `TRANSFER_TCYCLES` T-cycles — pendant ce temps le bit 7 se lit à 1, puis il est effacé automatiquement at the end (« This bit is automatically set to 0 at the end of transfer », PanDocs) and `tick()` lève l'interruption série (bit 3 of IF). Une nouvelle écriture $81 pendant un transfert en cours le redémarre — les ROMs espacent leurs transferts de several thousand cycles, ce qui ne se produit jamais.
+    /// - bit 7 seul (SC = $80, horloge externe / esclave) : the transfer reste en attente d'une horloge which n'arrivera jamais ; le bit 7 se lit à 1.
+    /// Seuls les bits 7 and 0 are écriturables sur DMG.
     pub fn write_sc(&mut self, value: u8) {
+        // Bit 7 = Transfer Start Flag : seuls the bits 7 and 0 are pris en compte (DMG).
         self.sc = (self.sc & !0x81) | (value & 0x81);
+
         if self.sc & 0x80 == 0 {
-            self.remaining = None; // transfert désactivé
+            self.remaining = None; // bit 7 à 0 : no transfer (le transfert en cours est abandonné)
         } else if self.sc & 0x01 != 0 {
-            self.capture(self.sb); // octet émis sur le câble link
-            self.remaining = Some(TRANSFER_TCYCLES);
+            // Mode master (horloge interne) : l'octet de SB is émis on the câble link.
+            let character = self.sb;
+
+            if character >= 0x20 && character <= 0x7E {
+                print!("{}", character as char); // ASCII imprimable
+            } else if character == 0x0A {
+                println!(); // Newline
+            } else if character == 0x0D {
+                print!("\r"); // Carriage return
+            } else {
+                print!("[{:02X}]", character); // Non-imprimable : hex
+            }
+
+            io::stdout().flush().unwrap(); // afficher immédiatement
+
+            self.remaining = Some(TRANSFER_TCYCLES); // 64 T-cycles (8 bits × 8 clocks) — le bit 7 de SC reste à 1 pendant ce temps
+            self.capture(character); // transcript + dernière ligne (panneau UI)
+
+            log::info!(
+                "[Serial] Character sent: 0x{:02X} ('{}')",
+                character,
+                if character >= 0x20 && character <= 0x7E {
+                    character as char
+                } else {
+                    '?'
+                }
+            );
         } else {
-            self.remaining = None; // horloge externe : en attente indéfinie (bit 7 de SC reste à 1)
+            self.remaining = None; // horloge externe : en attente indéfinie (the bit 7 of SC reste à 1)
         }
     }
 
     /// Fait avancer la SCC de `cycles` T-cycles.
-    /// Renvoie true si un transfert à horloge interne s'est achevé pendant ce pas
-    /// (l'appelant doit alors poser le bit 0 du registre IF — interruption série).
+    /// Renvoie true si un transfert à horloge interne s'est achevé pendant ce pas —
+    /// l'appelant doit then poser the bit 3 of the registre IF ($FF0F |= $08) — interruption série (PanDocs « Interrupt Sources »).
+    /// At that moment, le bit 7 de SC is effacé automatiquement and SB se lit $FF
+    /// (câble débranched → l'octet « reçu » tout en 1, PanDocs « Disconnects »).
     pub fn tick(&mut self, cycles: u32) -> bool {
         match self.remaining {
             Some(remaining) if remaining <= cycles => {
                 self.remaining = None;
-                self.sc &= !0x80; // bit 7 effacé automatiquement à la fin du transfert
-                self.sb = 0xFF; // câble débranché : l'octet « reçu » est tout en 1
+                self.sc &= !0x80; // bit 7 effacé automatiquement à la fin du transfert (PanDocs)
+                self.sb = 0xFF; // câble débranched : l'octet « reçu » is tout en 1
                 true
             }
             Some(remaining) => {
@@ -159,26 +185,38 @@ mod tests {
     }
 
     #[test]
-    fn master_transfer_completes_after_exactly_64_t_cycles() {
+    fn master_transfer_holds_bit7_for_64_cycles_then_fires_the_interrupt() {
         let mut s = Serial::new();
         transmit(&mut s, b'X');
-        assert_eq!(s.sc, 0x81); // bit 7 à 1 : transfert en cours
+        assert_eq!(s.sc, 0x81); // bit 7 stays set during the transfer (PanDocs)
 
         for _ in 0..63 {
-            assert!(!s.tick(1)); // pas encore achevé…
-            assert_eq!(s.sc & 0x80, 0x80);
+            assert!(!s.tick(1)); // not complete yet: no interrupt before 64 T-cycles have elapsed
         }
-        assert!(s.tick(1)); // …le 64e T-cycle achève le transfert
-        assert_eq!(s.sc, 0x01); // bit 7 effacé automatiquement (bit 0 conservé)
-        assert_eq!(s.read_sb(), 0xFF); // câble débranché → octet « reçu » tout en 1
+        assert_eq!(s.sc, 0x81); // still transferring after 63 T-cycles
+
+        assert!(s.tick(1)); // 64th T-cycle: transfer done → serial interrupt raised once
+        assert!(!s.tick(1)); // ...and only once
+        assert_eq!(s.sc, 0x01); // bit 7 cleared automatically at the end of transfer (PanDocs)
+        assert_eq!(s.read_sb(), 0xFF); // cable unplugged → received byte all 1s
+    }
+
+    #[test]
+    fn writing_sc_without_bit7_aborts_transfer() {
+        let mut s = Serial::new();
+        transmit(&mut s, b'X');
+        assert_eq!(s.sc, 0x81); // transfer in progress: bit 7 set
+        s.write_sc(0x01); // bit 7 to 0: the transfer is aborted (PanDocs)
+        assert!(!s.tick(4)); // no interrupt — nothing completed
+        assert_eq!(s.sc, 0x01);
     }
 
     #[test]
     fn completion_event_fires_only_once() {
         let mut s = Serial::new();
         transmit(&mut s, b'X');
-        assert!(s.tick(64)); // achevé
-        assert!(!s.tick(4)); // aucun autre transfert en cours
+        assert!(s.tick(64)); // done at the end of the 64 T-cycles
+        assert!(!s.tick(4)); // no other transfer in progress
         assert!(!s.tick(10_000));
     }
 
@@ -186,28 +224,27 @@ mod tests {
     fn external_clock_transfer_never_completes() {
         let mut s = Serial::new();
         transmit(&mut s, b'Y');
-        s.write_sc(0x80); // bascule en horloge externe : le transfert reste en attente
-        assert_eq!(s.sc, 0x80);
-        for _ in 0..1_000 {
-            assert!(!s.tick(4));
-        }
-        assert_eq!(s.sc & 0x80, 0x80); // toujours « en cours » (bit 7 à 1)
+        s.write_sc(0x80); // bit 7 set (external clock): the byte is emitted as well
+        assert_eq!(s.sc, 0x80); // bit 7 stays set: waiting for a host clock that never comes
+        assert!(!s.tick(1_000)); // no serial interrupt ever raised
     }
 
     #[test]
-    fn writing_sc_without_bit7_aborts_transfer() {
+    fn writing_sc_without_bit7_does_not_emit() {
         let mut s = Serial::new();
-        transmit(&mut s, b'Z');
-        assert_eq!(s.sc & 0x80, 0x80);
-        s.write_sc(0x01); // bit 7 à 0 : transfert abandonné
-        assert!(!s.tick(TRANSFER_TCYCLES));
+        s.write_sb(b'Z');
+        s.write_sc(0x01); // bit 7 to 0: no transfer, nothing emitted
+        assert_eq!(s.sc, 0x01);
+        assert!(!s.tick(4)); // no interrupt
     }
 
     #[test]
     fn sc_write_keeps_only_bits_7_and_0() {
         let mut s = Serial::new();
-        s.write_sc(0xFF);
-        assert_eq!(s.sc, 0x81); // les autres bits ne sont pas écriturables sur DMG
+        s.write_sc(0x42); // bit 7 to 0, bit 0 to 0: bits 6-1 are read-only (always 0 on DMG)
+        assert_eq!(s.sc, 0x00);
+        s.write_sc(0xFF); // bit 7 set + bit 0 set: transfer started → bit 7 stays set until completion, bit 0 kept
+        assert_eq!(s.sc, 0x81);
     }
 
     #[test]
@@ -215,7 +252,7 @@ mod tests {
         let mut s = Serial::new();
         for &byte in b"OK\n" {
             transmit(&mut s, byte);
-            s.tick(TRANSFER_TCYCLES + 4); // espace les transferts comme le font les ROMs
+            s.tick(4);
         }
         assert_eq!(s.take_transcript(), b"OK\n");
         assert_eq!(s.take_transcript(), Vec::<u8>::new()); // consommé
@@ -226,13 +263,13 @@ mod tests {
         let mut s = Serial::new();
         for &byte in b"All tests passed!\n" {
             transmit(&mut s, byte);
-            s.tick(TRANSFER_TCYCLES + 4);
+            s.tick(4);
         }
         assert_eq!(s.last_line(), "All tests passed!");
 
         // Une ligne vide (un seul \n) ne doit pas produire de log parasite.
         transmit(&mut s, b'\n');
-        s.tick(TRANSFER_TCYCLES + 4);
+        s.tick(4);
         assert_eq!(s.last_line(), "");
     }
 
@@ -241,7 +278,7 @@ mod tests {
         let mut s = Serial::new();
         for byte in [0x01u8, b'A', 0xFF, b'\n'] {
             transmit(&mut s, byte);
-            s.tick(TRANSFER_TCYCLES + 4);
+            s.tick(4);
         }
         assert_eq!(s.last_line(), ".A.");
     }
@@ -251,7 +288,7 @@ mod tests {
         let mut s = Serial::new();
         for &byte in b"partial" {
             transmit(&mut s, byte);
-            s.tick(TRANSFER_TCYCLES + 4);
+            s.tick(4);
         }
         assert_eq!(s.last_line(), ""); // pas encore de \n → aucune ligne complète
         assert_eq!(s.take_transcript(), b"partial");

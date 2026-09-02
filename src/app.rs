@@ -19,8 +19,11 @@ pub struct FarquaadGBApp {
     running: bool,
     /// Fenêtre de debug « Pattern Table » (VRAM $8000-$97FF).
     show_pattern_table: bool,
-    /// Fenêtre de debug « Name Table » (carte de tuiles $9800).
+    /// Fenêtre de debug « Name Table » (cartes de tuiles $9800/$9C00).
     show_name_table: bool,
+    /// La fenêtre « Name Table » affiche la carte $9C00-$9FFF (sinon $9800-$9BFF).
+    #[allow(dead_code)] // Champ réservé à la partie future qui ajoutera le basculement $9800/$9C00 dans l'UI.
+    name_table_show_9c00: bool,
     /// Fenêtre de debug « Processor » (registres/drapeaux CPU, style No$GBA/BGB).
     show_processor: bool,
     /// Fenêtre de debug « IO Map » (carte des registres I/O $FF00-$FFFF).
@@ -31,7 +34,8 @@ pub struct FarquaadGBApp {
 
 impl FarquaadGBApp {
     /// Crée l'application et configure le contexte egui (thème sombre, fond noir).
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    /// Si `initial_rom` est fourni (argument de ligne de commande), la ROM est chargée au démarrage.
+    pub fn new(cc: &eframe::CreationContext<'_>, initial_rom: Option<String>) -> Self {
         let mut visuals = Visuals::dark();
         visuals.window_fill = Color32::BLACK;
         cc.egui_ctx.set_style(egui::Style {
@@ -39,16 +43,25 @@ impl FarquaadGBApp {
             ..Default::default()
         });
 
-        Self {
+        let mut this = Self {
             emulator: Emulator::new(),
             rom_name: None,
             running: false,
             show_pattern_table: false,
             show_name_table: false,
+            name_table_show_9c00: false,
             show_processor: false,
             show_io_map: false,
             texture: None,
+        };
+
+        // Chargement automatique depuis la ligne de commande (ex. `cargo run -- assets/cpu_instrs.gb`).
+        if let Some(path) = initial_rom {
+            this.load_rom_file(std::path::Path::new(&path));
         }
+
+        eprintln!("[DIAG] FarquaadGBApp::new() terminé"); // TEMP (diagnostic)
+        this
     }
 
     /// Ouvre une boîte de dialogue et charge la ROM sélectionnée dans l'émulateur.
@@ -57,15 +70,25 @@ impl FarquaadGBApp {
             .add_filter("Game Boy ROM", &["gb", "gbc"])
             .pick_file()
         {
-            match std::fs::read(&path) {
-                Ok(data) => {
-                    self.emulator.load_rom(data);
-                    self.rom_name = path.file_name().and_then(|n| n.to_str()).map(String::from);
-                    self.running = true; // démarrage immédiat (séquence de boot + jeu)
-                    log::info!("ROM chargée : {:?}", path);
-                }
-                Err(err) => log::error!("Échec de la lecture de {:?} : {err}", path),
+            self.load_rom_file(&path);
+        }
+    }
+
+    /// Charge une ROM depuis le disque dans l'émulateur (partagée entre la boîte de dialogue
+    /// et l'argument de ligne de commande).
+    fn load_rom_file(&mut self, path: &std::path::Path) {
+        eprintln!("[DIAG] load_rom_file début : {:?}", path); // TEMP (diagnostic)
+        match std::fs::read(path) {
+            Ok(data) => {
+                eprintln!("[DIAG] ROM lue : {} octets", data.len()); // TEMP (diagnostic)
+                self.emulator.load_rom(data);
+                eprintln!("[DIAG] emulator.load_rom terminé"); // TEMP (diagnostic)
+                self.rom_name = path.file_name().and_then(|n| n.to_str()).map(String::from);
+                self.running = true; // démarrage immédiat (séquence de boot + jeu)
+                log::info!("ROM chargée : {:?}", path);
+                eprintln!("[DIAG] load_rom_file terminé"); // TEMP (diagnostic)
             }
+            Err(err) => log::error!("Échec de la lecture de {:?} : {err}", path),
         }
     }
 
@@ -544,6 +567,8 @@ impl FarquaadGBApp {
 
 impl eframe::App for FarquaadGBApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // TEMP (diagnostic) : marqueur non tamponné pour localiser le stack overflow.
+        eprintln!("[DIAG] update() t_cycles={}", self.emulator.t_cycles);
         // Exécution automatique : une frame par update UI (~60 FPS).
         if self.running && self.emulator.mmu.rom_size() > 0 {
             self.emulator.run_frame();
@@ -632,7 +657,7 @@ impl eframe::App for FarquaadGBApp {
 
         // Fenêtre de debug « Name Table » (carte de tuiles $9800).
         if self.show_name_table {
-            egui::Window::new("🗺 Name Table (VRAM $9800)")
+            egui::Window::new("🗺 Name Table (VRAM $9800/$9C00)")
                 .show(ctx, |ui| {
                     self.show_name_table_debug(ui);
                 });

@@ -1,7 +1,8 @@
 //! Memory Management Unit : pont entre le CPU et la mémoire.
 //!
 //! Implémente toute la carte d'adresses de la Game Boy (PanDocs « Memory Map »)
-//! ainsi que la logique MBC1 de base (commutation des banques ROM, SRAM).
+//! ainsi que le routage vers le contrôleur MBC unifié ([`mbc::Mbc`] : commutation des banques
+//! ROM/SRAM, mode de banking MBC1 et registres RTC MBC3).
 //!
 //! Étape 1 : les registres PPU ($FF40-$FF4B, dont le DMA OAM $FF46) sont routés vers la structure
 //! [`ppu::PPU`] embarquée dans le MMU ; partie 7 : les registres SCC ($FF01-$FF02) vers
@@ -10,15 +11,11 @@
 //! ($FE00-$FE9F) depuis l'adresse source `value << 8`, lue via la carte d'adresses (Pan Docs « DMA »).
 //! Le tableau `io` ne stocke que les valeurs brutes des autres registres (joypad… — parties 7+).
 
+use crate::cartridge::{parse_header, CartridgeHeader};
+use crate::mbc::{HEADER_TYPE_ADDR, Mbc, MbcType};
 use crate::ppu::PPU;
 use crate::serial::Serial;
 use crate::timer::Timer;
-
-/// Taille d'une banque ROM (16 KiB).
-const ROM_BANK_SIZE: usize = 0x4000;
-
-/// Taille maximale de SRAM cartouche supportée (32 KiB = quatre banques de 8 KiB, MBC1 max).
-const SRAM_SIZE: usize = 0x8000;
 
 #[allow(clippy::upper_case_acronyms)]
 pub struct MMU {
@@ -42,16 +39,16 @@ pub struct MMU {
     pub serial: Serial,
     /// Timer (registres $FF04-$FF07), synchronisé sur les T-cycles.
     pub timer: Timer,
+    /// PC de l'instruction en cours d'exécution par le CPU — maintenu par `CPU::step`, traçage debug uniquement.
+    pub cpu_pc: u16,
 
-    // --- État MBC1 cartouche ---
-    /// SRAM cartouche (jusqu'à 32 KiB en quatre banques de 8 KiB).
-    sram: [u8; SRAM_SIZE],
-    /// La RAM cartouche est-elle activée (écriture $0A sur le registre d'activation) ?
-    ram_enabled: bool,
-    /// Banque ROM sélectionnée pour la région 0x4000-0x7FFF ($00 se comporte comme $01).
-    rom_bank: u8,
-    /// Banque SRAM sélectionnée (cartouches avec plus de 8 KiB de RAM).
-    ram_bank: u8,
+    // --- Contrôleur MBC cartouche (PanDocs « MBCs ») ---
+    /// État unifié du contrôleur de mémoire : type détecté ($0147), banques ROM/SRAM,
+    /// activation RAM, mode de banking MBC1 et registres RTC MBC3.
+    pub mbc: Mbc,
+    // --- En-tête de cartouche analysé (PanDocs « The Cartridge Header ») ---
+    /// En-tête de cartouche ($0100-$014F) analysé au chargement ; None tant qu'aucune ROM n'est chargée.
+    pub cartridge: Option<CartridgeHeader>,
 }
 
 impl MMU {
@@ -59,11 +56,58 @@ impl MMU {
         Self::default()
     }
 
+    /// PC de l'instruction en cours d'exécution (maintenu par `CPU::step`) — traçage debug uniquement.
+    fn cpu_pc_for_debug(&self) -> u16 {
+        self.cpu_pc
+    }
+
     /// Charge une ROM `.gb` et réinitialise la mémoire à l'état power-on.
+    /// Analyse et valide l'en-tête de cartouche ($0100-$014F) — PanDocs « The Cartridge Header » :
+    /// un logo Nintendo ou une somme de contrôle d'en-tête invalide ne produit qu'un avertissement
+    /// (certains homebrews n'ont pas le logo), la ROM est chargée quand même.
     pub fn load_rom(&mut self, data: Vec<u8>) {
         let mut fresh = Self::new();
-        fresh.rom = data;
+        match parse_header(&data) {
+            Ok(header) => {
+                if !header.logo_valid {
+                    log::warn!(
+                        "[MMU] Logo Nintendo invalide ($0104-$0133) : la boot ROM se verrouillerait sur le matériel réel — continuation quand même (homebrew ?)."
+                    );
+                }
+                if !header.header_checksum_valid {
+                    log::warn!(
+                        "[MMU] Somme de contrôle d'en-tête invalide : $014D = ${:02X} mais calculée ${:02X} sur $0134-$014C — continuation quand même.",
+                        header.header_checksum,
+                        header.computed_header_checksum
+                    );
+                }
+                log::debug!(
+                    "[MMU] Cartouche : « {} » — {:?}, taille ROM {:?} octets, RAM externe {} octets, code de destination ${:02X}",
+                    header.title,
+                    header.mbc_type,
+                    header.rom_size_bytes,
+                    header.ram_size_bytes,
+                    header.destination_code
+                );
+                let mbc_type = header.mbc_type; // type détecté depuis $0147 (PanDocs « The Cartridge Header »)
+                fresh.cartridge = Some(header);
+                fresh.rom = data;
+                fresh.mbc = Mbc::new(mbc_type); // état power-up du contrôleur détecté
+            }
+            Err(err) => {
+                log::error!("[MMU] En-tête de cartouche invalide : {err} — chargement tel quel (ROM ONLY).");
+                let header_byte = data.get(HEADER_TYPE_ADDR as usize).copied().unwrap_or(0x00);
+                fresh.rom = data;
+                fresh.mbc = Mbc::new(MbcType::from_header_byte(header_byte)); // repli : type détecté depuis $0147 si lisible
+            }
+        }
         *self = fresh;
+    }
+
+    /// En-tête de cartouche analysé au chargement (None tant qu'aucune ROM n'est chargée).
+    #[allow(dead_code)] // API publique du MMU — utilisée par les tests et les parties futures (affichage UI, sauvegarde d'état).
+    pub fn cartridge(&self) -> Option<&CartridgeHeader> {
+        self.cartridge.as_ref()
     }
 
     /// Taille de la ROM chargée en octets (0 si aucune ROM n'est chargée).
@@ -75,24 +119,12 @@ impl MMU {
     /// Les zones non mappées renvoient $FF, comme sur le matériel réel.
     pub fn read(&self, addr: u16) -> u8 {
         match addr {
-            // Banque ROM 0 (fixe).
-            0x0000..=0x3FFF => self.read_rom_at(addr as u32),
-            // Région ROM à banques (MBC) : $00 se comporte comme la banque $01.
-            0x4000..=0x7FFF => {
-                let bank = if self.rom_bank == 0 { 1 } else { self.rom_bank };
-                self.read_rom_at(bank as u32 * ROM_BANK_SIZE as u32 + (addr - 0x4000) as u32)
-            }
+            // Région ROM : banque active selon le contrôleur MBC (PanDocs « MBC1 » / « MBC3 »).
+            0x0000..=0x7FFF => self.read_rom_at(self.mbc.get_rom_addr(addr) as u32),
             // Video RAM.
             0x8000..=0x9FFF => self.vram[(addr - 0x8000) as usize],
-            // SRAM cartouche (accessible uniquement si activée).
-            0xA000..=0xBFFF => {
-                if self.ram_enabled {
-                    let bank = (self.ram_bank & 0x03) as usize;
-                    self.sram[bank * 0x2000 + (addr - 0xA000) as usize]
-                } else {
-                    0xFF // open bus
-                }
-            }
+            // SRAM cartouche / registres RTC (open bus $FF si la RAM est désactivée ou absente).
+            0xA000..=0xBFFF => self.mbc.read_ram(addr).unwrap_or(0xFF),
             // Work RAM.
             0xC000..=0xDFFF => self.wram[(addr - 0xC000) as usize],
             // Echo RAM : miroir de C000-DDFF (seuls les 13 bits bas d'adresse sont connectés).
@@ -124,20 +156,24 @@ impl MMU {
     /// Écrit un octet sur toute la carte d'adresses 16 bits.
     #[allow(dead_code)] // Utilisé à partir de la partie 3 (le CPU écrit en mémoire).
     pub fn write(&mut self, addr: u16, value: u8) {
+        // TEMP (diagnostic) : trace TOUTES les écritures du CPU vers les registres I/O ($FF00-$FF4B et $FFFF),
+        // avec le PC de l'instruction en cours — pour reconstituer la séquence d'initialisation complète du jeu.
+        if (0xFF00..=0xFF4B).contains(&addr) || addr == 0xFFFF {
+            log::debug!(
+                "[IO TRACE] CPU (PC=${:04X}) écrit ${:02X} → ${:04X}",
+                self.cpu_pc_for_debug(),
+                value,
+                addr
+            );
+        }
         match addr {
-            // Région ROM : les écritures vont aux registres de contrôle du MBC (la ROM est en lecture seule).
-            0x0000..=0x3FFF => self.mbc_write(addr, value),
-            // Région ROM à banques : aucun registre MBC1 ici ; écritures ignorées.
-            0x4000..=0x7FFF => {}
+            // Région ROM : les écritures vont aux registres du contrôleur MBC actif (la ROM est en lecture seule).
+            // Le routage exact des adresses dépend du type détecté ($0147) — PanDocs « MBCs » / « MBC2 ».
+            0x0000..=0x7FFF => self.mbc.write_register(addr, value),
             // Video RAM.
             0x8000..=0x9FFF => self.vram[(addr - 0x8000) as usize] = value,
-            // SRAM cartouche (ignorée si non activée).
-            0xA000..=0xBFFF => {
-                if self.ram_enabled {
-                    let bank = (self.ram_bank & 0x03) as usize;
-                    self.sram[bank * 0x2000 + (addr - 0xA000) as usize] = value;
-                }
-            }
+            // SRAM cartouche / registres RTC (ignorées si la RAM est désactivée ou absente).
+            0xA000..=0xBFFF => self.mbc.write_ram(addr, value),
             // Work RAM.
             0xC000..=0xDFFF => self.wram[(addr - 0xC000) as usize] = value,
             // Echo RAM : les écritures sont miroirées vers C000-DDFF.
@@ -155,7 +191,18 @@ impl MMU {
             0xFF06 => self.timer.write_tma(value),
             0xFF07 => self.timer.write_tac(value),
             // Registres PPU (étape 1) : $FF40-$FF4B ; LY ($FF44) est en lecture seule — écriture ignorée.
-            0xFF41 => self.ppu.write_register(addr, value), // STAT : bits d'activation des interruptions (bits 3..6) routés vers la PPU
+            0xFF41 => {
+                // STAT ($FF41) : trace INCONDITIONNELLE de TOUTES les écritures du CPU (même la valeur $00),
+                // avec le PC de l'instruction en cours — pour identifier qui efface le bit d'activation
+                // VBlank (bit 5) et condamnerait le jeu à une boucle infinie réveillée par le Timer.
+                log::debug!(
+                    "[MMU TRACE] CPU (PC=${:04X}) écrit dans STAT ($FF41) : valeur=${:02X} (VBlank IRQ enable: {})",
+                    self.cpu_pc_for_debug(),
+                    value,
+                    (value & 0x20) != 0
+                );
+                self.ppu.write_register(addr, value); // bits d'activation des interruptions (bits 3..6) routés vers la PPU
+            }
             0xFF46 => {
                 // DMA OAM : l'écriture de $FF46 copie les 160 octets d'OAM depuis l'adresse source (value << 8).
                 self.ppu.write_register(addr, value); // enregistre l'adresse source dans le registre DMA
@@ -189,24 +236,6 @@ impl MMU {
         }
     }
 
-    /// Registres de contrôle MBC1 (écritures dans la région ROM).
-    ///
-    /// Les jeux écrivent conventionnellement : $0A à `0x0000` (activation RAM),
-    /// le numéro de banque à `0x0100`, et la banque SRAM à `0x0200`. PanDocs décrit
-    /// les registres physiques comme 0x0000-0x1FFF / 0x2000-0x3FFF ; nous acceptons
-    /// les deux plages d'adresses pour que tout logiciel fonctionne.
-    #[allow(dead_code)] // Utilisé à partir de la partie 3 (le CPU écrit en mémoire).
-    fn mbc_write(&mut self, addr: u16, value: u8) {
-        match addr {
-            // Activation RAM : toute valeur avec $A dans les 4 bits bas active la SRAM.
-            0x0000..=0x00FF => self.ram_enabled = (value & 0x0F) == 0x0A,
-            // Numéro de banque ROM ($00 se comporte comme $01 à la lecture).
-            0x0100..=0x01FF | 0x2000..=0x3FFF => self.rom_bank = value & 0x7F,
-            // Numéro de banque SRAM (cartouches avec plus de 8 KiB de RAM).
-            0x0200..=0x03FF => self.ram_bank = value & 0x03,
-            _ => {}
-        }
-    }
 }
 
 impl Default for MMU {
@@ -222,10 +251,9 @@ impl Default for MMU {
             ppu: PPU::new(),
             serial: Serial::default(),
             timer: Timer::default(),
-            sram: [0; SRAM_SIZE],
-            ram_enabled: false,
-            rom_bank: 0, // $00 au power-up → se comporte comme la banque $01.
-            ram_bank: 0,
+            cpu_pc: 0, // maintenu par `CPU::step` (traçage debug uniquement) ; $0000 à l'initialisation.
+            mbc: Mbc::new(MbcType::RomOnly), // état power-up ; remplacé par le type détecté dans `load_rom`.
+            cartridge: None, // remplacé par l'en-tête analysé dans `load_rom`.
         }
     }
 }
@@ -233,6 +261,7 @@ impl Default for MMU {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mbc::ROM_BANK_SIZE;
 
     /// Construit une ROM minimale de 32 KiB (sans MBC) avec `title` à l'emplacement du titre (0x0134).
     fn rom_with_title(title: &[u8]) -> Vec<u8> {
@@ -298,22 +327,39 @@ mod tests {
         rom[0x3FFF] = 0x99; // banque 0, dernier octet (toujours mappé)
         rom[0x4000] = 0x11; // banque 1, premier octet
         rom[0x8000] = 0x22; // banque 2, premier octet
+        rom[HEADER_TYPE_ADDR as usize] = 0x01; // en-tête $0147 : MBC1
 
         let mut mmu = MMU::new();
         mmu.load_rom(rom);
 
         assert_eq!(mmu.read(0x3FFF), 0x99); // région banque 0 fixe
         assert_eq!(mmu.read(0x4000), 0x11); // power-up : $00 se comporte comme la banque $01
-        mmu.write(0x0100, 0x02); // les jeux écrivent la banque à 0x0100
+        mmu.write(0x2000, 0x02); // les jeux écrivent le registre de banque à 0x2000 (PanDocs « MBC1 »)
         assert_eq!(mmu.read(0x4000), 0x22); // maintenant la banque 2
-        mmu.write(0x0100, 0x00);
+        mmu.write(0x2000, 0x00);
         assert_eq!(mmu.read(0x4000), 0x11); // $00 → retour à la banque $01
     }
 
     #[test]
-    fn mbc_cartridge_ram_requires_enable() {
+    fn rom_only_cart_ignores_writes() {
+        let mut rom = vec![0x00; 0x8000]; // ROM ONLY (en-tête $0147 = $00)
+        rom[0x4000] = 0x11;
+
         let mut mmu = MMU::new();
-        mmu.load_rom(vec![0xFF; 0x4000]);
+        mmu.load_rom(rom);
+
+        assert_eq!(mmu.read(0x4000), 0x11); // ROM plate : aucune commutation de banque
+        mmu.write(0x2000, 0x05); // « ROM ONLY » : les écritures dans $0000-$7FFF sont ignorées
+        assert_eq!(mmu.read(0x4000), 0x11);
+    }
+
+    #[test]
+    fn mbc_cartridge_ram_requires_enable() {
+        let mut rom = vec![0xFF; 0x8000]; // MBC1 + RAM (en-tête $0147 = $02)
+        rom[HEADER_TYPE_ADDR as usize] = 0x02;
+
+        let mut mmu = MMU::new();
+        mmu.load_rom(rom);
 
         // Désactivée par défaut : écritures ignorées, lectures open bus $FF.
         mmu.write(0xA000, 0x42);
@@ -327,6 +373,43 @@ mod tests {
         // Toute autre valeur la désactive à nouveau.
         mmu.write(0x0000, 0x00);
         assert_eq!(mmu.read(0xA000), 0xFF);
+    }
+
+    #[test]
+    fn mbc5_two_part_rom_bank() {
+        let mut rom = vec![0x00; ROM_BANK_SIZE * 0x180]; // 6 MiB : banques 0-383 (MBC5)
+        rom[0x4000] = 0x11; // banque 1, premier octet
+        rom[0x7F * ROM_BANK_SIZE] = 0x22; // banque $7F
+        rom[0x17F * ROM_BANK_SIZE] = 0x33; // banque $17F
+        rom[HEADER_TYPE_ADDR as usize] = 0x19; // en-tête $0147 : MBC5
+
+        let mut mmu = MMU::new();
+        mmu.load_rom(rom);
+
+        assert_eq!(mmu.read(0x4000), 0); // power-up : registre $00 → réellement la banque $00 (PanDocs « MBC5 »)
+        mmu.write(0x2000, 0x01); // bits 0-7 de la banque ROM
+        assert_eq!(mmu.read(0x4000), 0x11);
+        mmu.write(0x2000, 0x7F);
+        assert_eq!(mmu.read(0x4000), 0x22);
+        mmu.write(0x3000, 0x01); // bit 8 → banque $17F
+        assert_eq!(mmu.read(0x4000), 0x33);
+    }
+
+    #[test]
+    fn mbc2_bit8_of_address_selects_register() {
+        let mut rom = vec![0x00; 0x4000 * 16]; // 256 KiB : banques 0-15 (MBC2)
+        rom[0x4000] = 0x11; // banque 1, premier octet
+        rom[0x8000] = 0x33; // banque 2, premier octet
+        rom[HEADER_TYPE_ADDR as usize] = 0x05; // en-tête $0147 : MBC2
+
+        let mut mmu = MMU::new();
+        mmu.load_rom(rom);
+
+        assert_eq!(mmu.read(0x4000), 0x11); // power-up : registre $00 → se comporte comme la banque $01
+        mmu.write(0x0100, 0x02); // bit 8 à 1 → registre de banque ROM (PanDocs « MBC2 »)
+        assert_eq!(mmu.read(0x4000), 0x33);
+        mmu.write(0x0200, 0x0A); // bit 8 à 0 → activation RAM
+        assert_eq!(mmu.read(0xA000), 0x00); // la SRAM est maintenant accessible (open bus $FF avant)
     }
 
     #[test]
@@ -421,5 +504,89 @@ mod tests {
 
         assert_eq!(mmu.read(0xFE00), 0x3C); // premier octet OAM = $8200
         assert_eq!(mmu.read(0xFE9F), 0x3C); // dernier octet OAM = $829F
+    }
+
+    #[test]
+    fn mbc3_header_enables_rom_and_rtc_banking() {
+        let mut rom = vec![0x00; 0x8000 * 4]; // 128 KiB (MBC3)
+        rom[0x147] = 0x11; // MBC3 (PanDocs « The Cartridge Header »)
+        rom[0x4000] = 0x11; // banque $01, premier octet
+        rom[0x8000] = 0x22; // banque $02, premier octet
+
+        let mut mmu = MMU::new();
+        mmu.load_rom(rom);
+
+        assert_eq!(mmu.read(0x4000), 0x11); // power-up : registre ROM $00 → banque $01
+        mmu.write(0x2000, 0x02);
+        assert_eq!(mmu.read(0x4000), 0x22); // maintenant la banque $02
+
+        // Registres RTC : RAM activée + sélection $08 → secondes à $A000.
+        mmu.write(0x0000, 0x0A);
+        mmu.write(0x4000, 0x08);
+        assert!(mmu.read(0xA000) < 60); // secondes initialisées depuis l'heure système
+        mmu.write(0xA001, 59);
+        assert_eq!(mmu.read(0xA001), 59); // minutes
+
+        // RAM désactivée → open bus $FF même avec un registre RTC sélectionné.
+        mmu.write(0x0000, 0x00);
+        assert_eq!(mmu.read(0xA000), 0xFF);
+
+        // Banques SRAM : sélection $01 → banque 1 (RAM réactivée).
+        mmu.write(0x0000, 0x0A);
+        mmu.write(0x4000, 0x01);
+        mmu.write(0xA000, 0xAB);
+        assert_eq!(mmu.read(0xA000), 0xAB);
+    }
+
+    #[test]
+    fn mbc1_mode1_upper_bits_apply_to_both_regions() {
+        let mut rom = vec![0x00; 0x10_0000]; // 1 MiB : banques $00-$3F
+        rom[0x147] = 0x03; // MBC1+RAM+BATTERY (PanDocs « The Cartridge Header »)
+        rom[0x0000] = 0x10; // banque $00, premier octet
+        rom[0x80000] = 0xA2; // banque $20, premier octet (32 × 16 KiB)
+        rom[0x84000] = 0xB3; // banque $21, premier octet
+
+        let mut mmu = MMU::new();
+        mmu.load_rom(rom);
+
+        assert_eq!(mmu.read(0x0000), 0x10); // mode 0 (power-up) : région $0000-$3FFF en banque $00
+        mmu.write(0x6000, 0x80); // mode avancé (PanDocs « MBC1 »)
+        assert_eq!(mmu.read(0x0000), 0x10); // bits supérieurs = 0 → toujours la banque $00 ici
+        mmu.write(0x4000, 0x20); // bits supérieurs = 1 → banques $20-$3F
+        assert_eq!(mmu.read(0x0000), 0xA2); // la région $0000-$3FFF suit les bits supérieurs (mode 1)
+        assert_eq!(mmu.read(0x4000), 0xB3); // registre ROM $00 → se comporte comme $21 ($20 + 1)
+    }
+
+    /// Construit une ROM de 32 KiB avec le logo officiel et la somme de contrôle d'en-tête valide.
+    fn rom_with_valid_header() -> Vec<u8> {
+        use crate::cartridge::{compute_header_checksum, HEADER_CHECKSUM_ADDR, LOGO_LEN, LOGO_START, NINTENDO_LOGO};
+        let mut rom = vec![0u8; 0x4000];
+        rom[LOGO_START..LOGO_START + LOGO_LEN].copy_from_slice(&NINTENDO_LOGO); // logo officiel ($0104-$0133)
+        rom[0x0134..0x0134 + 16].copy_from_slice(b"FARQUAADGB\0\0\0\0\0\0"); // titre bourgé de $00
+        rom[HEADER_CHECKSUM_ADDR as usize] = compute_header_checksum(&rom); // $014D valide sur $0134-$014C
+        rom
+    }
+
+    #[test]
+    fn load_rom_parses_cartridge_header() {
+        let mut mmu = MMU::new();
+        mmu.load_rom(rom_with_valid_header());
+
+        let header = mmu.cartridge().expect("l'en-tête doit être analysé au chargement");
+        assert!(header.logo_valid); // logo officiel présent ($0104-$0133)
+        assert_eq!(header.title, "FARQUAADGB");
+        assert!(header.header_checksum_valid); // $014D == valeur calculée sur $0134-$014C
+        assert_eq!(header.mbc_type, MbcType::RomOnly); // $0147 = $00 → ROM ONLY
+        assert_eq!(header.rom_size_bytes, Some(32 * 1024)); // $0148 = $00 → 32 KiB
+        assert_eq!(mmu.mbc.mbc_type, MbcType::RomOnly); // le contrôleur est initialisé sur le type détecté
+    }
+
+    #[test]
+    fn load_rom_without_complete_header_still_works() {
+        let mut mmu = MMU::new();
+        mmu.load_rom(vec![0x42; 0x100]); // trop court pour un en-tête complet ($0100-$014F)
+
+        assert!(mmu.cartridge().is_none()); // pas d'en-tête analysé (avertissement affiché)
+        assert_eq!(mmu.read(0x0000), 0x42); // la ROM est chargée quand même, telle quelle
     }
 }

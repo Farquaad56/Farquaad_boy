@@ -33,7 +33,7 @@ pub struct CPU {
     /// Le CPU est-il en état HALT ? (sorti par une interruption pendante — le « HALT bug »).
     pub halted: bool,
     /// Retard d'activation de IME après un EI : IME n'est réactivé qu'une fois l'instruction
-    /// suivant l'EI exécutée (Pan Docs « CPU Instruction Set »). 0 = pas de retard en cours.
+    /// EI suivante exécutée (Pan Docs « CPU Instruction Set »). 0 = pas de retard en cours.
     pub ei_delay: u8,
     /// T-cycles écoulés au total — maintenu par `Emulator::step` (sert à throttler les logs par frame).
     pub t_cycles: u64,
@@ -91,8 +91,13 @@ impl CPU {
     /// annulé (le « HALT bug ») et l'interruption est servie même si IME est faux.
     ///
     /// Le retard d'EI est décrémenté après chaque instruction exécutée : IME n'est
-    /// réactivé qu'une fois l'instruction suivant l'EI exécutée (Pan Docs).
+    /// réactivé qu'une fois l'instruction EI suivante exécutée (Pan Docs).
     pub fn step(&mut self, mmu: &mut MMU) -> u32 {
+        // Maintains the PC for MMU debug tracing (e.g., unconditional trace of $FF41 writes):
+        // `self.pc` is the address of the instruction about to be executed — including the first
+        // ISR instruction, since `handle_interrupts` already moved `pc` to the vector.
+        mmu.cpu_pc = self.pc;
+
         // Check for interrupts before fetching the next opcode.
         if let Some(cycles) = opcodes::handle_interrupts(self, mmu) {
             return cycles;
@@ -120,7 +125,7 @@ impl CPU {
         self.pc = self.pc.wrapping_add(1);
         let cycles = opcodes::execute(self, mmu, opcode);
 
-        // EI : IME devient effectif après l'instruction suivant l'EI (2 étapes : la fin de
+        // EI : IME devient effectif après l'instruction EI suivante (2 étapes : la fin de
         // l'instruction EI elle-même, puis celle qui suit).
         if self.ei_delay > 0 {
             self.ei_delay -= 1;

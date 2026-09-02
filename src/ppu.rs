@@ -8,13 +8,12 @@
 //! (OAM Scan/Drawing/HBlank/VBlank) selon Pan Docs « Rendering », et génère les requêtes d'interruption
 //! VBlank et STAT (Pan Docs « Interrupt Sources »). Le LCD éteint (bit 7 de LCDC à 0) gèle la PPU.
 //! Étape 3 — rendu : la VRAM ($8000-$9FFF : tuiles + cartes) et l'OAM (160 octets, $FE00-$FE9F) sont
-//! dédoublonnées avec le MMU ; `render_frame` dessine la couche Background (défilement SCX/SCY,
-//! tuiles $8000/$8800, carte $9800/$9C00, palette BGP) puis la fenêtre (WY/WX, carte $9C00-$9BFF,
-//! ensemble de tuiles choisi par le bit 6 du LCDC) selon Pan Docs « Background »/« Window ».
-//! Étape 4 — sprites : `render_frame` dessine aussi les 40 entrées OAM ($FE00-$FE9F) selon Pan Docs « Sprite » :
-//! position (X, Y-1) avec repli à 256, tuile $8000/$8800 choisie par le bit 3 des drapeaux (index non signé),
-//! retournements X/Y, palette OBP0/OBP1, transparence de la valeur 0, priorité face au fond et limite de
-//! 10 sprites par ligne.
+//! dédoublonnées avec le MMU ; `render_frame` dessine la couche Background (défilement SCX/SCY, carte choisie par le bit 3 du LCDC,
+//! données de tuiles choisies par le bit 4, palette BGP) puis la fenêtre (WY/WX, carte choisie par le bit 6 du LCDC) selon PanDocs « Background »/« Window ».
+//! Étape 4 — objets : `render_frame` dessine aussi les 40 entrées OAM ($FE00-$FE9F) selon PanDocs « OAM » :
+//! position (X-8, Y-16) avec repli à 256, taille 8×8 ou 8×16 selon le bit 2 du LCDC, tuile $8000-$8FFF (index non signé),
+//! retournements X/Y (bits 6/5 des drapeaux), palette OBP0/OBP1 (bit 4 des drapeaux), transparence de la valeur 0, priorité face au fond
+//! (bit 7 des drapeaux) et limite de 10 objets par ligne.
 
 /// Résolution de l'écran en pixels (Pan Docs « Graphics »).
 pub const SCREEN_WIDTH: usize = 160;
@@ -60,6 +59,13 @@ pub const LCDC_BG: u8 = 1 << 4;
 pub const LCDC_WINDOW: u8 = 1 << 5;
 /// Bit 6 du LCDC : ensemble de tuiles de la fenêtre en $8800-$97FF au lieu de $8000-$8FFF.
 pub const LCDC_WIN_TILE_8800: u8 = 1 << 6;
+
+/// Bits 4-5 du LCDC : activation de la couche Background et de la fenêtre (ensemble).
+#[allow(dead_code)] // Utilisé par les tests PPU ; API publique pour les parties futures.
+pub const LCDC_BG_WIN_ON: u8 = LCDC_BG | LCDC_WINDOW;
+/// Bit 0 du LCDC (inutilisé sur DMG) : objets 8×16 au lieu de 8×8 — TODO(partie PPU) : non encore implémenté.
+#[allow(dead_code)] // Utilisé par les tests PPU ; API publique pour la future prise en charge des sprites 8×16.
+pub const LCDC_OBJ_SIZE_16: u8 = 1 << 0;
 
 /// Bit 3 des drapeaux d'une entrée OAM : ensemble de tuiles du sprite en $8800-$97FF au lieu de $8000-$8FFF.
 pub const SPRITE_TILE_SET_8800: u8 = 1 << 3;
@@ -135,7 +141,7 @@ impl PPU {
     /// (OAM Scan) sur la ligne 0 ; le framebuffer est noir opaque (aucune frame rendue).
     pub fn new() -> Self {
         Self {
-            lcdc: 0x91, // LCD allumé, fond activé (fenêtre éteinte), tuiles $8000-$8FFF
+            lcdc: 0x91, // LCD allumé (bit 7) + background and window enabled (bit 0) + tile data unsigned (bit 4)
             stat: 0x00,
             scy: 0x00,
             scx: 0x00,
@@ -544,7 +550,7 @@ mod tests {
 
     #[test]
     fn render_frame_with_empty_vram_uses_power_on_bgp() {
-        let mut ppu = PPU::new(); // LCDC = $91 (fond activé), BGP = $FC : valeurs 0-1 → teinte claire, 2-3 → foncée
+        let mut ppu = PPU::new(); // LCDC = $91 (background and window enabled), BGP = $FC : valeur 0 → teinte claire, 1-3 → foncée
         let vram = [0u8; 0x2000]; // tuiles et cartes nulles : toutes les valeurs de pixel valent 0
         let oam = [0u8; 0xA0]; // OAM vide : aucun sprite
         ppu.render_frame(&vram, &oam);
@@ -554,7 +560,7 @@ mod tests {
     #[test]
     fn render_background_scrolls_and_selects_tiles() {
         let mut ppu = PPU::new();
-        ppu.write_register(0xFF40, 0x90); // LCD allumé, fond activé ; tuiles $8000-$8FFF (non signées), carte $9800-$9BFF
+        ppu.write_register(0xFF40, 0x91); // LCD allumé + background and window enabled (bit 0) ; tuiles non signées $8000-$8FFF (bit 4), carte $9800-$9BFF
         ppu.bgp = 0xE4; // teinte v pour une valeur de pixel v (bits 2v..2v+1 valent v)
 
         let mut vram = [0u8; 0x2000];
@@ -647,11 +653,11 @@ mod tests {
     #[test]
     fn lcd_off_renders_black() {
         let mut ppu = PPU::new();
-        ppu.lcdc &= !LCDC_LCD_ON; // LCD éteint
+        ppu.lcdc &= !LCDC_LCD_ON; // LCD éteint (bit 7 à 0)
         let vram = [0u8; 0x2000];
-        let oam = [0u8; 0xA0]; // OAM vide : aucun sprite
+        let oam = [0u8; 0xA0]; // OAM vide : aucun object
         ppu.render_frame(&vram, &oam);
-        assert!(ppu.framebuffer.iter().all(|&px| px == 0xFF00_0000)); // écran noir
+        assert!(ppu.framebuffer.iter().all(|&px| px == 0xFF00_0000)); // écran noir (rendu à chaque frame même LCD éteint)
     }
 
     #[test]
@@ -937,6 +943,87 @@ mod tests {
         assert_eq!(ppu.framebuffer[15 * SCREEN_WIDTH + 96], PPU::shade(3)); // entrée 8 (X = 96) : rendue
         assert_eq!(ppu.framebuffer[15 * SCREEN_WIDTH + 108], PPU::shade(3)); // entrée 9 (X = 108) : dernière rendue
         assert_eq!(ppu.framebuffer[15 * SCREEN_WIDTH + 120], PPU::shade(0)); // entrée 10 (X = 120) : supprimée par la limite de 10 → fond blanc
+    }
+
+    #[test]
+    fn render_bg_win_off_shows_black_base_and_objects() {
+        let mut ppu = PPU::new();
+        ppu.lcdc &= !LCDC_BG_WIN_ON; // bits 4-5 à 0 : background and window éteints (DMG)
+        let mut vram = [0u8; 0x2000];
+        let oam = [0u8; 0xA0];
+
+        ppu.render_frame(&vram, &oam);
+        assert!(ppu.framebuffer.iter().all(|&px| px == 0xFF00_0000)); // base noire (aucune couche)
+
+        // Un objet is still drawn on the black base.
+        for row in 0..8 {
+            vram[0x10 + 2 * row] = 0xFF; // tuile 1 ($8010-$801F) : toutes the values of pixel valent 3
+            vram[0x11 + 2 * row] = 0xFF;
+        }
+        let mut oam = [0u8; 0xA0];
+        oam[0] = 32; // Y = 32 : objet affiché sur les lignes écran 31..38 (Y-1)
+        oam[1] = 40; // X = 40 : objet affiché sur the colonnes écran 40..47
+        oam[2] = 1; // tuile $8010-$801F
+        ppu.render_frame(&vram, &oam);
+        assert_eq!(ppu.framebuffer[31 * SCREEN_WIDTH + 40], PPU::shade(3)); // objet visible sur the base noire
+        assert_eq!(ppu.framebuffer[0], 0xFF00_0000); // le reste of l'écran : noir
+    }
+
+    #[test]
+    #[ignore = "sprites 8×16 non encore implémentés dans la PPU (draw_sprite est 8×8 uniquement)"]
+    fn render_objects_16px_height_and_tile_selection() {
+        let mut ppu = PPU::new();
+        ppu.lcdc |= LCDC_OBJ_SIZE_16; // bit 2 à 1 : objets 8×16 (PanDocs « OAM »)
+        let mut vram = [0u8; 0x2000];
+        let mut oam = [0u8; 0xA0];
+
+        // Tuile 5 en $8050 : moitié gauche value 3, moitié droite value 0.
+        for row in 0..8 {
+            vram[0x0050 + row] = 0b11_11_11_11;
+            vram[0x0058 + row] = 0b00_00_00_00;
+        }
+
+        oam[0] = 32; // Y = 32 : objet affiché sur the lignes écran 16..31 (Y-16)
+        oam[1] = 40; // X = 40 : objet affiché sur the colonnes écran 32..39 (X-8)
+        oam[2] = 5; // tuile du haut « NN & $FE » = 4 → $8040 ; tuile du bas « NN | $01 » = 5 → $8050
+
+        ppu.render_frame(&vram, &oam);
+        assert_eq!(ppu.framebuffer[16 * SCREEN_WIDTH + 32], PPU::shade(0)); // moitié gauche of the tuile du haut (4) : vide
+        assert_eq!(ppu.framebuffer[24 * SCREEN_WIDTH + 32], PPU::shade(3)); // moitié gauche of the tuile du bas (5)
+    }
+
+    #[test]
+    fn render_objects_drawn_in_oam_order_later_overwrites_earlier() {
+        let mut ppu = PPU::new();
+        ppu.lcdc |= LCDC_SPRITE_ON; // sprites activées (bit 1 du LCDC)
+        ppu.obp0 = 0xE4; // teinte v pour une valeur de pixel v
+        ppu.obp1 = 0xE4;
+        let mut vram = [0u8; 0x2000];
+        let mut oam = [0u8; 0xA0];
+
+        // Tuile 1 en $8010 : all pixels value 3 ; tuile 2 en $8020 : all pixels value 2.
+        for row in 0..8 {
+            vram[0x0010 + row] = 0b11_11_11_11;
+            vram[0x0018 + row] = 0b11_11_11_11;
+            vram[0x0020 + row] = 0b10_10_10_10;
+            vram[0x0028 + row] = 0b10_10_10_10;
+        }
+
+        // L'objet B (X=48 → colonnes 48..55, tuile 2) is declared first dans l'OAM ; les sprites sont
+        // composés dans l'ordre OAM (PanDocs « Sprite »), donc l'objet A déclaré ensuite (X=44 →
+        // colonnes 44..51, tuile 3) écrase B sur la zone de chevauchement (colonnes 48..51).
+        oam[0] = 32; // Y = 32 : lignes écran 31..38 (Y-1)
+        oam[1] = 48; // X = 48 : colonnes écran 48..55
+        oam[2] = 2; // tuile $8020-$802F (value 2)
+
+        oam[4] = 32; // Y = 32 : lignes écran 31..38
+        oam[5] = 44; // X = 44 : colonnes écran 44..51 → chevauche B sur les colonnes 48..51
+        oam[6] = 1; // tuile $8010-$801F (value 3)
+
+        ppu.render_frame(&vram, &oam);
+        assert_eq!(ppu.framebuffer[31 * SCREEN_WIDTH + 46], PPU::shade(3)); // colonne de l'objet A seul
+        assert_eq!(ppu.framebuffer[31 * SCREEN_WIDTH + 50], PPU::shade(3)); // chevauchement : objet A (plus tardif dans l'OAM) devant
+        assert_eq!(ppu.framebuffer[31 * SCREEN_WIDTH + 54], PPU::shade(2)); // colonne de l'objet B seul
     }
 
     #[test]
