@@ -6,7 +6,8 @@ edition = "2024"
 [dependencies]
 # UI et Rendu
 eframe = "0.31"
-egui = "0.31"
+# Feature « serde » : Serialize/Deserialize sur egui::Key (persistance du mappage clavier).
+egui = { version = "0.31", features = ["serde"] }
 egui_extras = "0.31"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

@@ -7,15 +7,22 @@
 //! Étape 1 : les registres PPU ($FF40-$FF4B, dont le DMA OAM $FF46) sont routés vers la structure
 //! [`ppu::PPU`] embarquée dans le MMU ; partie 7 : les registres SCC ($FF01-$FF02) vers
 //! [`serial::Serial`], et partie 9 : les registres Timer ($FF04-$FF07) vers [`timer::Timer`].
-//! Partie 10 : l'écriture du registre DMA OAM $FF46 déclenche le transfert des 160 octets d'OAM
-//! ($FE00-$FE9F) depuis l'adresse source `value << 8`, lue via la carte d'adresses (Pan Docs « DMA »).
-//! Le tableau `io` ne stocke que les valeurs brutes des autres registres (joypad… — parties 7+).
+//! Partie 10 : l'écriture du registre DMA OAM $FF46 démarre le transfert des 160 octets d'OAM
+//! ($FE00-$FE9F) depuis l'adresse source `value << 8`, un octet par M-cycle pendant 160 M-cycles
+//! (Pan Docs « OAM DMA Transfer ») : durant ce conflit de bus, le CPU ne peut plus accéder qu'à la
+//! HRAM ($FF80-$FFFE) — les autres lectures renvoient $FF et les écritures sont ignorées. Le
+//! registre Joypad $FF00 est routé vers [`joypad::Joypad`]. Le tableau `io` ne stocke que les
+//! valeurs brutes des autres registres I/O.
 
-use crate::cartridge::{parse_header, CartridgeHeader};
+use crate::cartridge::{CartridgeHeader, parse_header};
+use crate::joypad::Joypad;
 use crate::mbc::{HEADER_TYPE_ADDR, Mbc, MbcType};
 use crate::ppu::PPU;
 use crate::serial::Serial;
 use crate::timer::Timer;
+
+/// Durée du transfert OAM en M-cycles : 160 octets d'OAM ($FE00-$FE9F), un par cycle (Pan Docs « OAM DMA Transfer »).
+pub const DMA_OAM_CYCLES: u32 = 160;
 
 #[allow(clippy::upper_case_acronyms)]
 pub struct MMU {
@@ -29,16 +36,21 @@ pub struct MMU {
     pub oam: [u8; 0xA0],
     /// High RAM (0xFF80-0xFFFE), 127 octets.
     pub hram: [u8; 0x7F],
-    /// Registres I/O (0xFF00-0xFF7F).
+    /// Registres I/O (0xFF00-0xFF7F) : $FF00 est désormais routé vers le joypad, les autres conservent leur valeur brute.
     pub io: [u8; 0x80],
     /// Registre Interrupt Enable (0xFFFF).
     pub ie: u8,
+    /// État HALT du CPU, synchronisé par `Emulator::step` : bit 5 en lecture seule du registre IF ($FF0F).
+    pub cpu_halted: bool,
     /// Pixel Processing Unit (registres $FF40-$FF45), synchronisé sur les T-cycles.
     pub ppu: PPU,
     /// Serial Communication Controller (registres $FF01-$FF02), synchronisé sur les T-cycles.
     pub serial: Serial,
     /// Timer (registres $FF04-$FF07), synchronisé sur les T-cycles.
     pub timer: Timer,
+
+    /// Joypad (registre $FF00, P1/JOYP), PanDocs « Joypad Input ».
+    pub joypad: Joypad,
 
     // --- Contrôleur MBC cartouche (PanDocs « MBCs ») ---
     /// État unifié du contrôleur de mémoire : type détecté ($0147), banques ROM/SRAM,
@@ -47,6 +59,15 @@ pub struct MMU {
     // --- En-tête de cartouche analysé (PanDocs « The Cartridge Header ») ---
     /// En-tête de cartouche ($0100-$014F) analysé au chargement ; None tant qu'aucune ROM n'est chargée.
     pub cartridge: Option<CartridgeHeader>,
+
+    // --- Transfert DMA OAM en cours (Pan Docs « OAM DMA Transfer ») ---
+    /// M-cycles restants du transfert OAM déclenché par l'écriture de $FF46 (0 = aucun transfert).
+    pub dma_remaining: u32,
+    /// Adresse source du transfert OAM en cours : `value << 8` ($0000-$DFFF), un octet lu par M-cycle.
+    pub dma_source_addr: u16,
+    /// Posé quand $FF46 est écrit pendant l'instruction courante : le transfert démarre après cette
+    /// instruction (l'écriture a lieu sur son dernier M-cycle) — consommé par [`MMU::advance_dma`].
+    dma_just_started: bool,
 }
 
 impl MMU {
@@ -83,15 +104,19 @@ impl MMU {
                     header.destination_code
                 );
                 let mbc_type = header.mbc_type; // type détecté depuis $0147 (PanDocs « The Cartridge Header »)
+                let rom_size = data.len(); // taille réelle de la ROM : masque les bits de banque invalides (PanDocs « MBCs »)
                 fresh.cartridge = Some(header);
                 fresh.rom = data;
-                fresh.mbc = Mbc::new(mbc_type); // état power-up du contrôleur détecté
+                fresh.mbc = Mbc::new(mbc_type, rom_size); // état power-up du contrôleur détecté
             }
             Err(err) => {
-                log::error!("[MMU] En-tête de cartouche invalide : {err} — chargement tel quel (ROM ONLY).");
+                log::error!(
+                    "[MMU] En-tête de cartouche invalide : {err} — chargement tel quel (ROM ONLY)."
+                );
                 let header_byte = data.get(HEADER_TYPE_ADDR as usize).copied().unwrap_or(0x00);
+                let rom_size = data.len(); // taille réelle de la ROM : masque les bits de banque invalides (PanDocs « MBCs »)
                 fresh.rom = data;
-                fresh.mbc = Mbc::new(MbcType::from_header_byte(header_byte)); // repli : type détecté depuis $0147 si lisible
+                fresh.mbc = Mbc::new(MbcType::from_header_byte(header_byte), rom_size); // repli : type détecté depuis $0147 si lisible
             }
         }
         *self = fresh;
@@ -103,14 +128,40 @@ impl MMU {
         self.cartridge.as_ref()
     }
 
+    /// Réinitialise les régions de mémoire à leurs valeurs au power-on (PanDocs « Power Up Sequence ») :
+    /// VRAM $FF (DMG), WRAM banque 0 = $11 / banque 1 = $FF, OAM $FF, HRAM $FF.
+    /// La pile du CPU (SP=$FFFE au hand-off) pointe dans la HRAM, qui contient donc $FF comme sur le matériel réel.
+    pub fn reset_memory(&mut self) {
+        self.vram.fill(0xFF); // $8000-$9FFF : $FF sur DMG (aléatoire sur GB).
+        for byte in &mut self.wram[..0x1000] {
+            *byte = 0x11; // $C000-$CFFF : banque 0 WRAM.
+        }
+        for byte in &mut self.wram[0x1000..] {
+            *byte = 0xFF; // $D000-$DFFF : banque 1 WRAM.
+        }
+        self.oam.fill(0xFF); // $FE00-$FE9F.
+        self.hram.fill(0xFF); // $FF80-$FFFE : la pile est ici (SP=$FFFE).
+    }
+
     /// Taille de la ROM chargée en octets (0 si aucune ROM n'est chargée).
     pub fn rom_size(&self) -> usize {
         self.rom.len()
     }
 
-    /// Lit un octet sur toute la carte d'adresses 16 bits.
+    /// Lit un octet sur toute la carte d'adresses 16 bits (accès CPU).
     /// Les zones non mappées renvoient $FF, comme sur le matériel réel.
+    /// Pendant le DMA OAM, seule la HRAM ($FF80-$FFFE) est accessible au CPU : les autres lectures
+    /// renvoient $FF (conflit de bus — Pan Docs « OAM DMA Transfer »).
     pub fn read(&self, addr: u16) -> u8 {
+        if self.dma_active() && !Self::is_hram(addr) {
+            return 0xFF; // Bus occupé par le transfert OAM : lecture CPU bloquée.
+        }
+        self.read_plain(addr)
+    }
+
+    /// Lit un octet sur toute la carte d'adresses sans appliquer le conflit de bus du DMA OAM —
+    /// utilisé par l'unité DMA elle-même, qui n'est pas affectée par ce conflit (Pan Docs « OAM DMA Transfer »).
+    fn read_plain(&self, addr: u16) -> u8 {
         match addr {
             // Région ROM : banque active selon le contrôleur MBC (PanDocs « MBC1 » / « MBC3 »).
             0x0000..=0x7FFF => self.read_rom_at(self.mbc.get_rom_addr(addr) as u32),
@@ -121,11 +172,11 @@ impl MMU {
             // Work RAM.
             0xC000..=0xDFFF => self.wram[(addr - 0xC000) as usize],
             // Echo RAM : miroir de C000-DDFF (seuls les 13 bits bas d'adresse sont connectés).
-            0xE000..=0xFDFF => self.read(addr - 0x2000),
+            0xE000..=0xFDFF => self.read_plain(addr - 0x2000),
             // Object Attribute Memory.
             0xFE00..=0xFE9F => self.oam[(addr - 0xFE00) as usize],
-            // Non utilisable (FEA0-FEFF) : $00 sur DMG hors bloc OAM ;
-            // TODO(partie 4) : renvoyer $FF pendant le bloc de DMA OAM.
+            // Non utilisable (FEA0-FEFF) : $00 sur DMG hors bloc OAM ; pendant le DMA OAM, la lecture
+            // CPU est bloquée par le conflit de bus et renvoie $FF (voir `read`).
             0xFEA0..=0xFEFF => 0x00,
             // Serial Communication Controller (partie 7).
             0xFF01 => self.serial.read_sb(),
@@ -137,6 +188,11 @@ impl MMU {
             0xFF07 => self.timer.read_tac(),
             // Registres PPU (étape 1) : $FF40-$FF4B, dont le DMA OAM ($FF46).
             0xFF40..=0xFF4B => self.ppu.read_register(addr),
+            // Registre Joypad (partie 10).
+            0xFF00 => self.joypad.read(),
+            // Registre Interrupt Flag ($FF0F) : bits 0–4 = drapeaux d'interruption, bit 5 = halted (read-only),
+            // bits 7-6 non utilisés.
+            0xFF0F => self.io[0x0F] | if self.cpu_halted { 0x20 } else { 0 },
             // Autres registres I/O.
             0xFF00..=0xFF7F => self.io[(addr - 0xFF00) as usize],
             // High RAM.
@@ -146,9 +202,14 @@ impl MMU {
         }
     }
 
-    /// Écrit un octet sur toute la carte d'adresses 16 bits.
+    /// Écrit un octet sur toute la carte d'adresses 16 bits (accès CPU).
+    /// Pendant le DMA OAM, seule la HRAM ($FF80-$FFFE) est accessible au CPU : les autres écritures
+    /// sont ignorées car le bus est occupé par l'unité DMA (Pan Docs « OAM DMA Transfer »).
     #[allow(dead_code)] // Utilisé à partir de la partie 3 (le CPU écrit en mémoire).
     pub fn write(&mut self, addr: u16, value: u8) {
+        if self.dma_active() && !Self::is_hram(addr) {
+            return; // Bus occupé par le transfert OAM : écriture CPU ignorée.
+        }
         match addr {
             // Région ROM : les écritures vont aux registres du contrôleur MBC actif (la ROM est en lecture seule).
             // Le routage exact des adresses dépend du type détecté ($0147) — PanDocs « MBCs » / « MBC2 ».
@@ -175,11 +236,23 @@ impl MMU {
             0xFF07 => self.timer.write_tac(value),
             // Registres PPU (étape 1) : $FF40-$FF4B ; LY ($FF44) est en lecture seule — écriture ignorée.
             0xFF46 => {
-                // DMA OAM : l'écriture de $FF46 copie les 160 octets d'OAM depuis l'adresse source (value << 8).
+                // DMA OAM (Pan Docs « OAM DMA Transfer ») : l'écriture de $FF46 démarre le transfert des
+                // 160 octets d'OAM ($FE00-$FE9F) depuis l'adresse source `value << 8`, un octet par M-cycle
+                // pendant 160 M-cycles. Le registre mémorise la valeur ; seules les valeurs $00-$DF
+                // sélectionnent une adresse source valide (ROM ou RAM uniquement).
                 self.ppu.write_register(addr, value); // enregistre l'adresse source dans le registre DMA
-                self.dma_transfer(value);
+                if value < 0xE0 {
+                    self.dma_source_addr = (value as u16) << 8;
+                    self.dma_remaining = DMA_OAM_CYCLES;
+                    self.dma_just_started = true; // le transfert démarre après cette instruction.
+                }
             }
             0xFF40..=0xFF4B => self.ppu.write_register(addr, value),
+            // Registre Joypad (partie 10) : seuls les bits 4-5 sont écriturables.
+            0xFF00 => self.joypad.write(value),
+            // Registre Interrupt Flag ($FF0F) : write-1-to-clear for bits 0–4 (Pan Docs « Interrupt Sources ») —
+            // c'est au jeu, dans its ISR, d'acknowledge an interrupt by writing a 1 in the bit corresponding to $FF0F.
+            0xFF0F => self.io[0x0F] &= !(value & 0x1F),
             // Autres registres I/O.
             0xFF00..=0xFF7F => self.io[(addr - 0xFF00) as usize] = value,
             // High RAM.
@@ -189,13 +262,40 @@ impl MMU {
         }
     }
 
-    /// Transfert DMA OAM (Pan Docs « DMA ») : l'écriture de $FF46 copie les 160 octets d'OAM
-    /// ($FE00-$FE9F) depuis l'adresse source `source << 8` ($0000-$FFFF), lue via la carte d'adresses.
-    fn dma_transfer(&mut self, source: u8) {
-        let base = (source as usize) << 8; // adresse source : $0000-$FFFF
-        for i in 0..self.oam.len() {
-            let byte = self.read((base + i) as u16);
-            self.oam[i] = byte;
+    /// Indique si un transfert DMA OAM est en cours (Pan Docs « OAM DMA Transfer »).
+    pub fn dma_active(&self) -> bool {
+        self.dma_remaining > 0
+    }
+
+    /// Réinitialise l'état du transfert DMA OAM (power-on / reset — Pan Docs « OAM DMA Transfer »).
+    pub fn reset_dma(&mut self) {
+        self.dma_remaining = 0;
+        self.dma_just_started = false;
+    }
+
+    /// HRAM ($FF80-$FFFE) : la seule région accessible au CPU pendant le DMA OAM (Pan Docs « OAM DMA Transfer »).
+    fn is_hram(addr: u16) -> bool {
+        (0xFF80..=0xFFFE).contains(&addr)
+    }
+
+    /// Fait avancer le transfert DMA OAM de `cycles` M-cycles : un octet est copié par cycle, depuis
+    /// l'adresse source (`value << 8`) vers l'OAM ($FE00-$FE9F), lu via la carte d'adresses complète —
+    /// l'unité DMA n'est pas affectée par le conflit de bus qu'elle provoque (Pan Docs « OAM DMA Transfer »).
+    /// Si $FF46 a été écrit pendant ces mêmes cycles, aucun octet n'est copié : l'écriture a lieu sur le
+    /// dernier M-cycle de son instruction, donc la fenêtre de 160 M-cycles démarre après celle-ci.
+    pub fn advance_dma(&mut self, cycles: u32) {
+        if self.dma_just_started {
+            self.dma_just_started = false; // ces cycles ont déjà eu lieu avant (ou pendant) l'écriture de $FF46.
+            return;
+        }
+        if self.dma_remaining == 0 {
+            return; // aucun transfert en cours.
+        }
+        let n = cycles.min(self.dma_remaining) as usize;
+        for _ in 0..n {
+            let idx = self.oam.len() - self.dma_remaining as usize; // prochain slot OAM ($FE00 + idx)
+            self.oam[idx] = self.read_plain(self.dma_source_addr + idx as u16);
+            self.dma_remaining -= 1;
         }
     }
 
@@ -206,12 +306,11 @@ impl MMU {
             None => 0xFF,
         }
     }
-
 }
 
 impl Default for MMU {
     fn default() -> Self {
-        Self {
+        let mut mmu = Self {
             rom: Vec::new(),
             vram: [0; 0x2000],
             wram: [0; 0x2000],
@@ -219,18 +318,26 @@ impl Default for MMU {
             hram: [0; 0x7F],
             io: [0; 0x80],
             ie: 0,
+            cpu_halted: false, // le CPU n'est pas halté au power-on (bit 5 de IF lu à $00).
             ppu: PPU::new(),
             serial: Serial::default(),
             timer: Timer::default(),
-            mbc: Mbc::new(MbcType::RomOnly), // état power-up ; remplacé par le type détecté dans `load_rom`.
-            cartridge: None, // remplacé par l'en-tête analysé dans `load_rom`.
-        }
+            joypad: Joypad::default(),
+            mbc: Mbc::new(MbcType::RomOnly, 0), // état power-up (aucune ROM chargée) ; remplacé par le type détecté dans `load_rom`.
+            cartridge: None,                    // remplacé par l'en-tête analysé dans `load_rom`.
+            dma_remaining: 0,                   // aucun transfert OAM en cours au power-on.
+            dma_source_addr: 0,
+            dma_just_started: false,
+        };
+        mmu.reset_memory(); // valeurs au power-on (PanDocs « Power Up Sequence ») : VRAM/OAM/HRAM = $FF, WRAM banque 0 = $11 / banque 1 = $FF.
+        mmu
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cpu::CPU;
     use crate::mbc::ROM_BANK_SIZE;
 
     /// Construit une ROM minimale de 32 KiB (sans MBC) avec `title` à l'emplacement du titre (0x0134).
@@ -256,6 +363,53 @@ mod tests {
         assert_eq!(mmu.read(0x0000), 0x42);
         assert_eq!(mmu.read(0x00FF), 0x42);
         assert_eq!(mmu.read(0x0100), 0xFF); // open bus au-delà du fichier
+    }
+
+    #[test]
+    fn small_32kib_roms_map_the_whole_file_without_open_bus() {
+        // Une ROM de 32 KiB a des indices valides de 0 à 32767 : quel que soit le type d'en-tête (ROM ONLY, MBC1 ou MBC5)
+        // et quelle que soit la valeur écrite dans les registres de banque, une lecture $0000-$7FFF renvoie un octet du fichier.
+        let base: Vec<u8> = (0..32 * 1024).map(|i| if i < ROM_BANK_SIZE { 0x11 } else { 0x22 }).collect(); // banque 0 en $11, banque 1 en $22
+
+        // Cas 1 : en-tête $0147 = $00 → ROM ONLY : cartographie plate du fichier entier.
+        let mut rom = base.clone();
+        rom[HEADER_TYPE_ADDR as usize] = 0x00;
+        let mut mmu = MMU::new();
+        mmu.load_rom(rom);
+        assert_eq!(mmu.read(0x3FFF), 0x11); // dernier octet de la première moitié
+        assert_eq!(mmu.read(0x4000), 0x22); // seconde moitié du fichier à $4000-$7FFF
+        assert_eq!(mmu.read(0x7FFF), 0x22); // dernier octet du fichier
+
+        // Cas 2 : en-tête $0147 = $01 → MBC1 : seul le bit 0 du registre de banque est valide (deux banques).
+        let mut rom = base.clone();
+        rom[HEADER_TYPE_ADDR as usize] = 0x01;
+        let mut mmu = MMU::new();
+        mmu.load_rom(rom);
+        for reg in 0..=0xFFu8 {
+            mmu.write(0x2000, reg); // registre de banque ROM
+            assert_eq!(mmu.read(0x4000), 0x22); // règle du zéro + bit unique valide → toujours la banque 1
+            assert_eq!(mmu.read(0x7FFF), 0x22); // dernier octet du fichier, jamais l'open bus
+        }
+        mmu.write(0x6000, 0x80); // mode avancé : les bits supérieurs sont aussi masqués vers les deux banques existantes
+        for ram_reg in 0..=0xFFu8 {
+            mmu.write(0x4000, ram_reg);
+            mmu.write(0x2000, 0x00);
+            assert_eq!(mmu.read(0x4000), 0x22); // règle du zéro : registre $00 → banque 1
+            mmu.write(0x2000, 0x02);
+            assert_eq!(mmu.read(0x4000), 0x11); // seul le bit 0 valide : pair non nul → banque 0
+        }
+
+        // Cas 3 : en-tête $0147 = $11 → MBC5 : au power-up, le registre $00 sélectionne réellement la banque $00 ; seul le bit 0 est valide.
+        let mut rom = base;
+        rom[HEADER_TYPE_ADDR as usize] = 0x11;
+        let mut mmu = MMU::new();
+        mmu.load_rom(rom);
+        assert_eq!(mmu.read(0x4000), 0x11); // power-up : registre $00 → réellement la banque $00 (PanDocs « MBC5 »)
+        for reg in 0..=0xFFu8 {
+            mmu.write(0x2000, reg); // bits 0-7 de la banque ROM
+            let expected = if reg & 1 == 1 { 0x22 } else { 0x11 };
+            assert_eq!(mmu.read(0x4000), expected); // seul le bit 0 valide, jamais hors plage du fichier
+        }
     }
 
     #[test]
@@ -438,13 +592,18 @@ mod tests {
         mmu.write(0xFF44, 99);
         assert_eq!(mmu.read(0xFF44), 0);
 
-        // STAT ($FF41) : seuls les bits 3..6 sont écrits ; la lecture renvoie les bits d'activation + le drapeau LYC==LY (bit 7).
+        // STAT ($FF41) : seuls les bits 3..6 sont écrits ; la lecture renvoie le mode PPU courant (bits 0-1, OAM Scan au power-on),
+        // les bits d'activation + le drapeau LYC==LY (bit 7).
         mmu.write(0xFF41, 0x78);
-        assert_eq!(mmu.read(0xFF41), 0xF8); // bits écrits 0x78 + drapeau LYC==LY en bit 7 (ly == lyc == 0) ; les bits 0-2 se lisent à 0.
+        assert_eq!(mmu.read(0xFF41), 0xFA); // bits écrits 0x78 + mode OAM Scan en bits 0-1 (power-on) + drapeau LYC==LY en bit 7 (ly == lyc == 0).
 
-        // Le DMA OAM ($FF46) est routé vers la PPU, pas vers `io`.
+        // Le DMA OAM ($FF46) est routé vers la PPU, pas vers `io`. L'écriture démarre le transfert de
+        // 160 M-cycles : pendant le conflit de bus, la lecture de $FF46 (hors HRAM) renvoie $FF.
         mmu.write(0xFF46, 0xC0);
-        assert_eq!(mmu.read(0xFF46), 0xC0);
+        assert_eq!(mmu.read(0xFF46), 0xFF); // Bus occupé par le DMA → lecture bloquée...
+        mmu.advance_dma(8); // cycles de l'instruction ayant écrit $FF46 : aucun octet copié.
+        mmu.advance_dma(DMA_OAM_CYCLES); // ...jusqu'à la fin du transfert.
+        assert_eq!(mmu.read(0xFF46), 0xC0); // le registre DMA mémorise l'adresse source
     }
 
     #[test]
@@ -454,13 +613,40 @@ mod tests {
         for i in 0..0xA0 {
             mmu.write(0xC000 + i, (i as u8) ^ 0x5A);
         }
-        // L'écriture de $FF46 = $C0 copie les 160 octets depuis $C000 vers OAM ($FE00-$FE9F).
+        // L'écriture de $FF46 = $C0 démarre le transfert : rien n'est copié tant que les M-cycles ne se sont pas écoulés.
         mmu.write(0xFF46, 0xC0);
+        assert!(mmu.dma_active()); // le transfert est en cours...
+        assert_eq!(mmu.oam[0], 0xFF); // ...et l'OAM n'est pas encore modifiée (valeur power-on $FF ; la lecture CPU de $FE00 renvoie $FF).
+
+        mmu.advance_dma(8); // cycles de l'instruction ayant écrit $FF46 : aucun octet copié.
+        assert!(mmu.dma_active());
+        assert_eq!(mmu.oam[0], 0xFF);
+
+        mmu.advance_dma(DMA_OAM_CYCLES); // le transfert s'achève (exactement 160 M-cycles).
+        assert!(!mmu.dma_active());
 
         for i in 0..0xA0 {
             assert_eq!(mmu.read(0xFE00 + i), (i as u8) ^ 0x5A); // OAM = contenu de $C000-$C09F
         }
-        assert_eq!(mmu.read(0xFF46), 0xC0); // le registre DMA mémorise l'adresse source
+    }
+
+    #[test]
+    fn dma_oam_transfer_copies_one_byte_per_cycle() {
+        let mut mmu = MMU::new();
+        for i in 0..0xA0 {
+            mmu.write(0xC000 + i, i as u8);
+        }
+        mmu.write(0xFF46, 0xC0);
+        mmu.advance_dma(8); // cycles de l'instruction ayant écrit $FF46 : aucun octet copié.
+
+        for k in 1..=0xA0 {
+            mmu.advance_dma(1);
+            assert_eq!(mmu.oam[k - 1], (k - 1) as u8); // l'octet k-1 vient d'être copié...
+            if k < 0xA0 {
+                assert_eq!(mmu.oam[k], 0xFF); // ...le suivant ne l'est pas encore (valeur power-on $FF).
+            }
+        }
+        assert!(!mmu.dma_active()); // le transfert s'achève exactement après le 160e M-cycle.
     }
 
     #[test]
@@ -471,15 +657,67 @@ mod tests {
             mmu.write(0x8200 + i, 0x3C);
         }
         mmu.write(0xFF46, 0x82);
+        mmu.advance_dma(8); // cycles de l'instruction ayant écrit $FF46 : aucun octet copié.
+        mmu.advance_dma(DMA_OAM_CYCLES);
 
         assert_eq!(mmu.read(0xFE00), 0x3C); // premier octet OAM = $8200
         assert_eq!(mmu.read(0xFE9F), 0x3C); // dernier octet OAM = $829F
     }
 
     #[test]
+    fn dma_oam_transfer_restricts_cpu_access_for_160_cycles() {
+        let mut mmu = MMU::new();
+        for i in 0..0xA0 {
+            mmu.write(0xC000 + i, (i as u8) ^ 0x5A);
+        }
+        // La HRAM reste accessible pendant le transfert.
+        mmu.write(0xFF80, 0x11);
+        mmu.write(0xFFFE, 0x22);
+
+        mmu.write(0xFF46, 0xC0);
+        mmu.advance_dma(8); // cycles de l'instruction ayant écrit $FF46 : aucun octet copié.
+
+        for _ in 0..DMA_OAM_CYCLES - 1 {
+            mmu.advance_dma(1);
+            assert!(mmu.dma_active()); // la fenêtre dure exactement 160 M-cycles...
+            assert_eq!(mmu.read(0xC000), 0xFF); // ...les lectures WRAM sont bloquées → $FF.
+            assert_eq!(mmu.read(0x8000), 0xFF); // VRAM aussi.
+            assert_eq!(mmu.read(0xFFFF), 0xFF); // même IE ($FFFF) — hors HRAM.
+            mmu.write(0xC000, 0x77); // les écritures sont ignorées (bus occupé par l'unité DMA).
+            assert_eq!(mmu.read(0xFF80), 0x11); // ...sauf la HRAM, toujours accessible.
+            assert_eq!(mmu.read(0xFFFE), 0x22);
+        }
+
+        mmu.advance_dma(1); // le 160e M-cycle : le transfert s'achève.
+        assert!(!mmu.dma_active());
+        assert_eq!(mmu.read(0xC000), 0x5A); // l'écriture faite pendant le DMA a été ignorée...
+        assert_eq!(mmu.read(0xFF80), 0x11); // ...et la HRAM conserve les valeurs écrites pendant le DMA.
+    }
+
+    #[test]
+    fn dma_oam_write_outside_valid_source_range_does_not_start_transfer() {
+        let mut mmu = MMU::new();
+        for i in 0..0xA0 {
+            mmu.write(0xC000 + i, (i as u8) ^ 0x5A);
+        }
+
+        // $E0 et au-delà : l'adresse source n'est ni en ROM ni en RAM → aucun transfert
+        // (Pan Docs « OAM DMA Transfer » : XX = $00 à $DF).
+        for value in [0xE0u8, 0xFE, 0xFF] {
+            mmu.write(0xFF46, value);
+            assert!(!mmu.dma_active()); // aucun transfert démarré.
+            assert_eq!(mmu.read(0xFF46), value); // le registre mémorise la valeur écrite.
+        }
+
+        // Une écriture valide démarre bien un transfert de 160 M-cycles.
+        mmu.write(0xFF46, 0xC0);
+        assert!(mmu.dma_active());
+    }
+
+    #[test]
     fn mbc3_header_enables_rom_and_rtc_banking() {
         let mut rom = vec![0x00; 0x8000 * 4]; // 128 KiB (MBC3)
-        rom[0x147] = 0x11; // MBC3 (PanDocs « The Cartridge Header »)
+        rom[0x147] = 0x0B; // MBC3 with TIMER (PanDocs « The Cartridge Header »)
         rom[0x4000] = 0x11; // banque $01, premier octet
         rom[0x8000] = 0x22; // banque $02, premier octet
 
@@ -529,7 +767,9 @@ mod tests {
 
     /// Construit une ROM de 32 KiB avec le logo officiel et la somme de contrôle d'en-tête valide.
     fn rom_with_valid_header() -> Vec<u8> {
-        use crate::cartridge::{compute_header_checksum, HEADER_CHECKSUM_ADDR, LOGO_LEN, LOGO_START, NINTENDO_LOGO};
+        use crate::cartridge::{
+            HEADER_CHECKSUM_ADDR, LOGO_LEN, LOGO_START, NINTENDO_LOGO, compute_header_checksum,
+        };
         let mut rom = vec![0u8; 0x4000];
         rom[LOGO_START..LOGO_START + LOGO_LEN].copy_from_slice(&NINTENDO_LOGO); // logo officiel ($0104-$0133)
         rom[0x0134..0x0134 + 16].copy_from_slice(b"FARQUAADGB\0\0\0\0\0\0"); // titre bourgé de $00
@@ -542,7 +782,9 @@ mod tests {
         let mut mmu = MMU::new();
         mmu.load_rom(rom_with_valid_header());
 
-        let header = mmu.cartridge().expect("l'en-tête doit être analysé au chargement");
+        let header = mmu
+            .cartridge()
+            .expect("l'en-tête doit être analysé au chargement");
         assert!(header.logo_valid); // logo officiel présent ($0104-$0133)
         assert_eq!(header.title, "FARQUAADGB");
         assert!(header.header_checksum_valid); // $014D == valeur calculée sur $0134-$014C
@@ -558,5 +800,99 @@ mod tests {
 
         assert!(mmu.cartridge().is_none()); // pas d'en-tête analysé (avertissement affiché)
         assert_eq!(mmu.read(0x0000), 0x42); // la ROM est chargée quand même, telle quelle
+    }
+
+    /// Audit de la carte d'adresses complète (Gekkio Appendix B / PanDocs « Memory Map ») :
+    /// chaque plage est lue et écrite à sa place exacte, y compris la HRAM où vit la pile.
+    #[test]
+    fn full_memory_map_read_write_audit() {
+        let mut rom = vec![0x00; 0xC000]; // MBC1, 48 KiB (banques $00-$02)
+        rom[HEADER_TYPE_ADDR as usize] = 0x01;
+        rom[0x0000] = 0xA0; // banque 0, premier octet
+        rom[0x3FFF] = 0xB0; // banque 0, dernier octet (toujours mappé)
+        rom[0x4000] = 0xC1; // banque 1, premier octet
+
+        let mut mmu = MMU::new();
+        mmu.load_rom(rom);
+
+        // --- ROM : la région $0000-$3FFF reste en banque 0 ; $4000-$7FFF suit le registre de banque.
+        assert_eq!(mmu.read(0x0000), 0xA0);
+        assert_eq!(mmu.read(0x3FFF), 0xB0);
+        assert_eq!(mmu.read(0x4000), 0xC1); // power-up : le registre $00 se comporte comme la banque $01
+        mmu.write(0x2000, 0x02); // sélection de la banque 2 (registre ROM)
+        assert_eq!(mmu.read(0x4000), 0x00); // banque 2 (remplie de $00 dans ce test)
+        assert_eq!(mmu.read(0x3FFF), 0xB0); // la région banque 0 reste inchangée
+
+        // --- VRAM.
+        mmu.write(0x8000, 0x12);
+        assert_eq!(mmu.read(0x8000), 0x12);
+        mmu.write(0x9FFF, 0x34);
+        assert_eq!(mmu.read(0x9FFF), 0x34);
+
+        // --- SRAM cartouche : désactivée → open bus $FF ; activée ($0A) → lisible/écrivable.
+        assert_eq!(mmu.read(0xA000), 0xFF);
+        mmu.write(0x0000, 0x0A); // activation de la RAM
+        mmu.write(0xBFFF, 0x56);
+        assert_eq!(mmu.read(0xBFFF), 0x56);
+
+        // --- WRAM + Echo RAM (miroir C000-DDFF dans les deux sens).
+        mmu.write(0xC000, 0x78);
+        assert_eq!(mmu.read(0xE000), 0x78); // lecture via le miroir
+        mmu.write(0xFDFF, 0x9A);
+        assert_eq!(mmu.read(0xDDFF), 0x9A); // écriture via le miroir
+
+        // --- OAM + zone inutilisable.
+        mmu.write(0xFE9F, 0xBC);
+        assert_eq!(mmu.read(0xFE9F), 0xBC);
+        assert_eq!(mmu.read(0xFEA0), 0x00); // $FEA0-$FEFF : $00 sur DMG
+
+        // --- HRAM (la pile est ici !) + registre IE.
+        mmu.write(0xFF80, 0xDE);
+        assert_eq!(mmu.read(0xFF80), 0xDE);
+        mmu.write(0xFFFE, 0xAD); // vérification cruciale : le dernier octet de HRAM est bien écrit (LD SP,$FFFE)
+        assert_eq!(mmu.read(0xFFFE), 0xAD);
+        mmu.write(0xFFFF, 0b1010_0000);
+        assert_eq!(mmu.read(0xFFFF), 0b1010_0000); // registre IE
+    }
+
+    /// Valeurs au power-on des régions de mémoire (PanDocs « Power Up Sequence ») :
+    /// VRAM $FF, WRAM banque 0 = $11 / banque 1 = $FF, OAM $FF, HRAM $FF.
+    #[test]
+    fn memory_regions_power_up_values() {
+        let mmu = MMU::new();
+        assert_eq!(mmu.read(0x8000), 0xFF); // VRAM : $FF sur DMG
+        assert_eq!(mmu.read(0x9FFF), 0xFF);
+        assert_eq!(mmu.read(0xC000), 0x11); // WRAM banque 0 ($C000-$CFFF) : $11
+        assert_eq!(mmu.read(0xD000), 0xFF); // WRAM banque 1 ($D000-$DFFF) : $FF
+        assert_eq!(mmu.read(0xFE00), 0xFF); // OAM : $FF
+        assert_eq!(mmu.read(0xFF80), 0xFF); // HRAM : $FF (SP=$FFFE pointe ici au hand-off)
+        assert_eq!(mmu.read(0xFFFE), 0xFF);
+    }
+
+    /// La pile du CPU gère correctement la HRAM via de vraies instructions :
+    /// LD SP,$FFFE puis PUSH/POP traversent le dernier octet de HRAM sans perte.
+    #[test]
+    fn stack_operations_through_hram_top_byte() {
+        let mut rom = vec![0xFF; 0x4000];
+        let code: &[u8] = &[
+            0x31, 0xFE, 0xFF, // LD SP,$FFFE (vérification cruciale : le dernier octet de HRAM est utilisé)
+            0x01, 0x34, 0x12, // LD BC,$1234
+            0xC5, // PUSH BC → $FFFD = $12, $FFFC = $34 (SP devient $FFFC)
+            0xC1, // POP BC
+        ];
+        rom[0x0100..0x0100 + code.len()].copy_from_slice(code);
+
+        let mut mmu = MMU::new();
+        mmu.load_rom(rom);
+        let mut cpu = CPU::new();
+        for _ in 0..4 { // exactement les 4 instructions (LD SP, LD BC, PUSH, POP)
+            cpu.step(&mut mmu);
+        }
+
+        assert_eq!(cpu.sp, 0xFFFE); // la pile est de retour à $FFFE après le POP
+        assert_eq!(mmu.read(0xFFFC), 0x34); // l'octet bas a été poussé dans la HRAM...
+        assert_eq!(mmu.read(0xFFFD), 0x12); // ...ainsi que l'octet haut (le dernier octet $FFFE n'est pas écrasé)
+        assert_eq!(cpu.b, 0x12); // le POP a restauré BC depuis la HRAM
+        assert_eq!(cpu.c, 0x34);
     }
 }

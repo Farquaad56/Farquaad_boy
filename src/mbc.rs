@@ -38,14 +38,15 @@ pub enum MbcType {
 }
 
 impl MbcType {
-    /// Détecte le contrôleur de mémoire depuis l'octet d'en-tête $0147 (tableau PanDocs « The Cartridge Header »).
+    /// Détecte le contrôleur de mémoire depuis l'octet d'en-tête $0147 : les 5 bits bas sélectionnent
+    /// le type (tableau PanDocs « The Cartridge Header »).
     pub fn from_header_byte(byte: u8) -> Self {
-        match byte {
+        match byte & 0x1F {
             0x01..=0x03 => MbcType::Mbc1, // MBC1 / +RAM / +RAM+BATTERY
-            0x05 | 0x06 => MbcType::Mbc2, // MBC2 / +BATTERY
-            0x0F..=0x13 => MbcType::Mbc3, // variantes MBC3 (dont timer and MBC30)
-            0x19..=0x1E => MbcType::Mbc5, // variantes MBC5 (dont rumble)
-            _ => MbcType::RomOnly,        // $00 (ROM ONLY), MMM01, autres valeurs inconnues
+            0x05..=0x07 => MbcType::Mbc2, // MBC2 / +BATTERY / +RAM+BATTERY
+            0x0B..=0x0D => MbcType::Mbc3, // MBC3 with TIMER (± battery/RAM)
+            0x0F..=0x13 | 0x19..=0x1B => MbcType::Mbc5, // MBC5 (+RAM/+RUMBLE), dont variantes MBC6 non officielles
+            _ => MbcType::RomOnly, // $00 (ROM ONLY), $20 (MBC7), autres valeurs inconnues
         }
     }
 }
@@ -54,13 +55,15 @@ impl MbcType {
 pub struct Mbc {
     /// Type de contrôleur détecté depuis l'en-tête $0147.
     pub mbc_type: MbcType,
+    /// Taille de la ROM chargée en octets : les bits de banque au-delà de cette taille sont masqués (PanDocs « MBCs »).
+    rom_size: usize,
     /// Valeur brute du registre de banque ROM ($2000-$3FFF ; pour MBC5 : bits 0-7 à $2000-$2FFF + bit 8 à $3000-$3FFF).
     /// Défaut power-up $00 (lu comme la banque $01, sauf sur MBC5 où il est lu comme $00).
-    rom_bank_reg: u16,
+    rom_bank: u16,
     /// Valeur brute du registre $4000-$5FFF. Le sens dépend du type/mode :
-    /// MBC1 mode 0 → bits supérieurs ROM (bits 5-6) / banque SRAM (bits 0-1) ;
+    /// MBC1 mode avancé → bits 5-6 = banques supérieures ROM et banque SRAM (mode simple : SRAM verrouillée sur la banque 0) ;
     /// MBC3/MBC5 → sélection banque SRAM ou registre RTC ($08..=$0C). Défaut power-up $00.
-    ram_bank_reg: u8,
+    ram_bank: u8,
     /// Mode de banking MBC1 (bit 7 du registre $6000-$7FFF) : false = simple (banking ROM), true = avancé (banking RAM).
     banking_mode: bool,
     /// La RAM cartouche est-elle activée ? Écriture $0A sur $0000-$1FFF pour l'activer.
@@ -81,12 +84,13 @@ pub struct Mbc {
 
 impl Mbc {
     /// État power-up du contrôleur : registres à $00, RAM désactivée, horloge initialisée sur l'heure système.
-    pub fn new(mbc_type: MbcType) -> Self {
+    pub fn new(mbc_type: MbcType, rom_size: usize) -> Self {
         let (seconds, minutes, hours) = rtc_initial_time();
         Self {
             mbc_type,
-            rom_bank_reg: 0x00,
-            ram_bank_reg: 0x00,
+            rom_size,
+            rom_bank: 0x00,
+            ram_bank: 0x00,
             banking_mode: false,
             ram_enabled: false,
             sram: [0u8; SRAM_SIZE],
@@ -114,21 +118,21 @@ impl Mbc {
     /// Écriture du registre de banque ROM ($2000-$3FFF ; pour MBC5 : $2000-$2FFF → bits 0-7, bit 8 conservé).
     pub fn set_rom_bank(&mut self, value: u8) {
         match self.mbc_type {
-            MbcType::Mbc5 => self.rom_bank_reg = (self.rom_bank_reg & 0x0100) | value as u16,
-            _ => self.rom_bank_reg = value as u16,
+            MbcType::Mbc5 => self.rom_bank = (self.rom_bank & 0x0100) | value as u16,
+            _ => self.rom_bank = value as u16,
         }
     }
 
     /// Écriture du registre du bit 8 de la banque ROM sur MBC5 ($3000-$3FFF). No-op pour les autres contrôleurs.
     pub fn set_rom_bank_bit8(&mut self, value: u8) {
         if self.mbc_type == MbcType::Mbc5 {
-            self.rom_bank_reg = (self.rom_bank_reg & 0x00FF) | (((value & 0x01) as u16) << 8);
+            self.rom_bank = (self.rom_bank & 0x00FF) | (((value & 0x01) as u16) << 8);
         }
     }
 
     /// Écriture de la région $4000-$5FFF : banque SRAM / bits supérieurs ROM / sélection registre RTC (valeur brute).
     pub fn set_ram_bank(&mut self, value: u8) {
-        self.ram_bank_reg = value;
+        self.ram_bank = value;
     }
 
     /// Écriture de la région $6000-$7FFF : mode de banking MBC1 et latch horloge MBC3. No-op pour les autres contrôleurs.
@@ -152,20 +156,20 @@ impl Mbc {
                 // PanDocs « MBC2 » : le bit 8 de l'adresse sélectionne l'activation RAM (bit à 0) ou la banque ROM (bit à 1).
                 0x0000..=0x3FFF if addr & 0x0100 == 0 => self.set_ram_enabled(value),
                 0x0000..=0x3FFF => self.set_rom_bank(value), // 4 bits bas → banque ROM ($00 lu comme $01)
-                _ => {}                                      // $4000-$7FFF : aucun registre sur MBC2
+                _ => {} // $4000-$7FFF : aucun registre sur MBC2
             },
             MbcType::Mbc5 => match addr {
                 0x0000..=0x1FFF => self.set_ram_enabled(value),
-                0x2000..=0x2FFF => self.set_rom_bank(value),      // bits 0-7 de la banque ROM (PanDocs « MBC5 »)
+                0x2000..=0x2FFF => self.set_rom_bank(value), // bits 0-7 de la banque ROM (PanDocs « MBC5 »)
                 0x3000..=0x3FFF => self.set_rom_bank_bit8(value), // bit 8 de la banque ROM
-                0x4000..=0x5FFF => self.set_ram_bank(value),     // banque SRAM (bits 0-3)
-                _ => {}                                          // $6000-$7FFF : aucun registre sur MBC5
+                0x4000..=0x5FFF => self.set_ram_bank(value), // banque SRAM (bits 0-3)
+                _ => {} // $6000-$7FFF : aucun registre sur MBC5
             },
             MbcType::Mbc1 | MbcType::Mbc3 => match addr {
                 0x0000..=0x1FFF => self.set_ram_enabled(value),
                 0x2000..=0x3FFF => self.set_rom_bank(value), // bits 0-4 (MBC1) / 7 bits entiers (MBC3)
                 0x4000..=0x5FFF => self.set_ram_bank(value), // banque SRAM / bits supérieurs ROM / sélection RTC
-                _ => self.write_mode_register(value),        // $6000-$7FFF : mode select (MBC1) / latch (MBC3)
+                _ => self.write_mode_register(value), // $6000-$7FFF : mode select (MBC1) / latch (MBC3)
             },
         }
     }
@@ -187,16 +191,16 @@ impl Mbc {
         let offset = (addr - 0xA000) as usize;
         Some(match self.mbc_type {
             MbcType::Mbc2 => self.sram[(addr & 0x1FF) as usize], // RAM interne 512×4 bits : seuls les 9 bits bas d'adresse sont utilisés
-            MbcType::Mbc3 => match self.ram_bank_reg & 0x0F {
+            MbcType::Mbc3 => match self.ram_bank & 0x0F {
                 sel @ 8..=12 => self.rtc_read(sel - 8), // registre RTC $08-$0C (accessible à toute adresse de la région)
                 sel => self.sram[sel as usize % SRAM_BANK_COUNT * RAM_BANK_SIZE + offset],
             },
             MbcType::Mbc1 if self.banking_mode => {
-                let bank = (self.ram_bank_reg & 0x03) as usize; // bits 0-1 sélectionnent la banque SRAM
+                let bank = ((self.ram_bank >> 5) & 0x03) as usize; // bits 5-6 : même registre que les banques supérieures ROM (PanDocs « MBC1 »)
                 self.sram[bank * RAM_BANK_SIZE + offset]
             }
             MbcType::Mbc5 => {
-                let bank = (self.ram_bank_reg & 0x0F) as usize % SRAM_BANK_COUNT; // bits 0-3, rebroussement
+                let bank = (self.ram_bank & 0x0F) as usize % SRAM_BANK_COUNT; // bits 0-3, rebroussement
                 self.sram[bank * RAM_BANK_SIZE + offset]
             }
             _ => self.sram[offset], // MBC1 mode 0 : la SRAM reste verrouillée sur la banque 0
@@ -211,16 +215,16 @@ impl Mbc {
         let offset = (addr - 0xA000) as usize;
         match self.mbc_type {
             MbcType::Mbc2 => self.sram[(addr & 0x1FF) as usize] = value & 0x0F, // seuls les 4 bits bas sont conservés
-            MbcType::Mbc3 => match self.ram_bank_reg & 0x0F {
+            MbcType::Mbc3 => match self.ram_bank & 0x0F {
                 sel @ 8..=12 => self.rtc_write(sel - 8, value),
                 sel => self.sram[sel as usize % SRAM_BANK_COUNT * RAM_BANK_SIZE + offset] = value,
             },
             MbcType::Mbc1 if self.banking_mode => {
-                let bank = (self.ram_bank_reg & 0x03) as usize;
+                let bank = ((self.ram_bank >> 5) & 0x03) as usize; // bits 5-6 (PanDocs « MBC1 »)
                 self.sram[bank * RAM_BANK_SIZE + offset] = value;
             }
             MbcType::Mbc5 => {
-                let bank = (self.ram_bank_reg & 0x0F) as usize % SRAM_BANK_COUNT;
+                let bank = (self.ram_bank & 0x0F) as usize % SRAM_BANK_COUNT;
                 self.sram[bank * RAM_BANK_SIZE + offset] = value;
             }
             _ => self.sram[offset] = value, // MBC1 mode 0 : la SRAM reste verrouillée sur la banque 0
@@ -231,7 +235,7 @@ impl Mbc {
     #[allow(dead_code)] // API publique du contrôleur — utilisée par les tests et les parties futures (sauvegarde d'état).
     pub fn rtc_register(&self) -> Option<u8> {
         if self.mbc_type == MbcType::Mbc3 && self.ram_enabled {
-            let sel = self.ram_bank_reg & 0x0F;
+            let sel = self.ram_bank & 0x0F;
             ((8..=12).contains(&sel)).then(|| sel - 8)
         } else {
             None
@@ -266,34 +270,62 @@ impl Mbc {
         self.rtc_latched
     }
 
+    /// Calcule le nombre de banques ROM disponibles et masque les bits de banque invalides.
+    /// PanDocs : si le jeu sélectionne une banque qui n'existe pas, les bits supérieurs sont ignorés.
+    fn mask_rom_bank(&self, bank: u32) -> u32 {
+        let max_banks = (self.rom_size / ROM_BANK_SIZE) as u32;
+        if max_banks <= 1 {
+            return 0; // ROM plate ou une seule banque
+        }
+        // Trouver le masque de bits valide (ex: 2 banques = 1 bit, 4 banques = 2 bits, etc.)
+        let mask = max_banks.next_power_of_two() - 1;
+        bank & mask
+    }
+
     /// Banque ROM effective pour une adresse $0000-$7FFF (PanDocs « MBC1 » / « MBC2 » / « MBC3 » / « MBC5 »).
     fn effective_rom_bank(&self, addr: u16) -> u32 {
         match self.mbc_type {
             MbcType::Mbc1 => {
                 if self.banking_mode {
-                    let upper = ((self.ram_bank_reg >> 5) & 0x03) as u32; // bits 5-6 du registre $4000-$5FFF
+                    let upper = ((self.ram_bank >> 5) & 0x03) as u32; // bits 5-6 du registre $4000-$5FFF
                     if addr < 0x4000 {
-                        upper << 5 // les banques $20/$40/$60 deviennent accessibles dans cette région
+                        self.mask_rom_bank(upper << 5) // les banques $20/$40/$60 deviennent accessibles dans cette région
                     } else {
-                        let lower = (self.rom_bank_reg & 0x1F) as u32;
-                        (upper << 5) | if lower == 0 { 1 } else { lower } // la banque $00 se comporte comme $01
+                        let lower = (self.rom_bank & 0x1F) as u32;
+                        self.mask_rom_bank((upper << 5) | if lower == 0 { 1 } else { lower }) // la banque $00 se comporte comme $01
                     }
                 } else {
-                    let bank = (self.rom_bank_reg & 0x1F) as u32; // bits 0-4 du registre ROM
-                    if addr < 0x4000 { 0 } else { bank.max(1) }
+                    let bank = (self.rom_bank & 0x1F) as u32; // bits 0-4 du registre ROM
+                    if addr < 0x4000 {
+                        0
+                    } else {
+                        self.mask_rom_bank(bank).max(1)
+                    }
                 }
             }
             MbcType::Mbc2 => {
-                let bank = (self.rom_bank_reg & 0x0F) as u32; // registre 4 bits (PanDocs « MBC2 »)
-                if addr < 0x4000 { 0 } else { bank.max(1) }   // écrire $00 sélectionne la banque $01
+                let bank = (self.rom_bank & 0x0F) as u32; // registre 4 bits (PanDocs « MBC2 »)
+                if addr < 0x4000 {
+                    0
+                } else {
+                    self.mask_rom_bank(bank).max(1)
+                } // écrire $00 sélectionne la banque $01
             }
             MbcType::Mbc3 => {
-                let bank = (self.rom_bank_reg & 0x7F) as u32; // les 7 bits entiers du registre ROM (PanDocs « MBC3 »)
-                if addr < 0x4000 { 0 } else { bank.max(1) }   // écrire $00 sélectionne la banque $01
+                let bank = (self.rom_bank & 0x7F) as u32; // les 7 bits entiers du registre ROM (PanDocs « MBC3 »)
+                if addr < 0x4000 {
+                    0
+                } else {
+                    self.mask_rom_bank(bank).max(1)
+                } // écrire $00 sélectionne la banque $01
             }
             MbcType::Mbc5 => {
-                let bank = (self.rom_bank_reg & 0x1FF) as u32; // bits 0-8 du registre ROM (PanDocs « MBC5 »)
-                if addr < 0x4000 { 0 } else { bank }          // sur MBC5, la banque $00 est réellement la banque $00
+                let bank = (self.rom_bank & 0x1FF) as u32; // bits 0-8 du registre ROM (PanDocs « MBC5 »)
+                if addr < 0x4000 {
+                    0
+                } else {
+                    self.mask_rom_bank(bank)
+                } // sur MBC5, la banque $00 est réellement la banque $00
             }
             MbcType::RomOnly => unreachable!(), // géré dans get_rom_addr (ROM plate, sans commutation)
         }
@@ -305,7 +337,11 @@ fn rtc_initial_time() -> (u8, u8, u8) {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(d) => {
             let s = d.as_secs();
-            ((s % 60) as u8, ((s / 60) % 60) as u8, ((s / 3600) % 24) as u8)
+            (
+                (s % 60) as u8,
+                ((s / 60) % 60) as u8,
+                ((s / 3600) % 24) as u8,
+            )
         }
         Err(_) => (0, 0, 0),
     }
@@ -319,25 +355,27 @@ mod tests {
     fn header_byte_maps_to_mbc_type() {
         assert_eq!(MbcType::from_header_byte(0x00), MbcType::RomOnly); // ROM ONLY
         assert_eq!(MbcType::from_header_byte(0xFF), MbcType::RomOnly); // valeur inconnue (unknown value)
-        assert_eq!(MbcType::from_header_byte(0x0B), MbcType::RomOnly); // MMM01
-        assert_eq!(MbcType::from_header_byte(0x20), MbcType::RomOnly); // MBC6
+        assert_eq!(MbcType::from_header_byte(0x20), MbcType::RomOnly); // MBC7 : pas de variante dédiée → repli ROM ONLY
         for b in [0x01u8, 0x02, 0x03] {
             assert_eq!(MbcType::from_header_byte(b), MbcType::Mbc1);
         }
-        for b in [0x05u8, 0x06] {
+        for b in [0x05u8, 0x06, 0x07] {
             assert_eq!(MbcType::from_header_byte(b), MbcType::Mbc2);
         }
-        for b in [0x0Fu8, 0x10, 0x11, 0x12, 0x13] {
-            assert_eq!(MbcType::from_header_byte(b), MbcType::Mbc3);
+        for b in [0x0Bu8, 0x0C, 0x0D] {
+            assert_eq!(MbcType::from_header_byte(b), MbcType::Mbc3); // MBC3 with TIMER (± battery/RAM)
         }
-        for b in [0x19u8, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E] {
-            assert_eq!(MbcType::from_header_byte(b), MbcType::Mbc5);
+        for b in [0x0Fu8, 0x10, 0x11, 0x12, 0x13] {
+            assert_eq!(MbcType::from_header_byte(b), MbcType::Mbc5); // MBC5 (+RAM/+RUMBLE)
+        }
+        for b in [0x19u8, 0x1A, 0x1B] {
+            assert_eq!(MbcType::from_header_byte(b), MbcType::Mbc5); // variantes MBC6 non officielles (MBC5+RAM)
         }
     }
 
     #[test]
     fn rom_only_is_flat_and_ignores_writes() {
-        let mut mbc = Mbc::new(MbcType::RomOnly);
+        let mut mbc = Mbc::new(MbcType::RomOnly, 0x8000);
         assert_eq!(mbc.get_rom_addr(0x4000), 0x4000); // ROM plate : aucune commutation de banque (flat ROM: no bank switching)
         mbc.write_register(0x2000, 0x05); // les écritures dans $0000-$7FFF sont ignorées (writes in the range $0000-$7FFF are ignored)
         assert_eq!(mbc.get_rom_addr(0x4000), 0x4000);
@@ -347,7 +385,7 @@ mod tests {
 
     #[test]
     fn mbc1_mode0_rom_banking() {
-        let mut mbc = Mbc::new(MbcType::Mbc1);
+        let mut mbc = Mbc::new(MbcType::Mbc1, 0x20000); // ROM de 128 KiB (8 banques)
         assert_eq!(mbc.get_rom_addr(0x0000), 0); // la région $0000-$3FFF reste toujours en banque 0 (the region $0000-$3FFF always remains on bank 0)
         assert_eq!(mbc.get_rom_addr(0x4000), ROM_BANK_SIZE); // le registre $00 se comporte comme $01 (register $00 behaves as $01)
         mbc.set_rom_bank(0x05);
@@ -357,7 +395,7 @@ mod tests {
 
     #[test]
     fn mbc1_mode1_upper_bits_and_zero_rule() {
-        let mut mbc = Mbc::new(MbcType::Mbc1);
+        let mut mbc = Mbc::new(MbcType::Mbc1, 0x200000); // ROM de 2 MiB (128 banques)
         mbc.write_mode_register(0x80); // mode avancé (PanDocs « MBC1 ») (advanced mode)
         mbc.set_ram_bank(0x20); // bits supérieurs = 1 → banques $20-$3F (upper bits = 1 → banks $20-$3F)
         assert_eq!(mbc.get_rom_addr(0x0000), 0x20 * ROM_BANK_SIZE);
@@ -368,20 +406,22 @@ mod tests {
 
     #[test]
     fn mbc1_ram_banking_in_mode1() {
-        let mut mbc = Mbc::new(MbcType::Mbc1);
+        let mut mbc = Mbc::new(MbcType::Mbc1, 0x200000); // ROM de 2 MiB (128 banques)
         mbc.set_ram_enabled(0x0A);
         assert_eq!(mbc.read_ram(0xA000), Some(0)); // mode 0 : la SRAM reste verrouillée sur la banque 0 (mode 0: SRAM remains locked on bank 0)
         mbc.write_mode_register(0x80); // mode avancé (PanDocs « MBC1 ») (advanced mode)
-        mbc.set_ram_bank(0x02); // bits 0-1 → banque SRAM 2 (bits 0-1 → SRAM bank 2)
+        mbc.set_ram_bank(0x40); // bits 5-6 = 01 → banque SRAM 1, même registre que les banques supérieures ROM (bits 5-6 = 01 → SRAM bank 1, same register as the upper ROM banks)
         mbc.write_ram(0xA000, 0xAB);
         assert_eq!(mbc.read_ram(0xA000), Some(0xAB));
-        mbc.set_ram_bank(0x00);
-        assert_eq!(mbc.read_ram(0xA000), Some(0)); // la banque 0 est inchangée (bank 0 is unchanged)
+        mbc.set_ram_bank(0x80); // bits 5-6 = 10 → banque SRAM 2 (bits 5-6 = 10 → SRAM bank 2)
+        assert_eq!(mbc.read_ram(0xA000), Some(0)); // la banque 2 est inchangée (bank 2 is unchanged)
+        mbc.set_ram_bank(0x40);
+        assert_eq!(mbc.read_ram(0xA000), Some(0xAB)); // la banque 1 est conservée (bank 1 is retained)
     }
 
     #[test]
     fn ram_disabled_is_open_bus() {
-        let mut mbc = Mbc::new(MbcType::Mbc1);
+        let mut mbc = Mbc::new(MbcType::Mbc1, 0x20000); // ROM de 128 KiB (8 banques)
         assert_eq!(mbc.read_ram(0xA000), None); // désactivée par défaut (disabled by default)
         assert_eq!(mbc.rtc_register(), None);
         mbc.set_ram_enabled(0x0A);
@@ -390,7 +430,7 @@ mod tests {
 
     #[test]
     fn mbc2_bit8_of_address_selects_register() {
-        let mut mbc = Mbc::new(MbcType::Mbc2);
+        let mut mbc = Mbc::new(MbcType::Mbc2, 0x10000); // ROM de 64 KiB (4 banques)
         assert_eq!(mbc.get_rom_addr(0x4000), ROM_BANK_SIZE); // power-up : registre $00 → banque $01 (power-up: register $00 → bank $01)
         mbc.write_register(0x0100, 0x03); // bit 8 à 1 → banque ROM (PanDocs « MBC2 ») (bit 8 set to 1 → ROM bank)
         assert_eq!(mbc.get_rom_addr(0x4000), 3 * ROM_BANK_SIZE);
@@ -404,7 +444,7 @@ mod tests {
 
     #[test]
     fn mbc2_internal_ram_is_512_x_4_bits() {
-        let mut mbc = Mbc::new(MbcType::Mbc2);
+        let mut mbc = Mbc::new(MbcType::Mbc2, 0x8000); // ROM de 32 KiB (2 banques)
         mbc.write_register(0x0000, 0x0A); // active la RAM (bit 8 à 0) (enables the RAM: bit 8 set to 0)
         mbc.write_ram(0xA1FF, 0xAB); // dernier octet de la première région (last byte of the first region)
         assert_eq!(mbc.read_ram(0xBFFF), Some(0x0B)); // écho : seuls les 9 bits bas d'adresse + 4 bits bas conservés (echo: only the lower 9 address bits and lower 4 data bits are retained)
@@ -412,7 +452,7 @@ mod tests {
 
     #[test]
     fn mbc3_rom_bank_uses_seven_bits() {
-        let mut mbc = Mbc::new(MbcType::Mbc3);
+        let mut mbc = Mbc::new(MbcType::Mbc3, 0x200000); // ROM de 2 MiB (128 banques)
         assert_eq!(mbc.get_rom_addr(0x4000), ROM_BANK_SIZE); // le registre $00 se comporte comme $01 (register $00 behaves as $01)
         mbc.set_rom_bank(0x7F);
         assert_eq!(mbc.get_rom_addr(0x4000), 0x7F * ROM_BANK_SIZE);
@@ -421,7 +461,7 @@ mod tests {
 
     #[test]
     fn mbc3_rtc_registers_and_ram_banks() {
-        let mut mbc = Mbc::new(MbcType::Mbc3);
+        let mut mbc = Mbc::new(MbcType::Mbc3, 0x10000); // ROM de 64 KiB (4 banques)
         mbc.set_ram_enabled(0x0A);
         // Sélection $00 → banque SRAM 0 ; pas de registre RTC. (selection $00 → SRAM bank 0; no RTC register)
         assert_eq!(mbc.read_ram(0xA000), Some(0));
@@ -444,7 +484,7 @@ mod tests {
 
     #[test]
     fn mbc3_latch_sequence() {
-        let mut mbc = Mbc::new(MbcType::Mbc3);
+        let mut mbc = Mbc::new(MbcType::Mbc3, 0x10000); // ROM de 64 KiB (4 banques)
         assert!(!mbc.rtc_latched());
         mbc.write_mode_register(0x01); // verrouille l'horloge (PanDocs « MBC3 ») (locks the clock)
         assert!(mbc.rtc_latched());
@@ -454,7 +494,7 @@ mod tests {
 
     #[test]
     fn mbc5_rom_bank_written_in_two_parts() {
-        let mut mbc = Mbc::new(MbcType::Mbc5);
+        let mut mbc = Mbc::new(MbcType::Mbc5, 0x800000); // ROM de 8 MiB (512 banques) : le bit 8 du registre est valide
         assert_eq!(mbc.get_rom_addr(0x4000), 0); // power-up : registre $00 → réellement la banque $00 (PanDocs « MBC5 ») (power-up: register $00 → actually bank $00)
         mbc.set_rom_bank(0x7F);
         assert_eq!(mbc.get_rom_addr(0x4000), 0x7F * ROM_BANK_SIZE);
@@ -466,7 +506,7 @@ mod tests {
 
     #[test]
     fn mbc5_ram_banking_wraps_around() {
-        let mut mbc = Mbc::new(MbcType::Mbc5);
+        let mut mbc = Mbc::new(MbcType::Mbc5, 0x200000); // ROM de 2 MiB (128 banques)
         mbc.set_ram_enabled(0x0A);
         mbc.set_rom_bank(0x7F);
         assert_eq!(mbc.get_rom_addr(0x4000), 0x7F * ROM_BANK_SIZE);
@@ -478,16 +518,43 @@ mod tests {
     }
 
     #[test]
+    fn rom_bank_bits_beyond_rom_size_are_masked() {
+        // ROM de 128 KiB (8 banques) : les bits au-delà du bit 2 sont ignorés (PanDocs « MBCs »).
+        let mut mbc = Mbc::new(MbcType::Mbc3, 0x20000);
+        mbc.set_rom_bank(0x47); // bits supérieurs inexistants → masqués vers la banque $07
+        assert_eq!(mbc.get_rom_addr(0x4000), 7 * ROM_BANK_SIZE);
+        // ROM de 64 KiB (4 banques) : écrire $0C sélectionne la banque $00, lue comme $01.
+        let mut mbc = Mbc::new(MbcType::Mbc3, 0x10000);
+        mbc.set_rom_bank(0x0C);
+        assert_eq!(mbc.get_rom_addr(0x4000), ROM_BANK_SIZE);
+    }
+
+    #[test]
+    fn mbc1_32kib_rom_never_selects_missing_bank() {
+        // Une ROM de 32 KiB a exactement deux banques ($0000-$3FFF et $4000-$7FFF) : les bits de banque au-delà du bit 0 sont masqués (PanDocs « MBCs »),
+        // donc aucune valeur de registre ne peut sélectionner une banque inexistante ni lire au-delà de la fin du fichier.
+        let mut mbc = Mbc::new(MbcType::Mbc1, 32 * 1024);
+        for reg in 0..=0xFFu8 {
+            mbc.set_rom_bank(reg);
+            assert_eq!(mbc.get_rom_addr(0x0000), 0); // la région $0000-$3FFF reste toujours en banque 0
+            assert_eq!(mbc.get_rom_addr(0x4000), ROM_BANK_SIZE); // mode simple : règle du zéro + bit unique valide → toujours la banque 1
+            assert_eq!(mbc.get_rom_addr(0x7FFF), ROM_BANK_SIZE + 0x3FFF); // dernier octet du fichier, jamais hors plage
+        }
+        // Mode avancé : les bits supérieurs sont aussi masqués vers les deux banques existantes.
+        mbc.write_mode_register(0x80);
+        for ram_reg in 0..=0xFFu8 {
+            mbc.set_ram_bank(ram_reg);
+            assert_eq!(mbc.get_rom_addr(0x0000), 0); // bits supérieurs masqués → banque 0
+            let addr = mbc.get_rom_addr(0x4000);
+            assert!(addr == ROM_BANK_SIZE || addr == 0, "registre $4000=${:02X} → index {} hors plage", ram_reg, addr);
+        }
+    }
+
+    #[test]
     fn rtc_is_initialized_from_system_time() {
-        let mbc = Mbc::new(MbcType::Mbc3);
+        let mbc = Mbc::new(MbcType::Mbc3, 0x10000); // ROM de 64 KiB (4 banques)
         assert!(mbc.rtc_read(0) < 60); // secondes : 0-59 (seconds: 0-59)
         assert!(mbc.rtc_read(1) < 60); // minutes : 0-59 (minutes: 0-59)
         assert!(mbc.rtc_read(2) < 24); // heures : 0-23 (hours: 0-23)
     }
 }
-
-
-
-
-
-

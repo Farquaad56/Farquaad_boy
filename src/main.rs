@@ -44,9 +44,17 @@ fn main() {
         .spawn({
             move || {
                 let mut native_options = eframe::NativeOptions {
+                    // Pas de persistance de la fenêtre (taille/position/maximisée) d'une session
+                    // précédente : chaque lancement ouvre exactement à la taille fixe ci-dessous,
+                    // jamais une fenêtre restaurée plus petite qui cacherait l'écran jeu.
+                    persist_window: false,
                     viewport: egui::ViewportBuilder::default()
                         .with_title("FarquaadGB")
-                        .with_inner_size(egui::vec2(940.0, 640.0)), // écran (160x144 @ 4× = 640×576) + panneau debug CPU/PPU
+                        // Fenêtre redimensionnable : mise en page à 4 zones (Output / Processor + ROM Info /
+                        // IO Map / Pattern Table) avec panneaux latéraux redimensionnables. Taille par défaut
+                        // 1920×960, bornée à un minimum de 1280×720 pour garder les quatre zones lisibles.
+                        .with_inner_size(egui::vec2(1920.0, 960.0))
+                        .with_min_inner_size(egui::vec2(1280.0, 720.0)),
                     ..Default::default()
                 };
                 // winit 0.30 refuse de créer la boucle d'événements hors du thread main Windows sans

@@ -157,7 +157,10 @@ impl Timer {
     /// Incrémente TIMA ; un débordement le recharge depuis TMA et met l'interruption en attente (levée au prochain `tick`).
     fn increment_tima(&mut self) {
         if self.tima == 0xFF {
-            log::debug!("TIMA débordement : rechargé depuis TMA=${:02X}, interruption Timer en attente", self.tma);
+            log::debug!(
+                "TIMA débordement : rechargé depuis TMA=${:02X}, interruption Timer en attente",
+                self.tma
+            );
             self.tima = self.tma;
             self.pending_irq = true;
         } else {
@@ -226,7 +229,11 @@ mod tests {
             t.tick(period - 1);
             assert_eq!(t.read_tima(), 0, "TAC=${tac:02X} : pas encore d'incrément");
             t.tick(1);
-            assert_eq!(t.read_tima(), 1, "TAC=${tac:02X} : incrémenté à la période exacte");
+            assert_eq!(
+                t.read_tima(),
+                1,
+                "TAC=${tac:02X} : incrémenté à la période exacte"
+            );
         }
     }
 
@@ -340,4 +347,3 @@ mod tests {
         assert_eq!(t.read_tima(), 0x55);
     }
 }
-

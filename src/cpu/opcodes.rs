@@ -7,8 +7,8 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::cpu::flags::Flags;
 use crate::cpu::CPU;
+use crate::cpu::flags::Flags;
 use crate::mmu::MMU;
 
 // ---------------------------------------------------------------------------
@@ -217,11 +217,7 @@ fn inc8(cpu: &mut CPU, mmu: &mut MMU, idx: u8) -> u32 {
         f |= Flags::C;
     }
     cpu.set_flags(f);
-    if idx == 6 {
-        12
-    } else {
-        4
-    }
+    if idx == 6 { 12 } else { 4 }
 }
 
 /// DEC r8 (4 T-cycles, 12 si (HL)) : Z=(v==0), N=1, H=(v & $0F)==$0F, C inchangé.
@@ -241,16 +237,16 @@ fn dec8(cpu: &mut CPU, mmu: &mut MMU, idx: u8) -> u32 {
         f |= Flags::C;
     }
     cpu.set_flags(f);
-    if idx == 6 {
-        12
-    } else {
-        4
-    }
+    if idx == 6 { 12 } else { 4 }
 }
 
 /// INC rr / DEC rr (8 T-cycles, pas de drapeaux).
 fn inc_dec16(cpu: &mut CPU, idx: u8, delta: i16) -> u32 {
-    set_reg16(cpu, idx, (reg16(cpu, idx) as i16).wrapping_add(delta) as u16);
+    set_reg16(
+        cpu,
+        idx,
+        (reg16(cpu, idx) as i16).wrapping_add(delta) as u16,
+    );
     8
 }
 
@@ -323,11 +319,7 @@ fn daa(cpu: &mut CPU) {
     let a = cpu.a;
     let flags = cpu.flags();
     let is_sub = flags.contains(Flags::N);
-    let (sign6, sign60): (i16, i16) = if is_sub {
-        (-6, -0x60)
-    } else {
-        (6, 0x60)
-    };
+    let (sign6, sign60): (i16, i16) = if is_sub { (-6, -0x60) } else { (6, 0x60) };
     let mut v = a as i16;
     if (a & 0x0F) > 0x09 || flags.contains(Flags::H) {
         v += sign6;
@@ -400,7 +392,11 @@ fn rla(cpu: &mut CPU) -> u32 {
 
 /// RRA (8 T-cycles) : rotation droite, C entre par le drapeau ; Z toujours effacé.
 fn rra(cpu: &mut CPU) -> u32 {
-    let c_in = if cpu.flags().contains(Flags::C) { 0x80u8 } else { 0 };
+    let c_in = if cpu.flags().contains(Flags::C) {
+        0x80u8
+    } else {
+        0
+    };
     let carry = cpu.a & 0x01;
     cpu.a = (cpu.a >> 1) | c_in;
     let f = if carry != 0 { Flags::C } else { Flags::empty() };
@@ -451,11 +447,13 @@ fn ret_cond(cpu: &mut CPU, mmu: &mut MMU, taken: bool) -> u32 {
 /// RETI (16 T-cycles) : comme RET mais réactive IME.
 fn reti(cpu: &mut CPU, mmu: &mut MMU) -> u32 {
     let return_addr = pop16(cpu, mmu);
-    cpu.ime = true; // le drapeau IF correspondant a déjà été effacé à l'acceptation de l'interruption
+    cpu.ime = true; // le drapeau IF correspondant n'est effacé que par the jeu (write-1-to-clear dans $FF0F)
 
     log::debug!(
         "[CPU] RETI: return_addr=${:04X}, SP=${:04X}, IME re-enabled, IF={:02X}",
-        return_addr, cpu.sp, mmu.io[0x0F],
+        return_addr,
+        cpu.sp,
+        mmu.io[0x0F],
     );
 
     cpu.pc = return_addr;
@@ -475,8 +473,9 @@ fn jp_cond(cpu: &mut CPU, a16: u16, taken: bool) -> u32 {
 }
 
 /// RST n8 (16 T-cycles) : pousse le PC puis saute à n8 << 3.
-fn rst(cpu: &mut CPU, mmu: &mut MMU, n7: u8) -> u32 {
-    push16(cpu, mmu, cpu.pc);
+/// RST n8 (16 T-cycles) : saut inconditionnel au vecteur `n7 * 8` — contrairement à CALL,
+/// aucune adresse de retour n'est poussée sur la pile (Pan Docs « CPU Instruction Set »).
+fn rst(cpu: &mut CPU, n7: u8) -> u32 {
     cpu.pc = (n7 as u16) << 3;
     16
 }
@@ -504,7 +503,17 @@ fn ld_r8(cpu: &mut CPU, mmu: &mut MMU, dst: u8, src: u8) -> u32 {
 
 /// LD r16, n16 (12 T-cycles) ; pas de drapeaux. L'immédiat est à `cpu.pc`.
 fn ld_r16_imm(cpu: &mut CPU, mmu: &mut MMU, idx: u8) -> u32 {
-    set_reg16(cpu, idx, read_a16(mmu, cpu.pc));
+    let nn = read_a16(mmu, cpu.pc);
+    // [DEBUG TEMPORAIRE] LD SP, nn ($31) : log brut des octets renvoyés réellement par la MMU à l'adresse de l'opérande.
+    if idx == 3 {
+        let lsb = mmu.read(cpu.pc);
+        let msb = mmu.read(cpu.pc + 1);
+        println!(
+            "[DEBUG MMU] Lecture LD SP: PC=${:04X}, Octets lus: [${:02X}, ${:02X}], Valeur combinée: ${:04X}",
+            cpu.pc, lsb, msb, nn
+        );
+    }
+    set_reg16(cpu, idx, nn);
     cpu.pc = cpu.pc.wrapping_add(2); // passe l'immédiat n16
     12
 }
@@ -599,7 +608,9 @@ fn halt(cpu: &mut CPU, mmu: &MMU) -> u32 {
     cpu.halted = true;
     log::debug!(
         "[CPU] HALT entered: PC=${:04X}, IF={:02X}, IE={:02X}",
-        cpu.pc, mmu.io[0x0F], mmu.ie,
+        cpu.pc,
+        mmu.io[0x0F],
+        mmu.ie,
     );
     4
 }
@@ -630,87 +641,113 @@ fn cpl(cpu: &mut CPU) -> u32 {
 pub fn execute(cpu: &mut CPU, mmu: &mut MMU, opcode: u8) -> u32 {
     match opcode {
         // --- Block 0 (0x00-0x3F) : LD r16/mem, INC/DEC, rotations A, JR ---
-        0x00 => 4,                                        // NOP (4 T-cycles), pas de drapeaux
-        0x01 => ld_r16_imm(cpu, mmu, 0),                  // LD BC, n16 (12)
-        0x02 => ld_mem_r16(cpu, mmu, 0, true),            // LD (BC), A (8)
-        0x03 => inc_dec16(cpu, 0, 1),                     // INC BC (8)
-        0x04 => inc8(cpu, mmu, 0),                        // INC B (4) : Z N H C
-        0x05 => dec8(cpu, mmu, 0),                        // DEC B (4) : Z N=1 H C
-        0x06 => ld_r8_imm(cpu, mmu, 0),                   // LD B, n8 (8)
-        0x07 => rlca(cpu),                                // RLCA (8) : Z=0 N=0 H=0 C=résultat
-        0x08 => {                                         // LD (a16), SP (20) : octet bas puis haut
+        0x00 => 4,                             // NOP (4 T-cycles), pas de drapeaux
+        0x01 => ld_r16_imm(cpu, mmu, 0),       // LD BC, n16 (12)
+        0x02 => ld_mem_r16(cpu, mmu, 0, true), // LD (BC), A (8)
+        0x03 => inc_dec16(cpu, 0, 1),          // INC BC (8)
+        0x04 => inc8(cpu, mmu, 0),             // INC B (4) : Z N H C
+        0x05 => dec8(cpu, mmu, 0),             // DEC B (4) : Z N=1 H C
+        0x06 => ld_r8_imm(cpu, mmu, 0),        // LD B, n8 (8)
+        0x07 => rlca(cpu),                     // RLCA (8) : Z=0 N=0 H=0 C=résultat
+        0x08 => {
+            // LD (a16), SP (20) : octet bas puis haut
             let a16 = read_a16(mmu, cpu.pc);
             mmu.write(a16, (cpu.sp & 0xFF) as u8);
             mmu.write(a16.wrapping_add(1), (cpu.sp >> 8) as u8);
             cpu.pc = cpu.pc.wrapping_add(2);
             20
         }
-        0x09 => add_hl(cpu, reg16(cpu, 0)),               // ADD HL, BC (16) : N=0 H C, Z inchangé
-        0x0A => ld_mem_r16(cpu, mmu, 0, false),          // LD A, (BC) (8)
-        0x0B => inc_dec16(cpu, 0, -1),                    // DEC BC (8)
-        0x0C => inc8(cpu, mmu, 1),                        // INC C (4) : Z N H C
-        0x0D => dec8(cpu, mmu, 1),                        // DEC C (4) : Z N=1 H C
-        0x0E => ld_r8_imm(cpu, mmu, 1),                   // LD C, n8 (8)
-        0x0F => rrca(cpu),                                // RRCA (8) : Z=0 N=0 H=0 C=résultat
+        0x09 => add_hl(cpu, reg16(cpu, 0)), // ADD HL, BC (16) : N=0 H C, Z inchangé
+        0x0A => ld_mem_r16(cpu, mmu, 0, false), // LD A, (BC) (8)
+        0x0B => inc_dec16(cpu, 0, -1),      // DEC BC (8)
+        0x0C => inc8(cpu, mmu, 1),          // INC C (4) : Z N H C
+        0x0D => dec8(cpu, mmu, 1),          // DEC C (4) : Z N=1 H C
+        0x0E => ld_r8_imm(cpu, mmu, 1),     // LD C, n8 (8)
+        0x0F => rrca(cpu),                  // RRCA (8) : Z=0 N=0 H=0 C=résultat
 
-        0x10 => stop(cpu, mmu),                           // STOP (n8) (4+4=8 sur DMG)
-        0x11 => ld_r16_imm(cpu, mmu, 1),                  // LD DE, n16 (12)
-        0x12 => ld_mem_r16(cpu, mmu, 1, true),           // LD (DE), A (8)
-        0x13 => inc_dec16(cpu, 1, 1),                     // INC DE (8)
-        0x14 => inc8(cpu, mmu, 2),                        // INC D (4) : Z N H C
-        0x15 => dec8(cpu, mmu, 2),                        // DEC D (4) : Z N=1 H C
-        0x16 => ld_r8_imm(cpu, mmu, 2),                   // LD D, n8 (8)
-        0x17 => rla(cpu),                                 // RLA (8) : Z=0 N=0 H=0 C=résultat
-        0x18 => { let e8 = mmu.read(cpu.pc) as i8; jr(cpu, e8, true) }   // JR e8 (12/4)
-        0x19 => add_hl(cpu, reg16(cpu, 1)),               // ADD HL, DE (16) : N=0 H C, Z inchangé
-        0x1A => ld_mem_r16(cpu, mmu, 1, false),          // LD A, (DE) (8)
-        0x1B => inc_dec16(cpu, 1, -1),                    // DEC DE (8)
-        0x1C => inc8(cpu, mmu, 3),                        // INC E (4) : Z N H C
-        0x1D => dec8(cpu, mmu, 3),                        // DEC E (4) : Z N=1 H C
-        0x1E => ld_r8_imm(cpu, mmu, 3),                   // LD E, n8 (8)
-        0x1F => rra(cpu),                                 // RRA (8) : Z=0 N=0 H=0 C=résultat
+        0x10 => stop(cpu, mmu),                // STOP (n8) (4+4=8 sur DMG)
+        0x11 => ld_r16_imm(cpu, mmu, 1),       // LD DE, n16 (12)
+        0x12 => ld_mem_r16(cpu, mmu, 1, true), // LD (DE), A (8)
+        0x13 => inc_dec16(cpu, 1, 1),          // INC DE (8)
+        0x14 => inc8(cpu, mmu, 2),             // INC D (4) : Z N H C
+        0x15 => dec8(cpu, mmu, 2),             // DEC D (4) : Z N=1 H C
+        0x16 => ld_r8_imm(cpu, mmu, 2),        // LD D, n8 (8)
+        0x17 => rla(cpu),                      // RLA (8) : Z=0 N=0 H=0 C=résultat
+        0x18 => {
+            let e8 = mmu.read(cpu.pc) as i8;
+            jr(cpu, e8, true)
+        } // JR e8 (12/4)
+        0x19 => add_hl(cpu, reg16(cpu, 1)),    // ADD HL, DE (16) : N=0 H C, Z inchangé
+        0x1A => ld_mem_r16(cpu, mmu, 1, false), // LD A, (DE) (8)
+        0x1B => inc_dec16(cpu, 1, -1),         // DEC DE (8)
+        0x1C => inc8(cpu, mmu, 3),             // INC E (4) : Z N H C
+        0x1D => dec8(cpu, mmu, 3),             // DEC E (4) : Z N=1 H C
+        0x1E => ld_r8_imm(cpu, mmu, 3),        // LD E, n8 (8)
+        0x1F => rra(cpu),                      // RRA (8) : Z=0 N=0 H=0 C=résultat
 
-        0x20 => { let e8 = mmu.read(cpu.pc) as i8; jr(cpu, e8, cond_met(cpu, 0)) } // JR NZ,e8 (12/4)
-        0x21 => ld_r16_imm(cpu, mmu, 2),                  // LD HL, n16 (12)
-        0x22 => ld_hl_inc(cpu, mmu, true),                // LD (HL+), A (12)
-        0x23 => inc_dec16(cpu, 2, 1),                     // INC HL (8)
-        0x24 => inc8(cpu, mmu, 4),                        // INC H (4) : Z N H C
-        0x25 => dec8(cpu, mmu, 4),                        // DEC H (4) : Z N=1 H C
-        0x26 => ld_r8_imm(cpu, mmu, 4),                   // LD H, n8 (8)
-        0x27 => { daa(cpu); 4 }                           // DAA (4) : Z N H C recalculés
-        0x28 => { let e8 = mmu.read(cpu.pc) as i8; jr(cpu, e8, cond_met(cpu, 1)) } // JR Z,e8 (12/4)
-        0x29 => add_hl(cpu, cpu.hl()),                    // ADD HL, HL (16) : N=0 H C, Z inchangé
-        0x2A => ld_hl_dec(cpu, mmu, false),               // LD A, (HL-) (12)
-        0x2B => inc_dec16(cpu, 2, -1),                    // DEC HL (8)
-        0x2C => inc8(cpu, mmu, 5),                        // INC L (4) : Z N H C
-        0x2D => dec8(cpu, mmu, 5),                        // DEC L (4) : Z N=1 H C
-        0x2E => ld_r8_imm(cpu, mmu, 5),                   // LD L, n8 (8)
-        0x2F => cpl(cpu),                                 // CPL (4) : N=1 H=1, Z/C inchangés
+        0x20 => {
+            let e8 = mmu.read(cpu.pc) as i8;
+            jr(cpu, e8, cond_met(cpu, 0))
+        } // JR NZ,e8 (12/4)
+        0x21 => ld_r16_imm(cpu, mmu, 2),   // LD HL, n16 (12)
+        0x22 => ld_hl_inc(cpu, mmu, true), // LD (HL+), A (12)
+        0x23 => inc_dec16(cpu, 2, 1),      // INC HL (8)
+        0x24 => inc8(cpu, mmu, 4),         // INC H (4) : Z N H C
+        0x25 => dec8(cpu, mmu, 4),         // DEC H (4) : Z N=1 H C
+        0x26 => ld_r8_imm(cpu, mmu, 4),    // LD H, n8 (8)
+        0x27 => {
+            daa(cpu);
+            4
+        } // DAA (4) : Z N H C recalculés
+        0x28 => {
+            let e8 = mmu.read(cpu.pc) as i8;
+            jr(cpu, e8, cond_met(cpu, 1))
+        } // JR Z,e8 (12/4)
+        0x29 => add_hl(cpu, cpu.hl()),     // ADD HL, HL (16) : N=0 H C, Z inchangé
+        0x2A => ld_hl_dec(cpu, mmu, false), // LD A, (HL-) (12)
+        0x2B => inc_dec16(cpu, 2, -1),     // DEC HL (8)
+        0x2C => inc8(cpu, mmu, 5),         // INC L (4) : Z N H C
+        0x2D => dec8(cpu, mmu, 5),         // DEC L (4) : Z N=1 H C
+        0x2E => ld_r8_imm(cpu, mmu, 5),    // LD L, n8 (8)
+        0x2F => cpl(cpu),                  // CPL (4) : N=1 H=1, Z/C inchangés
 
-        0x30 => { let e8 = mmu.read(cpu.pc) as i8; jr(cpu, e8, cond_met(cpu, 2)) } // JR NC,e8 (12/4)
-        0x31 => ld_r16_imm(cpu, mmu, 3),                  // LD SP, n16 (12)
-        0x32 => ld_hl_inc(cpu, mmu, false),               // LD A, (HL+) (12)
-        0x33 => inc_dec16(cpu, 3, 1),                     // INC SP (8)
-        0x34 => inc8(cpu, mmu, 6),                        // INC (HL) (12) : Z N H C
-        0x35 => dec8(cpu, mmu, 6),                        // DEC (HL) (12) : Z N=1 H C
-        0x36 => ld_r8_imm(cpu, mmu, 6),                   // LD (HL), n8 (8)
-        0x37 => { scf(cpu); 4 }                           // SCF (4) : N=1 H=1 C=1, Z inchangé
-        0x38 => { let e8 = mmu.read(cpu.pc) as i8; jr(cpu, e8, cond_met(cpu, 3)) } // JR C,e8 (12/4)
-        0x39 => add_hl(cpu, cpu.sp),                      // ADD HL, SP (16) : N=0 H C, Z inchangé
-        0x3A => ld_hl_dec(cpu, mmu, true),                // LD (HL-), A (12)
-        0x3B => inc_dec16(cpu, 3, -1),                    // DEC SP (8)
-        0x3C => inc8(cpu, mmu, 7),                        // INC A (4) : Z N H C
-        0x3D => dec8(cpu, mmu, 7),                        // DEC A (4) : Z N=1 H C
-        0x3E => ld_r8_imm(cpu, mmu, 7),                   // LD A, n8 (8)
-        0x3F => { ccf(cpu); 4 }                           // CCF (4) : N=1 H=1 C=~C, Z inchangé
+        0x30 => {
+            let e8 = mmu.read(cpu.pc) as i8;
+            jr(cpu, e8, cond_met(cpu, 2))
+        } // JR NC,e8 (12/4)
+        0x31 => ld_r16_imm(cpu, mmu, 3),    // LD SP, n16 (12)
+        0x32 => ld_hl_inc(cpu, mmu, false), // LD A, (HL+) (12)
+        0x33 => inc_dec16(cpu, 3, 1),       // INC SP (8)
+        0x34 => inc8(cpu, mmu, 6),          // INC (HL) (12) : Z N H C
+        0x35 => dec8(cpu, mmu, 6),          // DEC (HL) (12) : Z N=1 H C
+        0x36 => ld_r8_imm(cpu, mmu, 6),     // LD (HL), n8 (8)
+        0x37 => {
+            scf(cpu);
+            4
+        } // SCF (4) : N=1 H=1 C=1, Z inchangé
+        0x38 => {
+            let e8 = mmu.read(cpu.pc) as i8;
+            jr(cpu, e8, cond_met(cpu, 3))
+        } // JR C,e8 (12/4)
+        0x39 => add_hl(cpu, cpu.sp),        // ADD HL, SP (16) : N=0 H C, Z inchangé
+        0x3A => ld_hl_dec(cpu, mmu, true),  // LD (HL-), A (12)
+        0x3B => inc_dec16(cpu, 3, -1),      // DEC SP (8)
+        0x3C => inc8(cpu, mmu, 7),          // INC A (4) : Z N H C
+        0x3D => dec8(cpu, mmu, 7),          // DEC A (4) : Z N=1 H C
+        0x3E => ld_r8_imm(cpu, mmu, 7),     // LD A, n8 (8)
+        0x3F => {
+            ccf(cpu);
+            4
+        } // CCF (4) : N=1 H=1 C=~C, Z inchangé
 
         // --- Block 1 (0x40-0x7F) : LD r8, r8 + HALT ---
-        0x40..=0x75 | 0x77..=0x7F => {                   // LD r8, r8 (4 T-cycles, 8 si dst=(HL))
+        0x40..=0x75 | 0x77..=0x7F => {
+            // LD r8, r8 (4 T-cycles, 8 si dst=(HL))
             let dst = (opcode & 0x38) >> 3;
             let src = opcode & 0x07;
             ld_r8(cpu, mmu, dst, src)
         }
-        0x76 => halt(cpu, mmu),                                // HALT (4) : le CPU s'arrête
+        0x76 => halt(cpu, mmu), // HALT (4) : le CPU s'arrête
 
         // --- Block 2 (0x80-0xBF) : ALU A, r8 (4 T-cycles) ---
         0x80..=0xBF => {
@@ -720,64 +757,174 @@ pub fn execute(cpu: &mut CPU, mmu: &mut MMU, opcode: u8) -> u32 {
         }
 
         // --- Block 3 (0xC0-0xFF) : ALU A,n8, RET/RETI, JP/CALL/RST, POP/PUSH, CB, LDH/LD a16, DI/EI ---
-        0xC0 => ret_cond(cpu, mmu, cond_met(cpu, 0)),    // RET NZ (20/8)
-        0xC1 => pop_r16(cpu, mmu, 0),                    // POP BC (12)
-        0xC2 => { let a16 = read_a16(mmu, cpu.pc); jp_cond(cpu, a16, cond_met(cpu, 0)) } // JP NZ,a16 (16/10)
-        0xC3 => { let a16 = read_a16(mmu, cpu.pc); cpu.pc = a16; 16 } // JP a16 (16)
-        0xC4 => { let a16 = read_a16(mmu, cpu.pc); call(cpu, mmu, a16, cond_met(cpu, 0)) } // CALL NZ,a16 (24/12)
-        0xC5 => push_r16(cpu, mmu, 0),                   // PUSH BC (16)
-        0xC6 => { let op = Alu8::from_bits((opcode & 0x38) >> 3); op.apply(cpu, mmu.read(cpu.pc)); cpu.pc = cpu.pc.wrapping_add(1); 8 } // ADD A,n8 (8)
-        0xC7 | 0xCF | 0xD7 | 0xDF | 0xE7 | 0xEF | 0xF7 | 0xFF => rst(cpu, mmu, (opcode & 0x38) >> 3), // RST n8 (16)
-        0xC8 => ret_cond(cpu, mmu, cond_met(cpu, 1)),    // RET Z (20/8)
-        0xC9 => { cpu.pc = pop16(cpu, mmu); 16 },       // RET (16)
-        0xCA => { let a16 = read_a16(mmu, cpu.pc); jp_cond(cpu, a16, cond_met(cpu, 1)) } // JP Z,a16 (16/10)
-        0xCB => {                                        // CB prefix : sous-opcode à `cpu.pc`
+        0xC0 => ret_cond(cpu, mmu, cond_met(cpu, 0)), // RET NZ (20/8)
+        0xC1 => pop_r16(cpu, mmu, 0),                 // POP BC (12)
+        0xC2 => {
+            let a16 = read_a16(mmu, cpu.pc);
+            jp_cond(cpu, a16, cond_met(cpu, 0))
+        } // JP NZ,a16 (16/10)
+        0xC3 => {
+            let a16 = read_a16(mmu, cpu.pc);
+            cpu.pc = a16;
+            16
+        } // JP a16 (16)
+        0xC4 => {
+            let a16 = read_a16(mmu, cpu.pc);
+            call(cpu, mmu, a16, cond_met(cpu, 0))
+        } // CALL NZ,a16 (24/12)
+        0xC5 => push_r16(cpu, mmu, 0),                // PUSH BC (16)
+        0xC6 => {
+            let op = Alu8::from_bits((opcode & 0x38) >> 3);
+            op.apply(cpu, mmu.read(cpu.pc));
+            cpu.pc = cpu.pc.wrapping_add(1);
+            8
+        } // ADD A,n8 (8)
+        0xC7 | 0xCF | 0xD7 | 0xDF | 0xE7 | 0xEF | 0xF7 | 0xFF => {
+            rst(cpu, (opcode & 0x38) >> 3)
+        } // RST n8 (16)
+        0xC8 => ret_cond(cpu, mmu, cond_met(cpu, 1)), // RET Z (20/8)
+        0xC9 => {
+            cpu.pc = pop16(cpu, mmu);
+            16
+        } // RET (16)
+        0xCA => {
+            let a16 = read_a16(mmu, cpu.pc);
+            jp_cond(cpu, a16, cond_met(cpu, 1))
+        } // JP Z,a16 (16/10)
+        0xCB => {
+            // CB prefix : sous-opcode à `cpu.pc`
             let sub = mmu.read(cpu.pc);
             cpu.pc = cpu.pc.wrapping_add(1);
             execute_cb(cpu, mmu, sub)
         }
-        0xCC => { let a16 = read_a16(mmu, cpu.pc); call(cpu, mmu, a16, cond_met(cpu, 1)) } // CALL Z,a16 (24/12)
-        0xCD => { let a16 = read_a16(mmu, cpu.pc); call(cpu, mmu, a16, true) } // CALL a16 (24)
-        0xCE => { let op = Alu8::from_bits((opcode & 0x38) >> 3); op.apply(cpu, mmu.read(cpu.pc)); cpu.pc = cpu.pc.wrapping_add(1); 8 } // ADC A,n8 (8)
+        0xCC => {
+            let a16 = read_a16(mmu, cpu.pc);
+            call(cpu, mmu, a16, cond_met(cpu, 1))
+        } // CALL Z,a16 (24/12)
+        0xCD => {
+            let a16 = read_a16(mmu, cpu.pc);
+            call(cpu, mmu, a16, true)
+        } // CALL a16 (24)
+        0xCE => {
+            let op = Alu8::from_bits((opcode & 0x38) >> 3);
+            op.apply(cpu, mmu.read(cpu.pc));
+            cpu.pc = cpu.pc.wrapping_add(1);
+            8
+        } // ADC A,n8 (8)
 
-        0xD0 => ret_cond(cpu, mmu, cond_met(cpu, 2)),    // RET NC (20/8)
-        0xD1 => pop_r16(cpu, mmu, 1),                    // POP DE (12)
-        0xD2 => { let a16 = read_a16(mmu, cpu.pc); jp_cond(cpu, a16, cond_met(cpu, 2)) } // JP NC,a16 (16/10)
-        0xD3 => 4,                                       // $D3 : opcode invalide (hard-lock sur le matériel)
-        0xD4 => { let a16 = read_a16(mmu, cpu.pc); call(cpu, mmu, a16, cond_met(cpu, 2)) } // CALL NC,a16 (24/12)
-        0xD5 => push_r16(cpu, mmu, 1),                   // PUSH DE (16)
-        0xD6 => { let op = Alu8::from_bits((opcode & 0x38) >> 3); op.apply(cpu, mmu.read(cpu.pc)); cpu.pc = cpu.pc.wrapping_add(1); 8 } // SUB A,n8 (8)
-        0xD8 => ret_cond(cpu, mmu, cond_met(cpu, 3)),    // RET C (20/8)
-        0xD9 => reti(cpu, mmu),                          // RETI (16) : réactive IME
-        0xDA => { let a16 = read_a16(mmu, cpu.pc); jp_cond(cpu, a16, cond_met(cpu, 3)) } // JP C,a16 (16/10)
-        0xDB => 4,                                       // $DB : opcode invalide (hard-lock sur le matériel)
-        0xDC => { let a16 = read_a16(mmu, cpu.pc); call(cpu, mmu, a16, cond_met(cpu, 3)) } // CALL C,a16 (24/12)
-        0xDD => 4,                                       // $DD : opcode invalide (hard-lock sur le matériel)
-        0xDE => { let op = Alu8::from_bits((opcode & 0x38) >> 3); op.apply(cpu, mmu.read(cpu.pc)); cpu.pc = cpu.pc.wrapping_add(1); 8 } // SBC A,n8 (8)
+        0xD0 => ret_cond(cpu, mmu, cond_met(cpu, 2)), // RET NC (20/8)
+        0xD1 => pop_r16(cpu, mmu, 1),                 // POP DE (12)
+        0xD2 => {
+            let a16 = read_a16(mmu, cpu.pc);
+            jp_cond(cpu, a16, cond_met(cpu, 2))
+        } // JP NC,a16 (16/10)
+        0xD3 => 4, // $D3 : opcode invalide (hard-lock sur le matériel)
+        0xD4 => {
+            let a16 = read_a16(mmu, cpu.pc);
+            call(cpu, mmu, a16, cond_met(cpu, 2))
+        } // CALL NC,a16 (24/12)
+        0xD5 => push_r16(cpu, mmu, 1), // PUSH DE (16)
+        0xD6 => {
+            let op = Alu8::from_bits((opcode & 0x38) >> 3);
+            op.apply(cpu, mmu.read(cpu.pc));
+            cpu.pc = cpu.pc.wrapping_add(1);
+            8
+        } // SUB A,n8 (8)
+        0xD8 => ret_cond(cpu, mmu, cond_met(cpu, 3)), // RET C (20/8)
+        0xD9 => reti(cpu, mmu), // RETI (16) : réactive IME
+        0xDA => {
+            let a16 = read_a16(mmu, cpu.pc);
+            jp_cond(cpu, a16, cond_met(cpu, 3))
+        } // JP C,a16 (16/10)
+        0xDB => 4, // $DB : opcode invalide (hard-lock sur le matériel)
+        0xDC => {
+            let a16 = read_a16(mmu, cpu.pc);
+            call(cpu, mmu, a16, cond_met(cpu, 3))
+        } // CALL C,a16 (24/12)
+        0xDD => 4, // $DD : opcode invalide (hard-lock sur le matériel)
+        0xDE => {
+            let op = Alu8::from_bits((opcode & 0x38) >> 3);
+            op.apply(cpu, mmu.read(cpu.pc));
+            cpu.pc = cpu.pc.wrapping_add(1);
+            8
+        } // SBC A,n8 (8)
 
-        0xE0 => ldh_a8(cpu, mmu, true),                  // LDH [n8], A (8)
-        0xE1 => pop_r16(cpu, mmu, 2),                    // POP HL (12)
-        0xE2 => ldh_c(cpu, mmu, true),                   // LDH [C], A (12)
-        0xE3 | 0xE4 | 0xEB | 0xEC | 0xED => 4,          // opcodes invalides (hard-lock sur le matériel)
-        0xE5 => push_r16(cpu, mmu, 2),                   // PUSH HL (16)
-        0xE6 => { let op = Alu8::from_bits((opcode & 0x38) >> 3); op.apply(cpu, mmu.read(cpu.pc)); cpu.pc = cpu.pc.wrapping_add(1); 8 } // AND A,n8 (8)
-        0xE8 => { let e8 = mmu.read(cpu.pc) as i8; cpu.pc = cpu.pc.wrapping_add(1); add_sp(cpu, e8) } // ADD SP, e8 (24) : Z=0 N=0 H C
-        0xE9 => { cpu.pc = cpu.hl(); 16 },               // JP HL (16)
-        0xEA => { let a16 = read_a16(mmu, cpu.pc); mmu.write(a16, cpu.a); cpu.pc = cpu.pc.wrapping_add(2); 16 } // LD (a16), A (16)
-        0xEE => { let op = Alu8::from_bits((opcode & 0x38) >> 3); op.apply(cpu, mmu.read(cpu.pc)); cpu.pc = cpu.pc.wrapping_add(1); 8 } // XOR A,n8 (8)
+        0xE0 => ldh_a8(cpu, mmu, false),       // LDH A, [n8] (8)
+        0xE1 => pop_r16(cpu, mmu, 2),          // POP HL (12)
+        0xE2 => ldh_c(cpu, mmu, false),        // LDH A, [C] (12)
+        0xE3 | 0xE4 | 0xEB | 0xEC | 0xED => 4, // opcodes invalides (hard-lock sur le matériel)
+        0xE5 => push_r16(cpu, mmu, 2),         // PUSH HL (16)
+        0xE6 => {
+            let op = Alu8::from_bits((opcode & 0x38) >> 3);
+            op.apply(cpu, mmu.read(cpu.pc));
+            cpu.pc = cpu.pc.wrapping_add(1);
+            8
+        } // AND A,n8 (8)
+        0xE8 => {
+            let e8 = mmu.read(cpu.pc) as i8;
+            cpu.pc = cpu.pc.wrapping_add(1);
+            add_sp(cpu, e8)
+        } // ADD SP, e8 (24) : Z=0 N=0 H C
+        0xE9 => {
+            cpu.pc = cpu.hl();
+            16
+        } // JP HL (16)
+        0xEA => {
+            let a16 = read_a16(mmu, cpu.pc);
+            mmu.write(a16, cpu.a);
+            cpu.pc = cpu.pc.wrapping_add(2);
+            16
+        } // LD (a16), A (16)
+        0xEE => {
+            let op = Alu8::from_bits((opcode & 0x38) >> 3);
+            op.apply(cpu, mmu.read(cpu.pc));
+            cpu.pc = cpu.pc.wrapping_add(1);
+            8
+        } // XOR A,n8 (8)
 
-        0xF0 => ldh_a8(cpu, mmu, false),                 // LDH A, [n8] (8)
-        0xF1 => pop_r16(cpu, mmu, 3),                    // POP AF (12)
-        0xF2 => ldh_c(cpu, mmu, false),                  // LDH A, [C] (12)
-        0xF3 => { cpu.ime = false; cpu.ei_delay = 0; log::debug!("[CPU] DI: IME disabled"); 4 }, // DI (4) : IME désactivé immédiatement, annule tout retard d'EI en cours
-        0xF4 | 0xFC | 0xFD => 4,                         // opcodes invalides (hard-lock sur le matériel)
-        0xF5 => push_r16(cpu, mmu, 3),                   // PUSH AF (16)
-        0xF6 => { let op = Alu8::from_bits((opcode & 0x38) >> 3); op.apply(cpu, mmu.read(cpu.pc)); cpu.pc = cpu.pc.wrapping_add(1); 8 } // OR A,n8 (8)
-        0xF8 => { let e8 = mmu.read(cpu.pc) as i8; cpu.pc = cpu.pc.wrapping_add(1); ld_hl_sp(cpu, e8) } // LD HL, SP+e8 (12) : Z=0 N=0 H C
-        0xF9 => { cpu.sp = cpu.hl(); 8 },                // LD SP, HL (8)
-        0xFA => { let a16 = read_a16(mmu, cpu.pc); cpu.a = mmu.read(a16); cpu.pc = cpu.pc.wrapping_add(2); 16 } // LD A, (a16) (16)
-        0xFB => { cpu.ei_delay = 2; log::debug!("[CPU] EI: IME will be enabled after next instruction"); 4 },                 // EI (4) : IME réactivé après l'instruction suivante (Pan Docs)
-        0xFE => { let op = Alu8::from_bits((opcode & 0x38) >> 3); op.apply(cpu, mmu.read(cpu.pc)); cpu.pc = cpu.pc.wrapping_add(1); 8 }, // CP A,n8 (8)
+        0xF0 => ldh_a8(cpu, mmu, true),  // LDH [n8], A (8)
+        0xF1 => pop_r16(cpu, mmu, 3),    // POP AF (12)
+        0xF2 => ldh_c(cpu, mmu, true),   // LDH [C], A (12)
+        0xF3 => {
+            cpu.ime = false;
+            cpu.ei_delay = 0;
+            log::debug!("[CPU] DI: IME disabled");
+            4
+        } // DI (4) : IME désactivé immédiatement, annule tout retard d'EI en cours
+        0xF4 | 0xFC | 0xFD => 4,         // opcodes invalides (hard-lock sur le matériel)
+        0xF5 => push_r16(cpu, mmu, 3),   // PUSH AF (16)
+        0xF6 => {
+            let op = Alu8::from_bits((opcode & 0x38) >> 3);
+            op.apply(cpu, mmu.read(cpu.pc));
+            cpu.pc = cpu.pc.wrapping_add(1);
+            8
+        } // OR A,n8 (8)
+        0xF8 => {
+            let e8 = mmu.read(cpu.pc) as i8;
+            cpu.pc = cpu.pc.wrapping_add(1);
+            ld_hl_sp(cpu, e8)
+        } // LD HL, SP+e8 (12) : Z=0 N=0 H C
+        0xF9 => {
+            cpu.sp = cpu.hl();
+            8
+        } // LD SP, HL (8)
+        0xFA => {
+            let a16 = read_a16(mmu, cpu.pc);
+            cpu.a = mmu.read(a16);
+            cpu.pc = cpu.pc.wrapping_add(2);
+            16
+        } // LD A, (a16) (16)
+        0xFB => {
+            cpu.ei_delay = 2;
+            log::debug!("[CPU] EI: IME will be enabled after next instruction");
+            4
+        } // EI (4) : IME réactivé après l'instruction suivante (Pan Docs)
+        0xFE => {
+            let op = Alu8::from_bits((opcode & 0x38) >> 3);
+            op.apply(cpu, mmu.read(cpu.pc));
+            cpu.pc = cpu.pc.wrapping_add(1);
+            8
+        } // CP A,n8 (8)
     }
 }
 
@@ -828,7 +975,11 @@ fn rl_reg(cpu: &mut CPU, mmu: &mut MMU, idx: u8) -> u32 {
 /// RR r8 (8 T-cycles, 16 si (HL)) : décalage droit, l'ancien C entre par le bit 7 ; C=bit0.
 fn rr_reg(cpu: &mut CPU, mmu: &mut MMU, idx: u8) -> u32 {
     let value = get_reg8(cpu, mmu, idx);
-    let c_in = if cpu.flags().contains(Flags::C) { 0x80 } else { 0 };
+    let c_in = if cpu.flags().contains(Flags::C) {
+        0x80
+    } else {
+        0
+    };
     let result = (value >> 1) | c_in;
     set_reg8(cpu, mmu, idx, result);
     cb_flags(cpu, result, (value & 0x01) != 0);
@@ -904,17 +1055,17 @@ fn set_reg(cpu: &mut CPU, mmu: &mut MMU, bit: u8, idx: u8) -> u32 {
 pub fn execute_cb(cpu: &mut CPU, mmu: &mut MMU, sub_opcode: u8) -> u32 {
     let reg_idx = sub_opcode & 0x07;
     match sub_opcode >> 3 {
-        0 => rlc_reg(cpu, mmu, reg_idx), // RLC r8
-        1 => rrc_reg(cpu, mmu, reg_idx), // RRC r8
-        2 => rl_reg(cpu, mmu, reg_idx),  // RL r8
-        3 => rr_reg(cpu, mmu, reg_idx),  // RR r8
-        4 => sla_reg(cpu, mmu, reg_idx), // SLA r8
-        5 => sra_reg(cpu, mmu, reg_idx), // SRA r8
+        0 => rlc_reg(cpu, mmu, reg_idx),  // RLC r8
+        1 => rrc_reg(cpu, mmu, reg_idx),  // RRC r8
+        2 => rl_reg(cpu, mmu, reg_idx),   // RL r8
+        3 => rr_reg(cpu, mmu, reg_idx),   // RR r8
+        4 => sla_reg(cpu, mmu, reg_idx),  // SLA r8
+        5 => sra_reg(cpu, mmu, reg_idx),  // SRA r8
         6 => swap_reg(cpu, mmu, reg_idx), // SWAP r8
-        7 => srl_reg(cpu, mmu, reg_idx), // SRL r8
+        7 => srl_reg(cpu, mmu, reg_idx),  // SRL r8
         8..=15 => bit_reg(cpu, mmu, (sub_opcode & 0x38) >> 3, reg_idx), // BIT b,r8
         16..=23 => res_reg(cpu, mmu, (sub_opcode & 0x38) >> 3, reg_idx), // RES b,r8
-        _ => set_reg(cpu, mmu, (sub_opcode & 0x38) >> 3, reg_idx),       // SET b,r8
+        _ => set_reg(cpu, mmu, (sub_opcode & 0x38) >> 3, reg_idx), // SET b,r8
     }
 }
 
@@ -927,7 +1078,7 @@ pub fn execute_cb(cpu: &mut CPU, mmu: &mut MMU, sub_opcode: u8) -> u32 {
 /// Renvoie `Some(20)` si une interruption est servied : IME est désactivé, le bit IF
 /// correspondant à l'interruption acceptée est effacé automatiquement par le matériel,
 /// le PC est poussé sur la pile et le CPU saute vers le vecteur de l'interruption
-/// pendante+activée de plus bas (V-Blank $40, LC3C $48, Timer $50, Serial $58).
+/// pendante+activée de plus bas (V-Blank $40, LC3C $48, Timer $50, Serial $58, Joypad $60).
 ///
 /// HALT bug : si le CPU est en HALT et qu'une interruption est pendante (même si IME=false), l'état HALT est annulé ;
 /// si IME est également vrai, l'interruption est servied.
@@ -939,7 +1090,9 @@ pub fn handle_interrupts(cpu: &mut CPU, mmu: &mut MMU) -> Option<u32> {
         cpu.halted = false;
         log::debug!(
             "[CPU] HALT exited: pending={:02X}, IF={:02X}, IE={:02X}",
-            pending, mmu.io[0x0F], mmu.ie,
+            pending,
+            mmu.io[0x0F],
+            mmu.ie,
         );
     }
 
@@ -952,29 +1105,39 @@ pub fn handle_interrupts(cpu: &mut CPU, mmu: &mut MMU) -> Option<u32> {
             if n % 4096 == 1 {
                 log::debug!(
                     "[CPU] Interrupts pending but IME=OFF: PC=${:04X}, opcode=${:02X}, pending={:02X}, IF={:02X}, IE={:02X}",
-                    cpu.pc, mmu.read(cpu.pc), pending, mmu.io[0x0F], mmu.ie,
+                    cpu.pc,
+                    mmu.read(cpu.pc),
+                    pending,
+                    mmu.io[0x0F],
+                    mmu.ie,
                 );
             }
         }
         return None;
     }
 
-    // ✅ On récupère à la fois l'adresse du vecteur ET le bit précis à effacer dans IF
-    let (vector, bit_to_clear) = match pending {
-        p if p & 0x01 != 0 => (0x40, 0x01), // V-Blank (IF bit 0)
-        p if p & 0x02 != 0 => (0x48, 0x02), // LCDC / STAT (IF bit 1)
-        p if p & 0x04 != 0 => (0x50, 0x04), // Timer (IF bit 2)
-        _ => (0x58, 0x08),                  // Serial (IF bit 3)
+    // On récupère l'adresse du vecteur corresponding au bit d'interruption le plus prioritaire (bit 0 > bit 4).
+    let vector = match pending {
+        p if p & 0x01 != 0 => 0x40, // V-Blank (IF bit 0)
+        p if p & 0x02 != 0 => 0x48, // LCDC / STAT (IF bit 1)
+        p if p & 0x04 != 0 => 0x50, // Timer (IF bit 2)
+        p if p & 0x08 != 0 => 0x58, // Serial (IF bit 3)
+        _ => 0x60, // Joypad (IF bit 4) — bits parasites : repli sur le vecteur Joypad
     };
 
     log::debug!(
         "[CPU] INTERRUPT ACCEPTED: PC=${:04X} → ${:04X}, IF={:02X}, IE={:02X}, IME=ON→OFF",
-        cpu.pc, vector, mmu.io[0x0F], mmu.ie,
+        cpu.pc,
+        vector,
+        mmu.io[0x0F],
+        mmu.ie,
     );
 
     // ✅ On efface le bit d'interruption dans le registre IF pour éviter la boucle infinie !
-    mmu.io[0x0F] &= !bit_to_clear;
-
+    // Comportement matériel (Pan Docs « Interrupt Sources ») : le service de l'interruption n'efface PAS le bit
+    // correspondant du registre IF — il reste posé jusqu'à ce que the jeu écrive un 1 dans ce bit de $FF0F
+    // (write-1-to-clear, géré par `MMU::write`). Si the ISR ne l'acknowledge pas et réactive IME (RETI),
+    // l'interruption se re-déclenche immédiatement : c'est le comportement réel du matériel, pas un bug de l'émulateur.
     cpu.ime = false;
     // ✅ Comportement matériel (Pan Docs « Interrupt Sources ») : l'adresse de retour est poussée sur la pile
     // avant le saut au vecteur — ici `cpu.pc` pointe sur la prochaine instruction à exécuter (fetch pas encore
@@ -1033,6 +1196,7 @@ fn cb_mnemonic(sub: u8) -> String {
 }
 
 /// Désassemble l'instruction située à `CPU.pc` en mnémonique.
+#[allow(dead_code)] // Réserve : le widget « CPU Debug » de la GUI a été retiré ; conserver pour un futur réemploi.
 pub fn disasm(cpu: &CPU, mmu: &MMU) -> String {
     let opcode = mmu.read(cpu.pc);
     match opcode {
@@ -1092,11 +1256,17 @@ pub fn disasm(cpu: &CPU, mmu: &MMU) -> String {
         // JR e8 / JR cond,e8 (l'octet est à pc+1)
         0x18 | 0x20 | 0x28 | 0x30 | 0x38 => {
             let conds = ["nz, ", "z, ", "nc, ", "c, "];
-            let cond = if opcode == 0x18 { "" } else { conds[(opcode - 0x20) as usize / 8] };
+            let cond = if opcode == 0x18 {
+                ""
+            } else {
+                conds[(opcode - 0x20) as usize / 8]
+            };
             format!(
                 "jr {}${:04X}",
                 cond,
-                (cpu.pc.wrapping_add(1) as i16).wrapping_add((mmu.read(cpu.pc.wrapping_add(1)) as i8) as i16) as u16
+                (cpu.pc.wrapping_add(1) as i16)
+                    .wrapping_add((mmu.read(cpu.pc.wrapping_add(1)) as i8) as i16)
+                    as u16
             )
         }
 
@@ -1123,7 +1293,10 @@ pub fn disasm(cpu: &CPU, mmu: &MMU) -> String {
         0xC9 => "ret".to_string(),
         0xD9 => "reti".to_string(),
         0xC0 | 0xC8 | 0xD0 | 0xD8 => {
-            format!("ret {}", ["nz", "z", "nc", "c"][(opcode - 0xC0) as usize / 8])
+            format!(
+                "ret {}",
+                ["nz", "z", "nc", "c"][(opcode - 0xC0) as usize / 8]
+            )
         }
 
         // JP a16 / JP cond,a16 / JP HL
@@ -1150,20 +1323,26 @@ pub fn disasm(cpu: &CPU, mmu: &MMU) -> String {
 
         // PUSH/POP r16stk
         0xC5 | 0xD5 | 0xE5 | 0xF5 => {
-            format!("push {}", REG16STK_NAMES[((opcode - 0xC5) as usize / 0x10).min(3)])
+            format!(
+                "push {}",
+                REG16STK_NAMES[((opcode - 0xC5) as usize / 0x10).min(3)]
+            )
         }
         0xC1 | 0xD1 | 0xE1 | 0xF1 => {
-            format!("pop {}", REG16STK_NAMES[((opcode - 0xC1) as usize / 0x10).min(3)])
+            format!(
+                "pop {}",
+                REG16STK_NAMES[((opcode - 0xC1) as usize / 0x10).min(3)]
+            )
         }
 
         // Préfixe CB (sous-opcode à pc+1)
         0xCB => format!("cb {}", cb_mnemonic(mmu.read(cpu.pc.wrapping_add(1)))),
 
         // LDH / LD a16 / ADD SP / DI / EI
-        0xE0 => format!("ldh [${:02X}], a", mmu.read(cpu.pc.wrapping_add(1))),
-        0xF0 => format!("ldh a, [${:02X}]", mmu.read(cpu.pc.wrapping_add(1))),
-        0xE2 => "ldh [c], a".to_string(),
-        0xF2 => "ldh a, [c]".to_string(),
+        0xE0 => format!("ldh a, [${:02X}]", mmu.read(cpu.pc.wrapping_add(1))),
+        0xF0 => format!("ldh [${:02X}], a", mmu.read(cpu.pc.wrapping_add(1))),
+        0xE2 => "ldh a, [c]".to_string(),
+        0xF2 => "ldh [c], a".to_string(),
         0xEA => format!("ld (${ :04X}), a", read_a16(mmu, cpu.pc.wrapping_add(1))),
         0xFA => format!("ld a, (${ :04X})", read_a16(mmu, cpu.pc.wrapping_add(1))),
         0xE8 => format!("add sp, ${:02X}", mmu.read(cpu.pc.wrapping_add(1))),
@@ -1261,7 +1440,10 @@ mod tests {
         let f = cpu.flags();
         assert!(!f.contains(Flags::Z), "Z doit être 0 pour 0x20");
         assert!(!f.contains(Flags::N), "N doit être 0 pour INC");
-        assert!(f.contains(Flags::H), "H doit être 1 (débordement 0x1F -> 0x20)");
+        assert!(
+            f.contains(Flags::H),
+            "H doit être 1 (débordement 0x1F -> 0x20)"
+        );
         assert!(!f.contains(Flags::C), "C doit rester 0");
 
         // DEC A : 0x20 - 1 = 0x1F (emprunt sur le bit 3 depuis le bit 4 → H=1, N=1, Z=0)
@@ -1579,7 +1761,7 @@ mod tests {
         cpu.pc = 0x0150;
         cpu.ime = true;
         mmu.io[0x0F] = 0x01; // IF : V-Blank en attente
-        mmu.ie = 0x01;       // IE : V-Blank activé
+        mmu.ie = 0x01; // IE : V-Blank activé
 
         // Service : IME désactivé, PC poussé, saut à $40, 20 T-cycles.
         assert_eq!(handle_interrupts(&mut cpu, &mut mmu), Some(20));
@@ -1588,8 +1770,8 @@ mod tests {
         assert_eq!(cpu.sp, 0xFFFC); // FFFE - 2 (un u16 poussé)
         assert_eq!(mmu.read(0xFFFD), 0x01); // octet haut de l'adresse de retour
         assert_eq!(mmu.read(0xFFFC), 0x50);
-        // Le matériel efface automatiquement le bit IF de l'interruption acceptée.
-        assert_eq!(mmu.io[0x0F], 0x00);
+        // Le matériel n'efface PAS le bit IF : il reste posé jusqu'à ce que the jeu écrive un 1 dans $FF0F (write-1-to-clear).
+        assert_eq!(mmu.io[0x0F], 0x01);
 
         // Pas de service quand IME est faux (même interruption en attente).
         let mut cpu = CPU::new();
@@ -1603,24 +1785,24 @@ mod tests {
         mmu.io[0x0F] = 0x03; // V-Blank + LC3C
         assert_eq!(handle_interrupts(&mut cpu, &mut mmu), Some(20));
         assert_eq!(cpu.pc, 0x40);
-        // Seul le bit accepté est effacé : LC3C (bit 1) reste en attente.
-        assert_eq!(mmu.io[0x0F], 0x02);
+        // Aucun bit n'est effacé par le service : V-Blank (bit 0) ET LC3C (bit 1) restent en attente.
+        assert_eq!(mmu.io[0x0F], 0x03);
 
         let mut cpu = CPU::new();
         cpu.ime = true;
         mmu.io[0x0F] = 0x06; // LC3C + Timer
         assert_eq!(handle_interrupts(&mut cpu, &mut mmu), Some(20));
         assert_eq!(cpu.pc, 0x48);
-        // Timer (bit 2) reste en attente.
-        assert_eq!(mmu.io[0x0F], 0x04);
+        // Aucun bit n'est effacé par le service : LC3C (bit 1) ET Timer (bit 2) restent en attente.
+        assert_eq!(mmu.io[0x0F], 0x06);
 
         let mut cpu = CPU::new();
         cpu.ime = true;
         mmu.io[0x0F] = 0x08; // Serial seul
-        mmu.ie = 0x0F;       // toutes les interruptions activées
+        mmu.ie = 0x0F; // toutes les interruptions activées
         assert_eq!(handle_interrupts(&mut cpu, &mut mmu), Some(20));
         assert_eq!(cpu.pc, 0x58);
-        assert_eq!(mmu.io[0x0F], 0x00); // le bit Serial est effacé
+        assert_eq!(mmu.io[0x0F], 0x08); // le bit Serial reste posé : seul un write-1-to-clear du jeu l'acknowledge
 
         // HALT bug : une interruption en attente sort du HALT même si IME=false (sans service).
         let mut cpu = CPU::new();
@@ -1639,6 +1821,53 @@ mod tests {
         assert_eq!(handle_interrupts(&mut cpu, &mut mmu), Some(20));
         assert!(!cpu.halted);
         assert_eq!(cpu.pc, 0x40);
+    }
+
+    #[test]
+    fn joypad_interrupt_vector_and_priority() {
+        let mut mmu = MMU::new();
+
+        // Joypad seul (IF bit 4) : saut à $60, le bit reste posé (pas d'effacement automatique).
+        let mut cpu = CPU::new();
+        cpu.ime = true;
+        mmu.io[0x0F] = 0x10;
+        mmu.ie = 0x1F; // toutes les interruptions activées
+        assert_eq!(handle_interrupts(&mut cpu, &mut mmu), Some(20));
+        assert_eq!(cpu.pc, 0x60);
+        assert_eq!(mmu.io[0x0F], 0x10);
+
+        // Serial + Joypad en attente : le Serial (bit 3) a priorité matérielle sur le Joypad (bit 4).
+        let mut cpu = CPU::new();
+        cpu.ime = true;
+        mmu.io[0x0F] = 0x18;
+        assert_eq!(handle_interrupts(&mut cpu, &mut mmu), Some(20));
+        assert_eq!(cpu.pc, 0x58);
+        assert_eq!(mmu.io[0x0F], 0x18); // le bit Joypad reste en attente (le service n'efface aucun bit)
+
+        // Bits parasites (IF bits 5-7) : IE n'active que les bits 4-0 → rien de pendan, pas de service.
+        let mut cpu = CPU::new();
+        cpu.ime = true;
+        mmu.io[0x0F] = 0xE0;
+        assert_eq!(handle_interrupts(&mut cpu, &mut mmu), None); // bits 5-7 non activés par IE → rien de pendan
+        assert_eq!(mmu.io[0x0F], 0xE0); // IF inchangé (aucun bit effacé)
+    }
+
+    #[test]
+    fn if_register_write_1_to_clear_acknowledges_interruptions() {
+        let mut mmu = MMU::new();
+        mmu.io[0x0F] = 0x07; // V-Blank + STAT + Timer en attente
+
+        // Le jeu acknowledge l'interruption Timer uniquement : un 1 écrit dans bit 2 efface ce bit…
+        mmu.write(0xFF0F, 0x04);
+        assert_eq!(mmu.io[0x0F], 0x03); // …sans toucher aux bits 0-1 (V-Blank + STAT restent en attente).
+
+        // …et un write de $00 n'efface nothing.
+        mmu.write(0xFF0F, 0x00);
+        assert_eq!(mmu.io[0x0F], 0x03);
+
+        // Acknowledge V-Blank + STAT : bits 0-1 effacés.
+        mmu.write(0xFF0F, 0x03);
+        assert_eq!(mmu.io[0x0F], 0x00);
     }
 
     #[test]
@@ -1675,32 +1904,44 @@ mod tests {
         // Le match d'execute() est exhaustif sur $00-$FF (vérifié à la compilation) ; ce test le confirme à l'exécution.
         for opcode in 0u8..=0xFF {
             let mut mmu = rom_with(&[]); // ROM remplie de $FF (valeurs des immédiats)
-            let mut cpu = CPU::new();    // pc=$0100, F=$B0 (Z=0, C=1), SP=$FFFE
+            let mut cpu = CPU::new(); // pc=$0100, F=$B0 (Z=0, C=1), SP=$FFFE
             let cycles = execute(&mut cpu, &mut mmu, opcode);
-            assert!((4..=24).contains(&cycles), "opcode ${:02X} : {} T-cycles", opcode, cycles);
+            assert!(
+                (4..=24).contains(&cycles),
+                "opcode ${:02X} : {} T-cycles",
+                opcode,
+                cycles
+            );
         }
 
         // La lecture d'un immédiat n16 doit avancer le PC de exactement 2 octets.
-        for &opcode in &[0x01u8, 0x11, 0x21, 0x31] { // LD r16,n16
+        for &opcode in &[0x01u8, 0x11, 0x21, 0x31] {
+            // LD r16,n16
             let mut mmu = rom_with(&[]);
             let mut cpu = CPU::new();
             execute(&mut cpu, &mut mmu, opcode);
-            assert_eq!(cpu.pc, 0x0102, "opcode ${:02X} doit consommer 2 octets", opcode);
+            assert_eq!(
+                cpu.pc, 0x0102,
+                "opcode ${:02X} doit consommer 2 octets",
+                opcode
+            );
         }
 
         // La lecture d'un immédiat n8 (ou du sous-opcode CB) doit avancer le PC de exactement 1 octet.
         for &opcode in &[
             0x06u8, 0x0E, 0x16, 0x1E, 0x26, 0x2E, 0x36, 0x3E, // LD r8,n8
-            0xC6, 0xCE, 0xD6, 0xDE, 0xE6, 0xEE, 0xF6, 0xFE,    // ALU A,n8
-            0xE8, 0xF8,                                          // ADD SP,e8 / LD HL,SP+e8
-            0xCB,                                                // préfixe CB (sous-opcode lu)
+            0xC6, 0xCE, 0xD6, 0xDE, 0xE6, 0xEE, 0xF6, 0xFE, // ALU A,n8
+            0xE8, 0xF8, // ADD SP,e8 / LD HL,SP+e8
+            0xCB, // préfixe CB (sous-opcode lu)
         ] {
             let mut mmu = rom_with(&[]);
             let mut cpu = CPU::new();
             execute(&mut cpu, &mut mmu, opcode);
-            assert_eq!(cpu.pc, 0x0101, "opcode ${:02X} doit consommer 1 octet", opcode);
+            assert_eq!(
+                cpu.pc, 0x0101,
+                "opcode ${:02X} doit consommer 1 octet",
+                opcode
+            );
         }
     }
-
 }
-

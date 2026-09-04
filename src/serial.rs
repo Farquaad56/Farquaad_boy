@@ -159,11 +159,11 @@ impl Serial {
     }
 
     /// Dernière ligne complète reçue sur le port link (« » si aucune).
+    #[allow(dead_code)] // Réserve : la section « Serial » du widget retiré était son seul usage hors tests.
     pub fn last_line(&self) -> &str {
         &self.last_line
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -294,5 +294,3 @@ mod tests {
         assert_eq!(s.take_transcript(), b"partial");
     }
 }
-
-

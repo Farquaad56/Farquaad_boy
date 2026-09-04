@@ -121,12 +121,15 @@ impl CartridgeHeader {
         self.cgb_flag == 0xC0
     }
 
-    /// La cartouche contient-elle de la RAM externe ? (le type $0147 inclut « +RAM »).
+    /// La cartouche contient-elle de la RAM externe ? (le type $0147 inclut « +RAM » — PanDocs « The Cartridge Header »).
     pub fn has_ram(&self) -> bool {
         matches!(
             self.cartridge_type,
-            0x02 | 0x03 | 0x08 | 0x09 | 0x0C | 0x0D | 0x10 | 0x12 | 0x13 | 0x1A | 0x1B | 0x1D | 0x1E
-                | 0x22 | 0xFF
+            0x02 | 0x03 // MBC1+RAM / +RAM+BATTERY
+                | 0x07   // MBC2+RAM+BATTERY
+                | 0x0D   // MBC3 with TIMER+RAM+BATTERY
+                | 0x10 | 0x11 | 0x12 | 0x13 // variantes MBC5 avec RAM (± rumble/battery)
+                | 0x1A | 0x1B // variantes MBC6 non officielles (MBC5+RAM)
         )
     }
 
@@ -134,13 +137,17 @@ impl CartridgeHeader {
     pub fn has_battery(&self) -> bool {
         matches!(
             self.cartridge_type,
-            0x03 | 0x06 | 0x09 | 0x0D | 0x0F | 0x10 | 0x13 | 0x1B | 0x1E | 0x22 | 0xFF
+            0x03 // MBC1+RAM+BATTERY
+                | 0x06 | 0x07 // MBC2+BATTERY / +RAM+BATTERY
+                | 0x0C | 0x0D // MBC3 with TIMER and BATTERY / +RAM+BATTERY
+                | 0x11 | 0x13 // variantes MBC5 avec battery (± rumble)
+                | 0x1B // variante MBC6 non officielle (+RAM+BATTERY)
         )
     }
 
-    /// La cartouche contient-elle une horloge RTC ? (MBC3 + TIMER, $0147 = $0F/$10).
+    /// La cartouche contient-elle une horloge RTC ? (MBC3 with TIMER, $0147 = $0B/$0C/$0D).
     pub fn has_rtc(&self) -> bool {
-        matches!(self.cartridge_type, 0x0F | 0x10)
+        matches!(self.cartridge_type, 0x0B | 0x0C | 0x0D)
     }
 
     /// Le code de destination est-il le Japon ? ($014A == $00).
@@ -210,8 +217,15 @@ pub fn is_nintendo_logo_valid(rom: &[u8]) -> bool {
 
 /// Décode le titre ($0134-$0143) : ASCII majuscule, bourgé de $00.
 fn decode_title(bytes: &[u8]) -> String {
-    bytes.iter()
-        .map(|&b| if (0x20..=0x7E).contains(&b) { b as char } else { ' ' })
+    bytes
+        .iter()
+        .map(|&b| {
+            if (0x20..=0x7E).contains(&b) {
+                b as char
+            } else {
+                ' '
+            }
+        })
         .collect::<String>()
         .trim_end()
         .to_string()
@@ -221,10 +235,10 @@ fn decode_title(bytes: &[u8]) -> String {
 pub fn rom_size_from_code(code: u8) -> Option<usize> {
     match code {
         0x00..=0x08 => Some((32 * 1024) << code), // $00 = 32 KiB … $07 = 4 MiB, $08 = 8 MiB
-        0x52 => Some(72 * ROM_BANK_SIZE),   // 1.1 MiB (taille non officielle, note PanDocs)
-        0x53 => Some(80 * ROM_BANK_SIZE),   // 1.2 MiB
-        0x54 => Some(96 * ROM_BANK_SIZE),   // 1.5 MiB
-        _ => None,                          // code inconnu
+        0x52 => Some(72 * ROM_BANK_SIZE),         // 1.1 MiB (taille non officielle, note PanDocs)
+        0x53 => Some(80 * ROM_BANK_SIZE),         // 1.2 MiB
+        0x54 => Some(96 * ROM_BANK_SIZE),         // 1.5 MiB
+        _ => None,                                // code inconnu
     }
 }
 
@@ -232,12 +246,12 @@ pub fn rom_size_from_code(code: u8) -> Option<usize> {
 pub fn ram_size_from_code(code: u8) -> usize {
     match code {
         0x00 => 0,          // pas de RAM
-        0x01 => 2 * 1024,   // listée comme 2 KiB dans les docs non officielles (PanDocs la marque « unused »)
-        0x02 => 8 * 1024,   // 1 banque de 8 KiB
-        0x03 => 32 * 1024,  // 4 banques de 8 KiB
+        0x01 => 2 * 1024, // listée comme 2 KiB dans les docs non officielles (PanDocs la marque « unused »)
+        0x02 => 8 * 1024, // 1 banque de 8 KiB
+        0x03 => 32 * 1024, // 4 banques de 8 KiB
         0x04 => 128 * 1024, // 16 banques de 8 KiB (MBC5)
-        0x05 => 64 * 1024,  // 8 banques de 8 KiB
-        _ => 0,             // code inconnu : pas de RAM
+        0x05 => 64 * 1024, // 8 banques de 8 KiB
+        _ => 0,           // code inconnu : pas de RAM
     }
 }
 
@@ -249,8 +263,7 @@ mod tests {
     fn rom_with_valid_header() -> Vec<u8> {
         let mut rom = vec![0u8; 0x4000];
         rom[LOGO_START..LOGO_START + LOGO_LEN].copy_from_slice(&NINTENDO_LOGO);
-        rom[TITLE_START..TITLE_START + TITLE_LEN]
-            .copy_from_slice(b"FARQUAADGB\0\0\0\0\0\0"); // titre bourgé de $00
+        rom[TITLE_START..TITLE_START + TITLE_LEN].copy_from_slice(b"FARQUAADGB\0\0\0\0\0\0"); // titre bourgé de $00
         rom[HEADER_CHECKSUM_ADDR as usize] = compute_header_checksum(&rom);
         rom
     }
@@ -296,7 +309,13 @@ mod tests {
     #[test]
     fn too_short_rom_is_an_error() {
         let err = parse_header(&vec![0x42u8; 0x100]).unwrap_err();
-        assert_eq!(err, HeaderError::RomTooShort { required: 0x0150, actual: 0x100 });
+        assert_eq!(
+            err,
+            HeaderError::RomTooShort {
+                required: 0x0150,
+                actual: 0x100
+            }
+        );
     }
 
     #[test]
@@ -348,14 +367,14 @@ mod tests {
     #[test]
     fn cartridge_type_flags_ram_battery_rtc() {
         let mut rom = rom_with_valid_header();
-        rom[HEADER_TYPE_ADDR as usize] = 0x0F; // MBC3 + TIMER + BATTERY
+        rom[HEADER_TYPE_ADDR as usize] = 0x0C; // MBC3 with TIMER and BATTERY
         let header = parse_header(&rom).unwrap();
         assert_eq!(header.mbc_type, MbcType::Mbc3);
         assert!(!header.has_ram());
         assert!(header.has_battery());
         assert!(header.has_rtc());
 
-        rom[HEADER_TYPE_ADDR as usize] = 0x1B; // MBC5 + RAM + BATTERY
+        rom[HEADER_TYPE_ADDR as usize] = 0x1B; // MBC5 + RAM + BATTERY (variante MBC6 non officielle)
         let header = parse_header(&rom).unwrap();
         assert_eq!(header.mbc_type, MbcType::Mbc5);
         assert!(header.has_ram());
