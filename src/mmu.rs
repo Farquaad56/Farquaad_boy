@@ -7,6 +7,9 @@
 //! Étape 1 : les registres PPU ($FF40-$FF4B, dont le DMA OAM $FF46) sont routés vers la structure
 //! [`ppu::PPU`] embarquée dans le MMU ; partie 7 : les registres SCC ($FF01-$FF02) vers
 //! [`serial::Serial`], et partie 9 : les registres Timer ($FF04-$FF07) vers [`timer::Timer`].
+//! Étape 2 : la VRAM ($8000-$9FFF) est bloquée par la PPU only during the Drawing mode (3), and
+//! l'OAM ($FE00-$FE9F) is blocked during OAM Scan (mode 2) and Drawing (mode 3) — in both cases, only when the LCD is on:
+//! CPU reads return $FF, and writes are ignored (Pan Docs « PPU »).
 //! Partie 10 : l'écriture du registre DMA OAM $FF46 démarre le transfert des 160 octets d'OAM
 //! ($FE00-$FE9F) depuis l'adresse source `value << 8`, un octet par M-cycle pendant 160 M-cycles
 //! (Pan Docs « OAM DMA Transfer ») : durant ce conflit de bus, le CPU ne peut plus accéder qu'à la
@@ -170,14 +173,19 @@ impl MMU {
         if self.dma_active() && !Self::is_hram(addr) {
             return 0xFF; // Bus occupé par le transfert OAM : lecture CPU bloquée.
         }
-        let value = self.read_plain(addr);
+        self.read_plain(addr)
+    }
 
-        // --- Diagnostic temporaire : on force un print standard pour contourner tout filtre de log. ---
-        if addr == 0xFF44 {
-            println!("🚨 PREUVE : Le CPU lit $FF44 ! LY actuel = {}", self.ppu.ly);
-        }
+    /// La PPU bloque-t-elle la VRAM ($8000-$9FFF) au CPU ? Seulement pendant le mode Drawing (3), et
+    /// uniquement quand le LCD est allumé (bit 7 du LCDC) — Pan Docs « PPU ».
+    fn vram_blocked(&self) -> bool {
+        self.ppu.lcdc & crate::ppu::LCDC_LCD_ON != 0 && self.ppu.mode == 3
+    }
 
-        value
+    /// La PPU bloque-t-elle l'OAM ($FE00-$FE9F) au CPU ? Pendant les modes OAM Scan (2) et Drawing (3),
+    /// et uniquement quand le LCD est allumé — Pan Docs « PPU ».
+    fn oam_blocked(&self) -> bool {
+        self.ppu.lcdc & crate::ppu::LCDC_LCD_ON != 0 && (self.ppu.mode == 2 || self.ppu.mode == 3)
     }
 
     /// Lit un octet sur toute la carte d'adresses sans appliquer le conflit de bus du DMA OAM —
@@ -186,16 +194,27 @@ impl MMU {
         match addr {
             // Région ROM : banque active selon le contrôleur MBC (PanDocs « MBC1 » / « MBC3 »).
             0x0000..=0x7FFF => self.read_rom_at(self.mbc.get_rom_addr(addr) as u32),
-            // Video RAM.
-            0x8000..=0x9FFF => self.vram[(addr - 0x8000) as usize],
+            // Video RAM : inaccessible au CPU pendant le mode Drawing (3) de la PPU — la lecture renvoie $FF,
+            // comme sur le matériel réel (Pan Docs « PPU »). Pendant l'OAM Scan (mode 2), seule l'OAM est bloquée.
+            0x8000..=0x9FFF => {
+                if self.vram_blocked() {
+                    return 0xFF; // Bus bloqué par la PPU.
+                }
+                self.vram[(addr - 0x8000) as usize]
+            }
             // SRAM cartouche / registres RTC (open bus $FF si la RAM est désactivée ou absente).
             0xA000..=0xBFFF => self.mbc.read_ram(addr).unwrap_or(0xFF),
             // Work RAM.
             0xC000..=0xDFFF => self.wram[(addr - 0xC000) as usize],
             // Echo RAM : miroir de C000-DDFF (seuls les 13 bits bas d'adresse sont connectés).
             0xE000..=0xFDFF => self.read_plain(addr - 0x2000),
-            // Object Attribute Memory.
-            0xFE00..=0xFE9F => self.oam[(addr - 0xFE00) as usize],
+            // Object Attribute Memory : inaccessible au CPU pendant les modes OAM Scan (2) and Drawing (3) of the PPU.
+            0xFE00..=0xFE9F => {
+                if self.oam_blocked() {
+                    return 0xFF; // Bus bloqué par la PPU en mode OAM Scan / Drawing.
+                }
+                self.oam[(addr - 0xFE00) as usize]
+            }
             // Non utilisable (FEA0-FEFF) : $00 sur DMG hors bloc OAM ; pendant le DMA OAM, la lecture
             // CPU est bloquée par le conflit de bus et renvoie $FF (voir `read`).
             0xFEA0..=0xFEFF => 0x00,
@@ -250,16 +269,26 @@ impl MMU {
             // Région ROM : les écritures vont aux registres du contrôleur MBC actif (la ROM est en lecture seule).
             // Le routage exact des adresses dépend du type détecté ($0147) — PanDocs « MBCs » / « MBC2 ».
             0x0000..=0x7FFF => self.mbc.write_register(addr, value),
-            // Video RAM.
-            0x8000..=0x9FFF => self.vram[(addr - 0x8000) as usize] = value,
+            // Video RAM : les écritures sont ignorées pendant le mode Drawing (3) de la PPU (LCD allumé).
+            0x8000..=0x9FFF => {
+                if self.vram_blocked() {
+                    return; // Bus bloqué par la PPU : écriture ignorée.
+                }
+                self.vram[(addr - 0x8000) as usize] = value;
+            }
             // SRAM cartouche / registres RTC (ignorées si la RAM est désactivée ou absente).
             0xA000..=0xBFFF => self.mbc.write_ram(addr, value),
             // Work RAM.
             0xC000..=0xDFFF => self.wram[(addr - 0xC000) as usize] = value,
             // Echo RAM : les écritures sont miroirées vers C000-DDFF.
             0xE000..=0xFDFF => self.write(addr - 0x2000, value),
-            // Object Attribute Memory.
-            0xFE00..=0xFE9F => self.oam[(addr - 0xFE00) as usize] = value,
+            // Object Attribute Memory : les écritures sont ignorées pendant the modes OAM Scan (2) and Drawing (3) of the PPU.
+            0xFE00..=0xFE9F => {
+                if self.oam_blocked() {
+                    return; // Bus bloqué par la PPU en mode OAM Scan / Drawing : écriture ignorée.
+                }
+                self.oam[(addr - 0xFE00) as usize] = value;
+            }
             // Non utilisable : écritures ignorées sur DMG.
             0xFEA0..=0xFEFF => {}
             // Serial Communication Controller (partie 7).
@@ -480,6 +509,7 @@ mod tests {
     #[test]
     fn oam_region() {
         let mut mmu = MMU::new();
+        mmu.ppu.mode = 0; // HBlank : l'OAM est accessible au CPU (la PPU ne le bloque qu'en modes 2/3, LCD allumé).
         mmu.write(0xFE00, 0x90);
         assert_eq!(mmu.read(0xFE00), 0x90);
         mmu.write(0xFE9F, 0x12); // dernier octet OAM
@@ -651,6 +681,7 @@ mod tests {
     #[test]
     fn dma_oam_transfer_copies_from_source() {
         let mut mmu = MMU::new();
+        mmu.ppu.mode = 0; // HBlank : l'OAM est accessible au CPU pour la lecture finale (la PPU ne le bloque qu'en modes 2/3, LCD allumé).
         // Source en WRAM : les 160 octets à $C000-$C09F (source byte $C0 → base $C000).
         for i in 0..0xA0 {
             mmu.write(0xC000 + i, (i as u8) ^ 0x5A);
@@ -694,6 +725,7 @@ mod tests {
     #[test]
     fn dma_oam_transfer_reads_through_full_address_map() {
         let mut mmu = MMU::new();
+        mmu.ppu.mode = 0; // HBlank : la VRAM est accessible au CPU (la PPU ne la bloque qu'en mode 3, LCD allumé).
         // Source en VRAM : les 160 octets à $8200-$829F (source byte $82 → base $8200).
         for i in 0..0xA0 {
             mmu.write(0x8200 + i, 0x3C);
@@ -856,6 +888,7 @@ mod tests {
 
         let mut mmu = MMU::new();
         mmu.load_rom(rom);
+        mmu.ppu.mode = 0; // HBlank : la VRAM/OAM est accessible au CPU (la PPU ne les bloque que pendant the modes 2/3, LCD allumé).
 
         // --- ROM : la région $0000-$3FFF reste en banque 0 ; $4000-$7FFF suit le registre de banque.
         assert_eq!(mmu.read(0x0000), 0xA0);

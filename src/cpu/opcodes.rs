@@ -504,15 +504,6 @@ fn ld_r8(cpu: &mut CPU, mmu: &mut MMU, dst: u8, src: u8) -> u32 {
 /// LD r16, n16 (12 T-cycles) ; pas de drapeaux. L'immédiat est à `cpu.pc`.
 fn ld_r16_imm(cpu: &mut CPU, mmu: &mut MMU, idx: u8) -> u32 {
     let nn = read_a16(mmu, cpu.pc);
-    // [DEBUG TEMPORAIRE] LD SP, nn ($31) : log brut des octets renvoyés réellement par la MMU à l'adresse de l'opérande.
-    if idx == 3 {
-        let lsb = mmu.read(cpu.pc);
-        let msb = mmu.read(cpu.pc + 1);
-        println!(
-            "[DEBUG MMU] Lecture LD SP: PC=${:04X}, Octets lus: [${:02X}, ${:02X}], Valeur combinée: ${:04X}",
-            cpu.pc, lsb, msb, nn
-        );
-    }
     set_reg16(cpu, idx, nn);
     cpu.pc = cpu.pc.wrapping_add(2); // passe l'immédiat n16
     12
@@ -849,7 +840,7 @@ pub fn execute(cpu: &mut CPU, mmu: &mut MMU, opcode: u8) -> u32 {
             8
         } // SBC A,n8 (8)
 
-        0xE0 => ldh_a8(cpu, mmu, false),       // LDH A, [n8] (8)
+        0xE0 => ldh_a8(cpu, mmu, false),       // LDH A, [n8] (8) : lit $FF00+n8 dans A
         0xE1 => pop_r16(cpu, mmu, 2),          // POP HL (12)
         0xE2 => ldh_c(cpu, mmu, false),        // LDH A, [C] (12)
         0xE3 | 0xE4 | 0xEB | 0xEC | 0xED => 4, // opcodes invalides (hard-lock sur le matériel)
@@ -882,7 +873,7 @@ pub fn execute(cpu: &mut CPU, mmu: &mut MMU, opcode: u8) -> u32 {
             8
         } // XOR A,n8 (8)
 
-        0xF0 => ldh_a8(cpu, mmu, true),  // LDH [n8], A (8)
+        0xF0 => ldh_a8(cpu, mmu, true),  // LDH [n8], A (8) : écrit A dans $FF00+n8
         0xF1 => pop_r16(cpu, mmu, 3),    // POP AF (12)
         0xF2 => ldh_c(cpu, mmu, true),   // LDH [C], A (12)
         0xF3 => {

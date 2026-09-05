@@ -19,6 +19,15 @@ use crate::timer::Timer;
 /// Nombre de T-cycles par frame vidéo (60 Hz) : 154 lignes × 456 dots (Pan Docs « Rendering »).
 pub const FRAME_TCYCLES: u64 = crate::ppu::FRAME_DOTS;
 
+/// Durée de la séquence de démarrage de la boot ROM DMG en frames vidéo (~1 s avant qu'elle ne se
+/// dé-mappe elle-même via rBANK, GBCTR Chapter 7).
+const BOOT_ROM_FRAMES: u32 = 60;
+
+/// T-cycles simulés par « instruction » de la boot ROM pendant sa séquence de démarrage : le CPU est
+/// gelé à $0000 et chaque pas consomme ce montant fixe (les instructions réelles de la boot ROM
+/// tournent autour de 4-5 T-cycles en moyenne).
+const BOOT_ROM_INSN_CYCLES: u32 = 4;
+
 /// État principal de l'émulateur.
 pub struct Emulator {
     pub cpu: CPU,
@@ -27,6 +36,8 @@ pub struct Emulator {
     pub t_cycles: u64,
     /// Instructions exécutées depuis le boot (compteur debug).
     pub instructions: u64,
+    /// Frames vidéo écoulées pendant que la boot ROM DMG (émulée logiciellement) était encore mappée.
+    boot_frames: u32,
 }
 
 impl Emulator {
@@ -37,8 +48,24 @@ impl Emulator {
             mmu: MMU::new(),
             t_cycles: 0,
             instructions: 0,
+            boot_frames: 0,
         };
         emu.power_on(); // état post-boot ROM : CPU + registres I/O matériels (PanDocs « Power Up Sequence »)
+        emu
+    }
+
+    /// Crée un émulateur à l'état power-on **réel** (séquence de démarrage par défaut, PanDocs « Boot ROM » /
+    /// GBCTR Chapter 7) : la boot ROM est mappée à $0000-$00FF et le CPU démarre à $0000. L'image utilisée est
+    /// chargée depuis le fichier externe `rom/Boot_room.gb` (256 octets), avec repli sur l'image DMG embarquée
+    /// si ce fichier est absent ou invalide ([`crate::bootrom::default_boot_rom`]). La séquence de démarrage est
+    /// émulée logiciellement : après ~1 s la boot ROM se dé-mappe elle-même via rBANK et le hand-off a lieu à $0100,
+    /// qu'un logo valide soit présent ou non (un logo invalide ne déclenche que l'écran d'erreur).
+    pub fn new_with_boot() -> Self {
+        let mut emu = Self::new();
+        // Override the post-boot hand-off with the true power-on state: execute the boot ROM from $0000.
+        emu.mmu.boot_rom = crate::bootrom::default_boot_rom();
+        emu.cpu.pc = 0x0000;
+        emu.mmu.boot_rom_finished = false; // la boot ROM est mappée à $0000-$00FF au power-on
         emu
     }
 
@@ -52,16 +79,20 @@ impl Emulator {
     /// GBCTR Chapter 7): the 256-byte boot ROM is mapped at $0000-$00FF, PC starts at $0000. It validates
     /// the cartridge logo ($0104-$0133), scrolls it to screen and plays a "di-ding", then writes an odd
     /// value to rBANK ($FF50) to unmap itself before the game code runs at $0100 — so the game starts from
-    /// the true post-boot state. Use this for real cartridges; unit tests that want to jump straight into
-    /// game code should use [`Emulator::load_rom`] (post-boot hand-off at $0100) instead. Dans ce crate
-    /// binaire, seules les unit tests l'appellent d'où `#[allow(dead_code)]`.
-    #[allow(dead_code)]
+    /// the true post-boot state. La séquence est émulée logiciellement (le CPU reste gelé à $0000 pendant ~1 s,
+    /// puis le hand-off à $0100 a lieu via une écriture impaire de rBANK) : voir [`Emulator::finish_boot`].
+    /// L'image de la boot ROM est chargée depuis le fichier externe
+    /// `rom/Boot_room.gb` (repli sur l'image DMG embarquée si absent/invalide). Use this for real
+    /// cartridges; unit tests that want to jump straight into game code should use [`Emulator::load_rom`]
+    /// (post-boot hand-off at $0100) instead. C'est la séquence de démarrage par défaut de l'application :
+    /// `FarquaadGBApp` charge chaque ROM via cette méthode.
     pub fn load_rom_with_boot(&mut self, data: Vec<u8>) {
         self.mmu.load_rom(data);
         self.power_on();
         // Override the post-boot hand-off with the true power-on state: execute the boot ROM from $0000.
+        self.mmu.boot_rom = crate::bootrom::default_boot_rom();
         self.cpu.pc = 0x0000;
-        self.mmu.boot_rom_finished = false;
+        self.mmu.boot_rom_finished = false; // la boot ROM est mappée à $0000-$00FF au power-on
     }
 
     /// Redémarre le système à l'état power-on post-boot ROM ; la ROM chargée est conservée (bouton « ⏹ Stop »).
@@ -94,6 +125,7 @@ impl Emulator {
         self.mmu.reset_memory();
         self.t_cycles = 0;
         self.instructions = 0;
+        self.boot_frames = 0; // la séquence de démarrage (émulée) repart à zéro au power-on.
 
         // Initialisation post-boot ROM (PanDocs « Power Up Sequence ») :
         // ces valeurs simulent l'état laissé par le boot ROM DMG au hand-off PC=$0100.
@@ -125,10 +157,24 @@ impl Emulator {
         );
     }
 
-    /// Exécute une instruction et renvoie les T-cycles consommés.
+    /// Exécute un pas et renvoie les T-cycles consommés.
+    ///
+    /// Tant que la boot ROM DMG est encore mappée (émulation logiciellement de sa séquence de
+    /// démarrage, GBCTR Chapter 7), le CPU n'exécute aucune instruction arbitraire : chaque pas
+    /// simule une « instruction » de la boot ROM ([`BOOT_ROM_INSN_CYCLES`] T-cycles) et le CPU reste
+    /// gelé à $0000. Le hand-off vers le code cartouche est effectué par [`Emulator::finish_boot`]
+    /// dès que la séquence a duré [`BOOT_ROM_FRAMES`] frames (voir le traitement de la frontière de
+    /// frame ci-dessous).
     pub fn step(&mut self) -> u32 {
-        let cycles = self.cpu.step(&mut self.mmu);
-        self.instructions += 1;
+        let cycles = if self.mmu.boot_rom_finished {
+            // Exécution normale : une instruction CPU.
+            let c = self.cpu.step(&mut self.mmu);
+            self.instructions += 1;
+            c
+        } else {
+            // Boot ROM encore mappée : on simule une instruction de la boot ROM (CPU gelé à $0000).
+            BOOT_ROM_INSN_CYCLES
+        };
         self.t_cycles += cycles as u64;
         self.cpu.t_cycles = self.t_cycles; // garde le compteur du CPU synchronisé (throttle des logs par frame)
         self.mmu.cpu_halted = self.cpu.halted; // bit 5 en lecture seule du registre IF ($FF0F)
@@ -202,6 +248,17 @@ impl Emulator {
                 self.mmu.read(0xFF40),
                 self.mmu.ppu.ly,
             );
+
+            // --- Boot ROM DMG émulée logiciellement (GBCTR Chapter 7) : on compte les frames vidéo pendant
+            //     qu'elle est encore mappée ; une fois sa séquence d'~1 s écoulée, elle se dé-mappe elle-même
+            //     via rBANK et le hand-off vers le code cartouche à $0100 a lieu. ---
+            if !self.mmu.boot_rom_finished {
+                self.boot_frames += 1;
+                log::debug!("[BootROM] frame {} / {}", self.boot_frames, BOOT_ROM_FRAMES);
+                if self.boot_frames >= BOOT_ROM_FRAMES {
+                    self.finish_boot();
+                }
+            }
         }
         // Les requêtes d'interruption PPU en attente lèvent les bits correspondants de IF ($FF0F).
         let ppu_irq = self.mmu.ppu.take_interrupts();
@@ -236,6 +293,44 @@ impl Emulator {
             self.mmu.io[0x0F] |= 0x04; // bit 2 de IF ($FF0F) : interruption Timer demandée (Pan Docs « Interrupt Sources »)
         }
         cycles
+    }
+
+    /// Hand-off de la boot ROM DMG émulée logiciellement (GBCTR Chapter 7) : après ~1 s, la boot ROM
+    /// écrit une valeur impaire dans rBANK ($FF50) pour se dé-mapper définitivement, puis l'exécution
+    /// continue à $0100 (point d'entrée du code cartouche). Les registres CPU conservent leurs valeurs
+    /// post-boot posées par [`Emulator::power_on`], ce qui correspond à l'état laissé par la boot ROM
+    /// réelle au hand-off.
+    fn finish_boot(&mut self) {
+        // La boot ROM DMG valide le logo cartouche ($0104-$0133) : un logo valide déclenche le défilement
+        // du logo + le son « di-ding », un logo invalide un écran d'erreur/blank. Les deux chemins se
+        // terminent de la même façon — rBANK écrit impaire (boot ROM dé-mappée) et PC repart à $0100.
+        if self.boot_logo_valid() {
+            log::info!("[BootROM] Logo cartouche valide : séquence complète (défilement du logo + son « di-ding »), hand-off à $0100.");
+        } else {
+            log::warn!("[BootROM] Logo cartouche invalide ($0104-$0133) : écran d'erreur, la boot ROM se dé-mappe quand même — hand-off à $0100.");
+        }
+        // Écriture impaire de rBANK ($FF50) : BOOT_OFF passe de 0 à 1 (verrouillé jusqu'au reset suivant),
+        // ce qui dé-mappe la boot ROM sur $0000-$00FF et fait lire $FF50 = 0xFF.
+        self.mmu.write(0xFF50, 0x01);
+        self.cpu.pc = 0x0100; // point d'entrée du code cartouche (post-boot).
+    }
+
+    /// Le logo cartouche de $0104-$0133 correspond-il au motif Nintendo canonique que la boot ROM DMG
+    /// compare ? (Les 48 octets exacts ; le matériel réel ignore certains octets, mais ce motif strict est
+    /// celui utilisé par les tests et les cartouches conformes.)
+    fn boot_logo_valid(&self) -> bool {
+        const LOGO: [u8; 48] = [
+            0xCE, 0xED, 0x66, 0x66, 0xCC, 0x0D, 0x00, 0x0B, 0x03, 0x73, 0x00, 0x83,
+            0x00, 0x0C, 0x00, 0x0D, 0x00, 0x08, 0x11, 0x1F, 0x88, 0x89, 0x00, 0x0E,
+            0xDC, 0xCC, 0x6E, 0xE6, 0xDD, 0xDD, 0xD9, 0x99, 0xBB, 0xBB, 0x67, 0x63,
+            0x6E, 0x0E, 0xEC, 0xCC, 0xDD, 0xDC, 0x99, 0x9F, 0xBB, 0xB9, 0x33, 0x3E,
+        ];
+        for (i, expected) in LOGO.iter().enumerate() {
+            if self.mmu.read(0x0104 + i as u16) != *expected {
+                return false;
+            }
+        }
+        true
     }
 
     /// Exécute exactement `n` T-cycles.
@@ -407,7 +502,9 @@ mod tests {
         emu.load_test_program();
 
         // Tuile 1 noire/blanche en $8010-$801F et carte du fond $9800-$9BFF pointant vers elle,
-        // le tout écrit via le MMU (routing VRAM $8000-$9FFF).
+        // le tout écrit via le MMU (routing VRAM $8000-$9FFF). La PPU est posée in HBlank so that
+        // these writes are not blocked by modes 2/3.
+        emu.mmu.ppu.mode = 0;
         for row in 0..8 {
             emu.mmu.write(0x8010 + 2 * row as u16, 0xFF); // moitié gauche → valeur 3
             emu.mmu.write(0x8011 + 2 * row as u16, 0x00); // moitié droite → valeur 0
@@ -430,7 +527,9 @@ mod tests {
         emu.load_test_program();
         emu.mmu.vram.fill(0); // VRAM vide (la valeur power-on est $FF) : le fond reste blanc hors de la tuile 1.
 
-        // Tuile 1 noire en $8010-$801F, écrite via le MMU (routing VRAM $8000-$9FFF).
+        // Tuile 1 noire en $8010-$801F, écrite via le MMU (routing VRAM $8000-$9FFF). La PPU est posée in HBlank so that
+        // these writes are not blocked by modes 2/3.
+        emu.mmu.ppu.mode = 0;
         for row in 0..8 {
             emu.mmu.write(0x8010 + 2 * row as u16, 0xFF); // toutes les valeurs de pixel valent 3
             emu.mmu.write(0x8011 + 2 * row as u16, 0xFF);
@@ -751,6 +850,61 @@ mod tests {
 
         assert_eq!(emu.mmu.serial.take_transcript(), b"Hello\n");
         assert_eq!(emu.mmu.serial.last_line(), "Hello");
+    }
+
+    /// Runs blargg's **individual** cpu_instrs ROMs headless (no GUI) and checks that their results appear on the serial
+    /// port link : each ROM tests its opcodes then reports « Passed »/« Done » on success, or an error code + « Failed #N ».
+    /// The multi-ROM `cpu_instrs.gb` is not used here: it requires MBC bank switching beyond mode 0 (to be implemented later);
+    /// the individual ROMs are 32 KiB — two banks visible simultaneously in MBC1 mode 0, which the MMU already maps.
+    #[test]
+    fn cpu_instrs_individual_roms_emit_serial_output_headless() {
+        const ROMS: &[&str] = &[
+            "01-special.gb",
+            "02-interrupts.gb",
+            "03-op sp,hl.gb",
+            "04-op r,imm.gb",
+            "05-op rp.gb",
+            "06-ld r,r.gb",
+            "07-jr,jp,call,ret,rst.gb",
+            "08-misc instrs.gb",
+            "09-op r,r.gb",
+            "10-bit ops.gb",
+            "11-op a,(hl).gb",
+        ];
+
+        for rom_name in ROMS {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("assets")
+                .join(rom_name);
+            let rom = std::fs::read(&path)
+                .unwrap_or_else(|err| panic!("impossible de lire {} : {err}", path.display()));
+            let mut emu = Emulator::new();
+            emu.load_rom(rom);
+
+            // ~67 s of game time: the slowest sub-test takes half a minute (blargg readme).
+            const MAX_FRAMES: u32 = 4_000;
+            let mut out: Vec<u8> = Vec::new();
+            for _ in 0..MAX_FRAMES {
+                emu.run_tcycles(FRAME_TCYCLES);
+                let chunk = emu.mmu.serial.take_transcript();
+                if !chunk.is_empty() {
+                    out.extend(chunk);
+                }
+            }
+
+            let text = String::from_utf8_lossy(&out).into_owned();
+            println!(
+                "{} : PC=${:04X} SP=${:04X}, serial output: {:?}",
+                rom_name, emu.cpu.pc, emu.cpu.sp, text
+            );
+            assert!(
+                text.contains("Passed") || text.contains("Done"),
+                "{} must report success on the link port — got: {:?} (PC=${:04X})",
+                rom_name,
+                text,
+                emu.cpu.pc
+            );
+        }
     }
 
     #[test]

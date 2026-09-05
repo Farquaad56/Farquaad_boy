@@ -9,9 +9,23 @@
 //! (`$FF50`) to unmap itself before the game code runs at `$0100`. While mapped, all
 //! reads from `$0000-$00FF` are served by this ROM and writes to that region are
 //! ignored; reads/writes of `$0100+` still reach the cartridge.
+//!
+//! The image is loaded by default from the external file `rom/Boot_room.gb` (256 bytes,
+//! relative to the working directory or next to the executable); if that file is absent
+//! or invalid, the embedded [`DMG_BOOT_ROM`] below is used as a safe fallback.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+/// Taille exacte d'une Boot ROM DMG (octets).
+pub const BOOT_ROM_SIZE: usize = 256;
+
+/// Chemin par défaut du fichier externe de la Boot ROM (relatif au répertoire de travail ;
+/// un second essai est fait à côté de l'exécutable — voir [`default_boot_rom`]).
+pub const DEFAULT_BOOT_ROM_PATH: &str = "rom/Boot_room.gb";
 
 /// The real DMG boot ROM (256 bytes), verified against GBCTR Table 7.1.
-pub const DMG_BOOT_ROM: [u8; 256] = [
+pub const DMG_BOOT_ROM: [u8; BOOT_ROM_SIZE] = [
     0x31, 0xfe, 0xff, 0xaf, 0x21, 0xff, 0x9f, 0x32, 0xcb, 0x7c, 0x20, 0xfb, 0x21, 0x26, 0xff, 0x0e,
     0x11, 0x3e, 0x80, 0x32, 0xe2, 0x0c, 0x3e, 0xf3, 0xe2, 0x32, 0x3e, 0x77, 0x77, 0x3e, 0xfc, 0xe0,
     0x47, 0x11, 0x04, 0x01, 0x21, 0x10, 0x80, 0x1a, 0xcd, 0x95, 0x00, 0xcd, 0x96, 0x00, 0x13, 0x7b,
@@ -33,3 +47,114 @@ pub const DMG_BOOT_ROM: [u8; 256] = [
 // La boot ROM MGB (pocket-color) réelle n'est pas encore embarquée : tant qu'un dump vérifié n'est pas
 // disponible, la MGB se comporte comme la DMG au hand-off — voir GBCTR Table 7.1
 // (MD5 `71a378e71ff30b2d8a1f02bf5c7896aa`).
+
+
+/// Charge la Boot ROM depuis un fichier `.gb` de exactement [`BOOT_ROM_SIZE`] octets.
+/// Retourne une erreur si le fichier est absent ou n'a pas la bonne taille.
+pub fn load_boot_rom_from_file(path: impl AsRef<Path>) -> Result<[u8; BOOT_ROM_SIZE], String> {
+    let path = path.as_ref();
+    if !path.is_file() {
+        return Err(format!("Fichier Boot ROM introuvable : {}", path.display()));
+    }
+
+    let data = fs::read(path).map_err(|e| format!("Erreur de lecture du fichier {} : {e}", path.display()))?;
+
+    if data.len() != BOOT_ROM_SIZE {
+        return Err(format!(
+            "La Boot ROM doit faire exactement {} octets, obtenu : {}",
+            BOOT_ROM_SIZE,
+            data.len()
+        ));
+    }
+
+    let mut rom = [0u8; BOOT_ROM_SIZE];
+    rom.copy_from_slice(&data);
+    Ok(rom)
+}
+
+/// Chemins candidats du fichier externe de la Boot ROM : d'abord relatif au répertoire de travail
+/// (`cargo run` depuis la racine du projet), puis à côté de l'exécutable (lancement de l'exe
+/// depuis un autre CWD).
+fn candidate_boot_rom_paths() -> Vec<PathBuf> {
+    let mut paths = vec![PathBuf::from(DEFAULT_BOOT_ROM_PATH)];
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let next_to_exe = dir.join("rom").join("Boot_room.gb");
+            if !paths.contains(&next_to_exe) {
+                paths.push(next_to_exe);
+            }
+        }
+    }
+    paths
+}
+
+/// Image de la Boot ROM par défaut : le fichier externe [`DEFAULT_BOOT_ROM_PATH`] s'il est lisible et
+/// valide (256 octets), sinon l'image DMG embarquée [`DMG_BOOT_ROM`] en repli sécurisé.
+pub fn default_boot_rom() -> [u8; BOOT_ROM_SIZE] {
+    for path in candidate_boot_rom_paths() {
+        match load_boot_rom_from_file(&path) {
+            Ok(rom) => {
+                log::info!("[BootROM] Boot ROM chargée depuis : {}", path.display());
+                return rom;
+            }
+            Err(err) => log::debug!("[BootROM] {} — essai du chemin suivant.", err),
+        }
+    }
+    log::warn!(
+        "[BootROM] Fichier externe introuvable ou invalide ({} et à côté de l'exécutable) — utilisation de la Boot ROM DMG embarquée (repli).",
+        DEFAULT_BOOT_ROM_PATH
+    );
+    DMG_BOOT_ROM
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Répertoire temporaire unique par test : `farquaadgb_bootrom_<nom>` dans le temp du système.
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("farquaadgb_bootrom_{name}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("impossible de créer le répertoire temporaire");
+        dir
+    }
+
+    #[test]
+    fn load_boot_rom_from_file_missing_errors() {
+        let dir = temp_dir("missing");
+        let err = load_boot_rom_from_file(dir.join("absent.gb")).unwrap_err();
+        assert!(err.contains("introuvable"), "message inattendu : {err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_boot_rom_from_file_wrong_size_errors() {
+        let dir = temp_dir("size");
+        let path = dir.join("court.gb");
+        fs::write(&path, vec![0x31; BOOT_ROM_SIZE - 1]).expect("impossible d'écrire le fichier de test");
+
+        let err = load_boot_rom_from_file(&path).unwrap_err();
+        assert!(err.contains("256"), "message inattendu : {err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_boot_rom_from_file_ok() {
+        let dir = temp_dir("ok");
+        let path = dir.join("boot.gb");
+        fs::write(&path, DMG_BOOT_ROM).expect("impossible d'écrire le fichier de test");
+
+        let rom = load_boot_rom_from_file(&path).unwrap();
+        assert_eq!(rom, DMG_BOOT_ROM); // octet par octet
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn embedded_dmg_boot_rom_has_canonical_edges() {
+        // Garde-fou : les 8 premiers octets du dump DMG vérifié (GBCTR Table 7.1, MD5 32fbbd84…).
+        assert_eq!(&DMG_BOOT_ROM[..8], &[0x31, 0xfe, 0xff, 0xaf, 0x21, 0xff, 0x9f, 0x32]);
+        // …et les 4 derniers : le boot ROM se termine par LD A,$01 / OUT ($50),A (dé-mappage via rBANK).
+        assert_eq!(&DMG_BOOT_ROM[BOOT_ROM_SIZE - 4..], &[0x3e, 0x01, 0xe0, 0x50]);
+    }
+}
+

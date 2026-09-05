@@ -107,12 +107,6 @@ impl CPU {
             return 4;
         }
 
-        // [DEBUG TEMPORAIRE] Lecture à $0040 (vecteur d'interruption V-Blank) : doit renvoyer une instruction
-        // ROM valide ($C3 JP, etc.), jamais $00. Ne se déclenche que lorsque le PC pointe exactement sur $0040.
-        if self.pc == 0x0040 {
-            println!("[DEBUG MMU] Le CPU essaie de lire à $0040. La MMU renvoie: ${:02X}", mmu.read(0x0040));
-        }
-
         let opcode = mmu.read(self.pc);
 
         // 🚨 DÉTECTEUR DE CRASH : Si le PC entre in HRAM, on le loggue immediately — cela nous dira how the CPU got there.
@@ -141,20 +135,8 @@ impl CPU {
             }
         }
 
-        // [DEBUG TEMPORAIRE] LD SP, nn ($31) : loggue l'opérande immédiat avant exécution et la nouvelle valeur de SP après.
-        // NB : les opérandes sont à pc+1 / pc+2 (pc pointe encore sur l'opcode $31 ici).
-        if opcode == 0x31 {
-            let nn = u16::from_le_bytes([mmu.read(self.pc + 1), mmu.read(self.pc + 2)]);
-            println!("[DEBUG CPU] Exécution de LD SP, ${:04X}", nn);
-        }
-
         self.pc = self.pc.wrapping_add(1);
         let cycles = opcodes::execute(self, mmu, opcode);
-
-        if opcode == 0x31 {
-            println!("[DEBUG CPU] SP est maintenant: ${:04X}", self.sp);
-        }
-
         // EI : IME devient effectif après l'instruction EI suivante (2 étapes : la fin de
         // l'instruction EI elle-même, puis celle qui suit).
         if self.ei_delay > 0 {

@@ -130,6 +130,12 @@ pub struct FarquaadGBApp {
     show_pattern_table: bool, // panneau droit « Pattern Table » (tuiles VRAM)
     /// Fenêtre « ⌨️ Input Mapping » (mappage clavier → joypad $FF00).
     show_input_mapping: bool,
+    /// Fenêtre « 🔌 Serial Monitor » : sortie du port série (SB/SC + transcript) pour le debug des ROMs de test.
+    show_serial_monitor: bool,
+    /// Cache du transcript série rendu en texte (régénéré uniquement quand un nouvel octet est capturé).
+    serial_text_cache: String,
+    /// Nombre d'octets contenus dans `serial_text_cache` (détection des nouveaux octets capturés).
+    serial_cached_len: usize,
     /// Mappage clavier des huit boutons du joypad, dans the order of the indices
     /// (`crate::joypad::KEY_A`…`crate::joypad::KEY_DOWN`) ; `None` = non mappé.
     key_map: [Option<egui::Key>; 8],
@@ -158,7 +164,10 @@ impl FarquaadGBApp {
         });
 
         let mut this = Self {
-            emulator: Emulator::new(),
+            // Séquence de démarrage par défaut : la boot ROM (rom/Boot_room.gb, repli embarqué) est mappée à
+            // $0000-$00FF et le CPU démarre à $0000 — comme sur le matériel réel. Sans cartouche valide, elle
+            // échoue sa vérification du logo et tourne en boucle infinie (écran noir), comme une console vide.
+            emulator: Emulator::new_with_boot(),
             rom_name: None,
             state: EmulationState::Stopped,
             // Vue épurée par défaut : seul le panneau ROM Info est actif (les autres widgets se
@@ -168,6 +177,10 @@ impl FarquaadGBApp {
             show_io_map: false,
             show_pattern_table: false,
             show_input_mapping: false,
+            // Vue épurée par défaut : la fenêtre Serial Monitor se réactive depuis the menu « 🔍 Debug ».
+            show_serial_monitor: false,
+            serial_text_cache: String::new(),
+            serial_cached_len: 0,
             key_map: [None; 8],
             capturing_button: None,
             texture: None,
@@ -198,11 +211,13 @@ impl FarquaadGBApp {
     }
 
     /// Charge une ROM depuis the disque dans l'émulateur (partagée entre la boîte de dialogue
-    /// et the argument de ligne de commande).
+    /// et the argument de ligne de commande). La séquence de démarrage par défaut est la boot ROM réelle :
+    /// elle s'exécute d'abord à $0000, valide le logo de la cartouche puis dé-mappe via rBANK ($FF50) avant
+    /// que le jeu ne démarre à $0100.
     fn load_rom_file(&mut self, path: &std::path::Path) {
         match std::fs::read(path) {
             Ok(data) => {
-                self.emulator.load_rom(data);
+                self.emulator.load_rom_with_boot(data);
                 self.rom_name = path.file_name().and_then(|n| n.to_str()).map(String::from);
                 self.state = EmulationState::Running; // démarrage immédiat (séquence de boot + jeu)
                 log::info!("ROM chargée : {:?}", path);
@@ -412,6 +427,9 @@ impl FarquaadGBApp {
                     ui.checkbox(&mut self.show_pattern_table, "Pattern Table");
                     ui.separator();
                     ui.checkbox(&mut self.show_input_mapping, "Input Mapping");
+                    ui.separator();
+                    // Fenêtre « 🔌 Serial Monitor » : sortie du port série pour le debug des ROMs de test.
+                    ui.checkbox(&mut self.show_serial_monitor, "Serial Monitor");
                 });
                 ui.separator();
                 match &self.rom_name {
@@ -908,6 +926,83 @@ impl FarquaadGBApp {
             self.save_input_config();
         }
     }
+
+    /// Dessine la fenêtre « 🔌 Serial Monitor » : sortie en direct du port série (registres SB/SC,
+    /// dernière ligne complète et transcript des octets émis) pour le debug des ROMs de test
+    /// (GBCTR / cpu_instrs). La ROM n'est pas décompilée : seules les octes transmis sur le câble
+    /// link sont affichés, avec la même convention que l'affichage stdout (`serial.rs`).
+    fn show_serial_monitor_window(&mut self, ctx: &egui::Context) {
+        // Régénère le transcript rendu uniquement quand de nouveaux octets ont été capturés (ou vidés).
+        let serial = &self.emulator.mmu.serial;
+        if serial.transcript_len() != self.serial_cached_len {
+            self.serial_text_cache = serial.rendered_transcript();
+            self.serial_cached_len = serial.transcript_len();
+        }
+
+        // Valeurs d'en-tête copiées (la closure ci-dessous emprunte `self` mutablement pour le bouton « Clear »).
+        let sb = self.emulator.mmu.serial.sb;
+        let sc = self.emulator.mmu.serial.sc;
+        let last_line = self.emulator.mmu.serial.last_line().to_owned();
+
+        egui::Window::new("🔌 Serial Monitor")
+            .open(&mut self.show_serial_monitor)
+            .default_size([600.0, 420.0])
+            .show(ctx, |ui| {
+                // En-tête : registres SB/SC + compteur d'octets + bouton « Clear » (à droite).
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("SB ($FF01)").color(Color32::YELLOW));
+                    ui.monospace(format!("{sb:02X}"));
+                    ui.add_space(8.0);
+                    let transfer_active = sc & 0x80 != 0; // bit 7 : transfert en cours (PanDocs)
+                    ui.label(egui::RichText::new("SC ($FF02)").color(Color32::YELLOW));
+                    ui.colored_label(
+                        if transfer_active { Color32::GREEN } else { Self::DIM_GRAY },
+                        format!("{sc:02X}"),
+                    );
+                    if transfer_active {
+                        ui.weak("(transfert en cours)");
+                    }
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(format!("{} octets", self.serial_cached_len))
+                            .color(Color32::CYAN),
+                    );
+                    // Bouton « Clear » à droite de la ligne (vide le transcript, pas les registres).
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("🗑 Clear").clicked() {
+                            self.emulator.mmu.serial.clear_transcript();
+                            self.serial_text_cache.clear();
+                            self.serial_cached_len = 0;
+                        }
+                    });
+                });
+
+                // Dernière ligne complète reçue (statut d'un coup d'œil, ex. « All tests passed! »).
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Dernière ligne").color(Color32::YELLOW));
+                    if last_line.is_empty() {
+                        ui.weak("—");
+                    } else {
+                        ui.monospace(&last_line);
+                    }
+                });
+
+                ui.separator();
+
+                // Transcript complet (monospace, défilement calé sur le bas comme un terminal).
+                egui::ScrollArea::vertical()
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        if self.serial_text_cache.is_empty() {
+                            ui.weak(
+                                "Aucune sortie série — exécutez une ROM de test (GBCTR / cpu_instrs) pour voir ses résultats ici.",
+                            );
+                        } else {
+                            ui.monospace(&self.serial_text_cache);
+                        }
+                    });
+            });
+    }
 }
 
 impl eframe::App for FarquaadGBApp {
@@ -1048,5 +1143,8 @@ impl eframe::App for FarquaadGBApp {
 
         // Window « ⌨️ Input Mapping » (keyboard mapping → joypad $FF00).
         self.show_input_mapping_window(ctx);
+
+        // Window « 🔌 Serial Monitor » : live output of the serial port (SB/SC + transcript) for debugging test ROMs.
+        self.show_serial_monitor_window(ctx);
     }
 }

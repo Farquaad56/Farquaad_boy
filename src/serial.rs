@@ -14,6 +14,9 @@
 //! `tick()` lève l'interruption série (bit 3 du registre IF : $FF0F |= $08) — géré par
 //! emulator.rs. SB se lit alors $FF (câble débranché → bits reçus tous à 1, PanDocs « Disconnects »).
 //! En mode esclave (bit 0 = 0), le transfert reste en attente indéfiniment : aucun appareil hôte ne fournit d'horloge.
+//!
+//! Le transcript complet des octets émis est aussi exposé à l'interface (fenêtre « 🔌 Serial Monitor »
+//! activable depuis the menu Debug) : la ROM de test n'y est pas décompilée, seules les octes transmis sur le câble link y sont affichés.
 
 use std::io::{self, Write};
 
@@ -65,7 +68,7 @@ impl Serial {
     /// - bit 7 seul (SC = $80, horloge externe / esclave) : the transfer reste en attente d'une horloge which n'arrivera jamais ; le bit 7 se lit à 1.
     /// Seuls les bits 7 and 0 are écriturables sur DMG.
     pub fn write_sc(&mut self, value: u8) {
-        // Bit 7 = Transfer Start Flag : seuls the bits 7 and 0 are pris en compte (DMG).
+        // Bit 7 = Transfer Start Flag : seuls les bits 7 et 0 sont pris en compte (DMG).
         self.sc = (self.sc & !0x81) | (value & 0x81);
 
         if self.sc & 0x80 == 0 {
@@ -158,8 +161,36 @@ impl Serial {
         std::mem::take(&mut self.transcript)
     }
 
-    /// Dernière ligne complète reçue sur le port link (« » si aucune).
-    #[allow(dead_code)] // Réserve : la section « Serial » du widget retiré était son seul usage hors tests.
+    /// Nombre d'octets capturés depuis le dernier reset/clear (compteur de la fenêtre « 🔌 Serial Monitor »).
+    pub fn transcript_len(&self) -> usize {
+        self.transcript.len()
+    }
+
+    /// Rend le transcript complet en texte lisible pour the fenêtre « 🔌 Serial Monitor » : ASCII
+    /// imprimable tel quel, `0x0A` → newline, tout autre octet en hexadécimal `[XX]` — même
+    /// convention que l'affichage stdout de [`Self::write_sc`]. La ROM n'est pas décompilée : seules
+    /// les octes émis sur le câble link sont affichés.
+    pub fn rendered_transcript(&self) -> String {
+        let mut text = String::new();
+        for &byte in &self.transcript {
+            match byte {
+                0x20..=0x7E => text.push(byte as char),
+                0x0A => text.push('\n'),
+                0x0D => {} // retour chariot Windows : ignoré (les ROMs n'envoient que \n)
+                _ => text.push_str(&format!("[{:02X}]", byte)),
+            }
+        }
+        text
+    }
+
+    /// Vide le transcript et la ligne en cours d'assemblage (bouton « Clear » de the fenêtre UI) ;
+    /// les registres SB/SC eux-mêmes ne sont pas touchés.
+    pub fn clear_transcript(&mut self) {
+        self.transcript.clear();
+        self.line.clear();
+    }
+
+    /// Dernière ligne complète reçue sur le port link (« » si aucune) — affichée dans the fenêtre « 🔌 Serial Monitor ».
     pub fn last_line(&self) -> &str {
         &self.last_line
     }
