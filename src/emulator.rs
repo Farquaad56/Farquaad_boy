@@ -192,18 +192,6 @@ impl Emulator {
             );
         }
 
-        // --- Diagnostic temporaire : "battement de cœur" PC/LCDC/LY toutes les 100 000 instructions — continue à
-        //     battre même quand la PPU est gelée (LCD éteint) et qu'aucune frame ne se complète plus. ---
-        if self.instructions % 100_000 == 0 {
-            log::debug!(
-                "[TRACEUR] PC=${:04X}, LCDC=${:02X}, LY={}, mode={}",
-                self.cpu.pc,
-                self.mmu.read(0xFF40),
-                self.mmu.ppu.ly,
-                self.mmu.ppu.mode,
-            );
-        }
-
         // La PPU avance du même nombre de T-cycles (timing LY/mode, Pan Docs « Rendering ») et dessine
         // chaque scanline à la fin du mode Drawing : le rendu est donc incrémental, plus par frame. Le
         // framebuffer est toujours à jour après ce pas ; app.rs le présente tel quel. La transition LCD
@@ -241,14 +229,6 @@ impl Emulator {
                 self.mmu.read(0xFFFF), // registre IE ($FFFF) : sources d'interruption activées
             );
 
-            // --- Diagnostic temporaire : état LCDC/LY à la frontière de frame — si le bit 7 du LCDC est à 0,
-            //     la PPU est gelée et LY n'atteindra jamais 144 (Gekkio PDF §9). ---
-            log::debug!(
-                "[TRACEUR] LCDC=${:02X}, LY={}",
-                self.mmu.read(0xFF40),
-                self.mmu.ppu.ly,
-            );
-
             // --- Boot ROM DMG émulée logiciellement (GBCTR Chapter 7) : on compte les frames vidéo pendant
             //     qu'elle est encore mappée ; une fois sa séquence d'~1 s écoulée, elle se dé-mappe elle-même
             //     via rBANK et le hand-off vers le code cartouche à $0100 a lieu. ---
@@ -263,7 +243,6 @@ impl Emulator {
         // Les requêtes d'interruption PPU en attente lèvent les bits correspondants de IF ($FF0F).
         let ppu_irq = self.mmu.ppu.take_interrupts();
 
-        // LOG CRITIQUE
         if ppu_irq != 0 {
             log::debug!(
                 "[PPU] IRQ raised: ${:02X}, IF before: ${:02X}, LY={}, mode={}",
@@ -382,7 +361,7 @@ mod tests {
     use super::*;
     use crate::cpu::flags::Flags;
     use crate::mmu::DMA_OAM_CYCLES;
-    use crate::ppu::{DOTS_PER_LINE, SCREEN_WIDTH, STAT_IRQ_LYC, STAT_IRQ_VBLANK};
+    use crate::ppu::{DOTS_PER_LINE, SCREEN_HEIGHT, SCREEN_WIDTH, STAT_IRQ_LYC, STAT_IRQ_VBLANK};
 
     #[test]
     fn boot_state_after_load_rom() {
@@ -904,6 +883,140 @@ mod tests {
                 text,
                 emu.cpu.pc
             );
+        }
+    }
+
+    /// Smoke test visuel headless : charge la ROM réelle Tetris.GB (NROM 32 KiB) et vérifie que le rendu du
+    /// Background produit un écran varié — VRAM initialisée par le jeu, palette BGP modifiée depuis sa valeur
+    /// post-boot, framebuffer multi-teintes. Chaque point de contrôle est imprimé en art ASCII pour inspection
+    /// visuelle (`cargo test -- --nocapture`) : c'est exactement l'image que présente le panneau « Output » du GUI.
+    #[test]
+    fn tetris_rom_renders_a_varied_background_headless() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("rom")
+            .join("Sans MBC_(NROM)")
+            .join("Tetris.GB");
+        let rom = match std::fs::read(&path) {
+            Ok(data) => data,
+            Err(err) => {
+                eprintln!("smoke test ignoré : impossible de lire {} ({err})", path.display());
+                return; // la ROM n'est pas versionnée — le test ne doit pas casser les builds qui n'ont pas la ROM
+            }
+        };
+
+        let mut emu = Emulator::new();
+        emu.load_rom_with_boot(rom);
+
+        // Points de contrôle en frames : fin de la boot ROM (~1 s), puis ~3 s, ~5 s et ~10 s de temps de jeu.
+        let mut frame = 0u32;
+        for &target in &[60u32, 180, 300, 600] {
+            while frame < target {
+                emu.run_frame();
+                frame += 1;
+            }
+            dump_tetris_checkpoint(&emu, target);
+            // Échantillon en milieu de frame (demi-frame) : si la PPU avance normalement, LY ne doit plus être à 0.
+            emu.run_tcycles(FRAME_TCYCLES / 2);
+            println!(
+                "    + demi-frame : t_cycles={} LY={:03} mode={} IF=${:02X} IE=${:02X} IME={} halted={}",
+                emu.t_cycles,
+                emu.mmu.ppu.ly,
+                emu.mmu.ppu.mode,
+                emu.mmu.read(0xFF0F),
+                emu.mmu.read(0xFFFF),
+                emu.cpu.ime,
+                emu.mmu.cpu_halted
+            );
+            // Échantillonnage fin du PC dans la frame suivante : révèle si le CPU cycle ou est figé.
+            for i in 1..=8 {
+                emu.run_tcycles(FRAME_TCYCLES / 8);
+                println!(
+                    "    + {}×1/8 frame : t_cycles={} PC=${:04X} A=${:02X} LY={:03}",
+                    i,
+                    emu.t_cycles,
+                    emu.cpu.pc,
+                    emu.cpu.a,
+                    emu.mmu.ppu.ly
+                );
+            }
+        }
+
+        // Après ~10 s de temps de jeu, Tetris a initialisé sa VRAM et sa palette : l'écran n'est plus uniforme.
+        let lcdc = emu.mmu.ppu.lcdc;
+        assert!(lcdc & 0x80 != 0, "le LCD doit être allumé (LCDC=${:02X})", lcdc);
+        assert!(lcdc & 0x01 != 0, "la couche Background doit être activée (LCDC=${:02X})", lcdc);
+        assert_ne!(emu.mmu.ppu.bgp, 0xFC, "BGP doit avoir été modifié par le jeu depuis sa valeur post-boot $FC");
+
+        let mut vram_seen = [false; 256];
+        for &byte in emu.mmu.vram.iter() {
+            vram_seen[byte as usize] = true;
+        }
+        assert!(
+            vram_seen.iter().filter(|&&vu| vu).count() >= 8,
+            "la VRAM ne doit plus être uniforme (valeur power-on $FF)"
+        );
+
+        let mut colors: std::collections::BTreeMap<u32, usize> = std::collections::BTreeMap::new();
+        for &px in emu.mmu.ppu.framebuffer.iter() {
+            *colors.entry(px).or_insert(0) += 1;
+        }
+        assert!(
+            colors.len() >= 3,
+            "le framebuffer doit montrer au moins 3 couleurs distinctes ({} obtenues)",
+            colors.len()
+        );
+    }
+
+    /// Imprime l'état d'un point de contrôle du smoke test Tetris : registres PPU, histogramme VRAM et art ASCII
+    /// de l'écran (1 caractère par pixel : `.`/`:`/`o`/`#` = teintes 0..3 DMG, espace = noir).
+    fn dump_tetris_checkpoint(emu: &Emulator, frame: u32) {
+        let ppu = &emu.mmu.ppu;
+        println!(
+            "\n=== Tetris.GB @ frame {} (~{} s) : PC=${:04X} LCDC=${:02X} BGP=${:02X} SCX={:03} SCY={:03} LY={:03} mode={} ===",
+            frame,
+            frame / 60,
+            emu.cpu.pc,
+            ppu.lcdc,
+            ppu.bgp,
+            ppu.scx,
+            ppu.scy,
+            ppu.ly,
+            ppu.mode
+        );
+
+        // Histogramme VRAM : les 8 valeurs les plus fréquentes d'abord.
+        let mut counts = [0usize; 256];
+        for &byte in emu.mmu.vram.iter() {
+            counts[byte as usize] += 1;
+        }
+        let top: Vec<(u8, usize)> = counts
+            .iter()
+            .enumerate()
+            .map(|(v, &c)| (v as u8, c))
+            .filter(|&(_, c)| c > 0)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev() // les plus fréquentes d'abord
+            .take(8)
+            .collect();
+        println!("VRAM (top valeurs par fréquence) : {}", top.iter().map(|&(v, c)| format!("${:02X}×{}", v, c)).collect::<Vec<_>>().join(" "));
+
+        // Art ASCII de l'écran : 1 caractère par pixel.
+        let shade_char = |px: u32| -> char {
+            for i in 0..4usize {
+                if px == PPU::shade(i as u8) {
+                    return ['.', ':', 'o', '#'][i];
+                }
+            }
+            ' ' // noir (aucune couche) ou couleur inconnue
+        };
+        for y in 0..SCREEN_HEIGHT {
+            let row: String = emu.mmu.ppu.framebuffer[y * SCREEN_WIDTH..(y + 1) * SCREEN_WIDTH]
+                .iter()
+                .map(|&px| shade_char(px))
+                .collect();
+            println!("{row}");
         }
     }
 

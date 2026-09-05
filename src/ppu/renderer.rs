@@ -18,18 +18,12 @@ impl PPU {
     pub fn render_frame(&mut self, vram: &[u8; 0x2000], oam: &[u8; 0xA0]) {
         if self.lcdc & LCDC_LCD_ON == 0 {
             self.framebuffer.fill(0xFF00_0000); // LCD éteint : écran noir
-            self.last_uniform_shade = 0xFF00_0000;
             return;
         }
 
         for y in 0..SCREEN_HEIGHT as u32 {
             self.render_scanline(y as u8, vram, oam); // y < SCREEN_HEIGHT (144) : le cast en u8 est sûr
         }
-
-        // Diagnostic : teinte unique si l'écran est uniforme ($FFFFFFFF sinon).
-        let first = self.framebuffer[0];
-        let uniform = self.framebuffer.iter().all(|&px| px == first);
-        self.last_uniform_shade = if uniform { first } else { !0u32 };
     }
 
     /// Dessine la scanline `ly` (lignes 0..143 visibles) dans le framebuffer : Background (défilement SCX/SCY, carte
@@ -94,10 +88,6 @@ impl PPU {
         } else {
             // Couche Background éteinte : base noire.
             self.framebuffer[row_start..row_start + SCREEN_WIDTH].fill(0xFF00_0000);
-            // --- DIAGNOSTIC TEMPORAIRE (Cause C) : pas de fond sur la ligne 0 → base noire.
-            if ly == 0 {
-                log::debug!("Dessin ligne 0 : Background éteint (bit 0 du LCDC à 0) — base noire");
-            }
         }
 
         // Fenêtre : pas de défilement ; elle apparaît à partir of the ligne WY et of the colonne WX+1 (Pan Docs « Window »).

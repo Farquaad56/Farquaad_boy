@@ -65,8 +65,6 @@ pub struct PPU {
 
     /// Requêtes d'interruption PPU en attente, consommées par `take_interrupts`.
     pending_irq: u8,
-    /// Diagnostic : teinte unique of the frame précédente si l'écran était uniforme ($FFFFFFFF = non uniforme).
-    last_uniform_shade: u32,
 
     /// Framebuffer écran (couleurs RGBA sur 32 bits, R dans l'octet le plus bas — compatible zero-copy egui/bytemuck).
     pub framebuffer: [u32; SCREEN_WIDTH * SCREEN_HEIGHT],
@@ -95,7 +93,6 @@ impl PPU {
             mode_clock: 0, // début of the scanline 0 (OAM Scan)
             mode: 2,       // OAM Scan : LCD allumé, line 0
             pending_irq: 0x00,
-            last_uniform_shade: !0u32, // aucune uniformité détectée avant the première frame rendue
             framebuffer: [0xFF00_0000; SCREEN_WIDTH * SCREEN_HEIGHT], // noir opaque (aucune frame rendue)
         }
     }
@@ -174,7 +171,6 @@ impl PPU {
         self.mode_clock = 0;
         self.update_stat_mode();
         self.framebuffer.fill(0xFF00_0000); // écran noir
-        self.last_uniform_shade = 0xFF00_0000;
     }
 
     /// Renvoie les requêtes d'interruption PPU en attente and les efface (Pan Docs « Interrupt Sources ») :
