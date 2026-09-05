@@ -5,6 +5,7 @@
 
 mod app;
 mod apu;
+mod bootrom;
 mod cartridge;
 mod cpu;
 mod emulator;

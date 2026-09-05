@@ -48,6 +48,22 @@ impl Emulator {
         self.power_on();
     }
 
+    /// Charge une ROM `.gb` and starts execution from the **real DMG boot ROM** (PanDocs « Boot ROM » /
+    /// GBCTR Chapter 7): the 256-byte boot ROM is mapped at $0000-$00FF, PC starts at $0000. It validates
+    /// the cartridge logo ($0104-$0133), scrolls it to screen and plays a "di-ding", then writes an odd
+    /// value to rBANK ($FF50) to unmap itself before the game code runs at $0100 — so the game starts from
+    /// the true post-boot state. Use this for real cartridges; unit tests that want to jump straight into
+    /// game code should use [`Emulator::load_rom`] (post-boot hand-off at $0100) instead. Dans ce crate
+    /// binaire, seules les unit tests l'appellent d'où `#[allow(dead_code)]`.
+    #[allow(dead_code)]
+    pub fn load_rom_with_boot(&mut self, data: Vec<u8>) {
+        self.mmu.load_rom(data);
+        self.power_on();
+        // Override the post-boot hand-off with the true power-on state: execute the boot ROM from $0000.
+        self.cpu.pc = 0x0000;
+        self.mmu.boot_rom_finished = false;
+    }
+
     /// Redémarre le système à l'état power-on post-boot ROM ; la ROM chargée est conservée (bouton « ⏹ Stop »).
     pub fn reset(&mut self) {
         self.power_on();
@@ -89,7 +105,7 @@ impl Emulator {
         self.mmu.write(0xFF07, 0xF8); // TAC ($FF07) : bits 7-3 toujours lus à 1 → timer désactivé au hand-off (seuls les bits 2-0 sont écrits).
 
         // Registres PPU
-        self.mmu.write(0xFF40, 0x91); // LCDC ($FF40) : LCD ON (bit 7), background and window enabled (bit 0), tuiles non signées $8000-$8FFF (bit 4), carte $9800-$9BFF.
+        self.mmu.write(0xFF40, 0x91); // LCDC ($FF40) : LCD ON (bit 7), tuiles signées $8800-$97FF (bit 4), fond activé (bit 0), carte $9800-$9BFF.
                                       // STAT ($FF41) left at the hardware default ($00): l'entrée en VBlank lève désormais le drapeau VBlank
                                       // (bit 0 de IF) inconditionnellement, so forcing STAT=$20 is no longer needed for a game that never configures
                                       // STAT to wake from HALT — the flag will be raised at each frame anyway.
@@ -130,6 +146,18 @@ impl Emulator {
             );
         }
 
+        // --- Diagnostic temporaire : "battement de cœur" PC/LCDC/LY toutes les 100 000 instructions — continue à
+        //     battre même quand la PPU est gelée (LCD éteint) et qu'aucune frame ne se complète plus. ---
+        if self.instructions % 100_000 == 0 {
+            log::debug!(
+                "[TRACEUR] PC=${:04X}, LCDC=${:02X}, LY={}, mode={}",
+                self.cpu.pc,
+                self.mmu.read(0xFF40),
+                self.mmu.ppu.ly,
+                self.mmu.ppu.mode,
+            );
+        }
+
         // La PPU avance du même nombre de T-cycles (timing LY/mode, Pan Docs « Rendering ») et dessine
         // chaque scanline à la fin du mode Drawing : le rendu est donc incrémental, plus par frame. Le
         // framebuffer est toujours à jour après ce pas ; app.rs le présente tel quel. La transition LCD
@@ -142,6 +170,38 @@ impl Emulator {
         };
         if frame_done {
             log::debug!("[PPU] Frame boundary crossed at t_cycles={}", self.t_cycles);
+
+            // --- Traceur de PC amélioré : si l'opcode au PC est $F0 (LDH), on lit l'octet suivant pour
+            //     voir l'adresse I/O ciblée ($FFnn) — permet d'identifier le registre lu/écrit. ---
+            let opcode = self.mmu.read(self.cpu.pc);
+            let operand = if opcode == 0xF0 {
+                format!(
+                    "(n=${:02X} -> Addr=$FF{:02X})",
+                    self.mmu.read(self.cpu.pc + 1),
+                    self.mmu.read(self.cpu.pc + 1)
+                )
+            } else {
+                String::new()
+            };
+
+            log::debug!(
+                "[TRACEUR] Frame rendue. CPU: PC=${:04X}, Opcode=${:02X} {}, SP=${:04X}, IME={}, IF=${:02X}, IE=${:02X}",
+                self.cpu.pc,
+                opcode,
+                operand,
+                self.cpu.sp,
+                self.cpu.ime,
+                self.mmu.read(0xFF0F), // registre IF ($FF0F) : bits 0-4 drapeaux + bit 5 halted (read-only)
+                self.mmu.read(0xFFFF), // registre IE ($FFFF) : sources d'interruption activées
+            );
+
+            // --- Diagnostic temporaire : état LCDC/LY à la frontière de frame — si le bit 7 du LCDC est à 0,
+            //     la PPU est gelée et LY n'atteindra jamais 144 (Gekkio PDF §9). ---
+            log::debug!(
+                "[TRACEUR] LCDC=${:02X}, LY={}",
+                self.mmu.read(0xFF40),
+                self.mmu.ppu.ly,
+            );
         }
         // Les requêtes d'interruption PPU en attente lèvent les bits correspondants de IF ($FF0F).
         let ppu_irq = self.mmu.ppu.take_interrupts();
@@ -355,7 +415,7 @@ mod tests {
         for addr in 0x9800..=0x9BFF {
             emu.mmu.write(addr, 1);
         }
-        emu.mmu.write(0xFF40, 0x91); // LCD allumé + background and window enabled (bit 0) ; tuiles non signées $8000-$8FFF (bit 4), carte $9800-$9BFF
+        emu.mmu.write(0xFF40, 0x81); // LCD allumé (bit 7) + fond activé (bit 0) ; tuiles non signées $8000-$8FFF (bit 4 à 0), carte $9800-$9BFF
         emu.mmu.write(0xFF47, 0xE4); // BGP : teinte v pour une valeur de pixel v
 
         emu.run_frame(); // une frame vidéo : le rendu est mis à jour à la frontière de frame
@@ -757,5 +817,93 @@ mod tests {
             assert_eq!(emu.mmu.read(0xFE00 + i), (i as u8) ^ 0x5A); // OAM = contenu de $C000-$C09F
         }
         assert_eq!(emu.mmu.read(0xFF46), 0xC0); // le registre DMA mémorise l'adresse source
+    }
+
+    /// The real DMG boot ROM (PanDocs « Boot ROM » / GBCTR Chapter 7) executes from $0000, validates the
+    /// cartridge logo ($0104-$0133), then writes an odd value to rBANK ($FF50) to unmap itself before the
+    /// game code runs at $0100 — so a valid cartridge starts from the true post-boot state.
+    #[test]
+    fn boot_rom_validates_logo_and_unmaps_via_rbank() {
+        // 32 KiB ROM filled with $FF, carrying a valid Nintendo logo at $0104-$0133 (the exact 48 bytes
+        // the real DMG boot ROM compares against — see `bootrom::DMG_BOOT_ROM` offsets $C8-$F7).
+        let mut rom = vec![0xFF; 0x8000];
+        let logo: [u8; 48] = [
+            0xCE, 0xED, 0x66, 0x66, 0xCC, 0x0D, 0x00, 0x0B, 0x03, 0x73, 0x00, 0x83,
+            0x00, 0x0C, 0x00, 0x0D, 0x00, 0x08, 0x11, 0x1F, 0x88, 0x89, 0x00, 0x0E,
+            0xDC, 0xCC, 0x6E, 0xE6, 0xDD, 0xDD, 0xD9, 0x99, 0xBB, 0xBB, 0x67, 0x63,
+            0x6E, 0x0E, 0xEC, 0xCC, 0xDD, 0xDC, 0x99, 0x9F, 0xBB, 0xB9, 0x33, 0x3E,
+        ];
+        rom[0x0104..0x0104 + logo.len()].copy_from_slice(&logo);
+
+        let mut emu = Emulator::new();
+        emu.load_rom_with_boot(rom);
+        assert!(!emu.mmu.boot_rom_finished); // boot ROM still mapped at power-on (BOOT_OFF=0)
+        assert_eq!(emu.cpu.pc, 0x0000); // execution starts from the boot ROM
+
+        // The real DMG boot ROM takes ~1 s (≈60 frames) to scroll the logo and play its sound before it
+        // writes rBANK; run a generous margin (2 s = 120 frames), in one-frame chunks, stopping as soon as
+        // it unmapped itself.
+        let mut t: u64 = 0;
+        while !emu.mmu.boot_rom_finished && t < FRAME_TCYCLES * 120 {
+            let chunk = std::cmp::min(FRAME_TCYCLES, FRAME_TCYCLES * 120 - t);
+            emu.run_tcycles(chunk);
+            t += chunk;
+        }
+
+        assert!(emu.mmu.boot_rom_finished, "the boot ROM must unmap itself by writing an odd value to rBANK ($FF50)");
+        // After unmapping, execution continues at $0100 (the game code), not in the boot ROM region.
+        assert!(emu.cpu.pc >= 0x0100 && emu.cpu.pc < 0x8000, "PC must be in cartridge space after hand-off: ${:04X}", emu.cpu.pc);
+        // rBANK reads back as 0xFF once BOOT_OFF=1 (bits 7-1 read as 1).
+        assert_eq!(emu.mmu.read(0xFF50), 0xFF);
+    }
+
+    #[test]
+    fn diag_boot_rom_trajectory() {
+        let mut rom = vec![0xFF; 0x8000];
+        let logo: [u8; 48] = [
+            0xCE, 0xED, 0x66, 0x66, 0xCC, 0x0D, 0x00, 0x0B, 0x03, 0x73, 0x00, 0x83,
+            0x00, 0x0C, 0x00, 0x0D, 0x00, 0x08, 0x11, 0x1F, 0x88, 0x89, 0x00, 0x0E,
+            0xDC, 0xCC, 0x6E, 0xE6, 0xDD, 0xDD, 0xD9, 0x99, 0xBB, 0xBB, 0x67, 0x63,
+            0x6E, 0x0E, 0xEC, 0xCC, 0xDD, 0xDC, 0x99, 0x9F, 0xBB, 0xB9, 0x33, 0x3E,
+        ];
+        rom[0x0104..0x0104 + logo.len()].copy_from_slice(&logo);
+
+        let mut emu = Emulator::new();
+        emu.load_rom_with_boot(rom);
+        let mut reported_unmap: Option<u32> = None;
+        for frame in 0..3000 {
+            emu.run_tcycles(FRAME_TCYCLES);
+            if emu.mmu.boot_rom_finished && reported_unmap.is_none() {
+                reported_unmap = Some(frame);
+                println!(
+                    ">>> boot ROM unmapped at frame {}: PC=${:04X} AF=${:02X}{:02X} BC=${:02X}{:02X} DE=${:02X}{:02X} HL=${:02X}{:02X} SP=${:04X}",
+                    frame, emu.cpu.pc, emu.cpu.a, emu.cpu.f, emu.cpu.b, emu.cpu.c,
+                    emu.cpu.d, emu.cpu.e, emu.cpu.h, emu.cpu.l, emu.cpu.sp,
+                );
+            }
+            if reported_unmap.is_some() && frame as u32 - reported_unmap.unwrap() > 5 { break; }
+        }
+        println!(
+            "final: finished={} unmap_frame={:?} PC=${:04X}",
+            emu.mmu.boot_rom_finished, reported_unmap, emu.cpu.pc,
+        );
+    }
+
+    /// A cartridge with an invalid logo must NOT be treated as valid by the boot ROM: on real hardware the
+    /// DMG boot ROM shows an error pattern instead of the normal logo. We verify the boot ROM still runs and
+    /// eventually unmapped itself (it does not hard-halt), but via a different code path than a valid logo.
+    #[test]
+    fn boot_rom_runs_even_with_invalid_logo() {
+        let rom = vec![0xFF; 0x8000]; // no Nintendo logo at $0104-$0133 (all $FF) → invalid
+        let mut emu = Emulator::new();
+        emu.load_rom_with_boot(rom);
+
+        let mut t: u64 = 0;
+        while !emu.mmu.boot_rom_finished && t < FRAME_TCYCLES * 120 {
+            let chunk = std::cmp::min(FRAME_TCYCLES, FRAME_TCYCLES * 120 - t);
+            emu.run_tcycles(chunk);
+            t += chunk;
+        }
+        assert!(emu.mmu.boot_rom_finished, "the boot ROM must still unmap itself even for an invalid logo");
     }
 }

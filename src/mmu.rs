@@ -60,6 +60,15 @@ pub struct MMU {
     /// En-tête de cartouche ($0100-$014F) analysé au chargement ; None tant qu'aucune ROM n'est chargée.
     pub cartridge: Option<CartridgeHeader>,
 
+    // --- Boot ROM (PanDocs « Boot ROM » / GBCTR Chapter 7) ---
+    /// Image de la boot ROM DMG/MGB réelle (256 octets), mappée à $0000-$00FF au power-on : le CPU
+    /// démarre à $0000 et l'exécute ; tant que `boot_rom_finished` est faux, les lectures de
+    /// $0000-$00FF sont servies par cette image et les écritures de cette zone sont ignorées.
+    pub boot_rom: [u8; 0x100],
+    /// Registre rBANK ($FF50), bit 0 « BOOT_OFF » : une fois à 1 (écriture impaire), la boot ROM est
+    /// définitivement dé-mappée jusqu'au prochain reset. Lecture de $FF50 = `0xFE | BOOT_OFF`.
+    pub boot_rom_finished: bool,
+
     // --- Transfert DMA OAM en cours (Pan Docs « OAM DMA Transfer ») ---
     /// M-cycles restants du transfert OAM déclenché par l'écriture de $FF46 (0 = aucun transfert).
     pub dma_remaining: u32,
@@ -153,10 +162,22 @@ impl MMU {
     /// Pendant le DMA OAM, seule la HRAM ($FF80-$FFFE) est accessible au CPU : les autres lectures
     /// renvoient $FF (conflit de bus — Pan Docs « OAM DMA Transfer »).
     pub fn read(&self, addr: u16) -> u8 {
+        // Boot ROM mapping (PanDocs « Boot ROM » / GBCTR Chapter 7): while BOOT_OFF=0 ($FF50 bit 0),
+        // $0000-$00FF is served by the boot ROM image instead of the cartridge; reads of $0100+ still reach it.
+        if !self.boot_rom_finished && addr < 0x100 {
+            return self.boot_rom[addr as usize];
+        }
         if self.dma_active() && !Self::is_hram(addr) {
             return 0xFF; // Bus occupé par le transfert OAM : lecture CPU bloquée.
         }
-        self.read_plain(addr)
+        let value = self.read_plain(addr);
+
+        // --- Diagnostic temporaire : on force un print standard pour contourner tout filtre de log. ---
+        if addr == 0xFF44 {
+            println!("🚨 PREUVE : Le CPU lit $FF44 ! LY actuel = {}", self.ppu.ly);
+        }
+
+        value
     }
 
     /// Lit un octet sur toute la carte d'adresses sans appliquer le conflit de bus du DMA OAM —
@@ -186,6 +207,8 @@ impl MMU {
             0xFF05 => self.timer.read_tima(),
             0xFF06 => self.timer.read_tma(),
             0xFF07 => self.timer.read_tac(),
+            // Registre LY ($FF44) : routé explicitement vers la PPU — ne doit jamais tomber dans un cas par défaut.
+            0xFF44 => self.ppu.read_register(0xFF44),
             // Registres PPU (étape 1) : $FF40-$FF4B, dont le DMA OAM ($FF46).
             0xFF40..=0xFF4B => self.ppu.read_register(addr),
             // Registre Joypad (partie 10).
@@ -193,6 +216,8 @@ impl MMU {
             // Registre Interrupt Flag ($FF0F) : bits 0–4 = drapeaux d'interruption, bit 5 = halted (read-only),
             // bits 7-6 non utilisés.
             0xFF0F => self.io[0x0F] | if self.cpu_halted { 0x20 } else { 0 },
+            // Registre rBANK ($FF50, PanDocs « Boot ROM »): bits 7-1 se lisent à 1 ; bit 0 = BOOT_OFF.
+            0xFF50 => 0xFE | u8::from(self.boot_rom_finished),
             // Autres registres I/O.
             0xFF00..=0xFF7F => self.io[(addr - 0xFF00) as usize],
             // High RAM.
@@ -209,6 +234,17 @@ impl MMU {
     pub fn write(&mut self, addr: u16, value: u8) {
         if self.dma_active() && !Self::is_hram(addr) {
             return; // Bus occupé par le transfert OAM : écriture CPU ignorée.
+        }
+        // Boot ROM mapping (PanDocs « Boot ROM » / GBCTR Chapter 7): while BOOT_OFF=0, writes to
+        // $0000-$00FF are ignored (they cannot reach the cartridge/MBC) — only reads are intercepted.
+        if !self.boot_rom_finished && addr < 0x100 {
+            return;
+        }
+        // Registre rBANK ($FF50, PanDocs « Boot ROM »): bit 0 « BOOT_OFF » only transitions 0→1 (once the
+        // boot ROM is unmapped it stays so until reset); bits 7-1 are ignored on write. Reading $FF50 = 0xFE|BOOT_OFF.
+        if addr == 0xFF50 {
+            self.boot_rom_finished |= value & 1 != 0;
+            return;
         }
         match addr {
             // Région ROM : les écritures vont aux registres du contrôleur MBC actif (la ROM est en lecture seule).
@@ -325,6 +361,12 @@ impl Default for MMU {
             joypad: Joypad::default(),
             mbc: Mbc::new(MbcType::RomOnly, 0), // état power-up (aucune ROM chargée) ; remplacé par le type détecté dans `load_rom`.
             cartridge: None,                    // remplacé par l'en-tête analysé dans `load_rom`.
+
+            // Boot ROM (PanDocs « Boot ROM ») : image DMG réelle ; `boot_rom_finished` = rBANK ($FF50) bit 0.
+            // Default à true (dé-mappée) pour que les tests de la carte d'adresses/MBC voient $0000-$00FF comme
+            // une ROM cartouche normale ; `Emulator::load_rom_with_boot` le met à false pour exécuter la boot ROM.
+            boot_rom: crate::bootrom::DMG_BOOT_ROM,
+            boot_rom_finished: true,
             dma_remaining: 0,                   // aucun transfert OAM en cours au power-on.
             dma_source_addr: 0,
             dma_just_started: false,

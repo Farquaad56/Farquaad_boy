@@ -250,7 +250,7 @@ fn inc_dec16(cpu: &mut CPU, idx: u8, delta: i16) -> u32 {
     8
 }
 
-/// ADD HL, rr (16 T-cycles) : N=0, H et C selon l'addition 16 bits ; Z n'est PAS modifié.
+/// ADD HL, rr (8 T-cycles) : N=0, H et C selon l'addition 16 bits ; Z n'est PAS modifié.
 fn add_hl(cpu: &mut CPU, operand: u16) -> u32 {
     let hl = cpu.hl();
     let sum = (hl as u32).wrapping_add(operand as u32);
@@ -267,10 +267,10 @@ fn add_hl(cpu: &mut CPU, operand: u16) -> u32 {
     }
     cpu.set_flags(f);
     set_reg16(cpu, 2, sum as u16);
-    16
+    8
 }
 
-/// ADD SP, e8 (24 T-cycles) : Z=0, N=0 ; H et C calculés sur l'addition non signée de
+/// ADD SP, e8 (16 T-cycles) : Z=0, N=0 ; H et C calculés sur l'addition non signée de
 /// l'octet bas de SP avec `e8` (interprété comme un octet non signé).
 fn add_sp(cpu: &mut CPU, e8: i8) -> u32 {
     let sp_lo = (cpu.sp & 0xFF) as u32;
@@ -287,7 +287,7 @@ fn add_sp(cpu: &mut CPU, e8: i8) -> u32 {
     // e8 est ajouté en arithmétique signée (i8) : modulo 2^16, `e8 as i16 as u16`
     // donne exactement SP + e8 (ex. $FF = -1 → SP-1).
     cpu.sp = cpu.sp.wrapping_add(e8 as i16 as u16);
-    24
+    16
 }
 
 /// LD HL, SP+e8 (12 T-cycles) : Z=0, N=0 ; H et C calculés sur l'addition non signée de
@@ -460,7 +460,7 @@ fn reti(cpu: &mut CPU, mmu: &mut MMU) -> u32 {
     16
 }
 
-/// JP cond,a16 : 16 T-cycles si pris, 10 sinon ; pas de drapeaux. `cpu.pc` pointe sur
+/// JP cond,a16 : 16 T-cycles si pris, 12 sinon ; pas de drapeaux. `cpu.pc` pointe sur
 /// le premier octet de l'immédiat.
 fn jp_cond(cpu: &mut CPU, a16: u16, taken: bool) -> u32 {
     if taken {
@@ -468,7 +468,7 @@ fn jp_cond(cpu: &mut CPU, a16: u16, taken: bool) -> u32 {
         16
     } else {
         cpu.pc = cpu.pc.wrapping_add(2); // passe les deux octets de l'immédiat
-        10
+        12
     }
 }
 
@@ -657,7 +657,7 @@ pub fn execute(cpu: &mut CPU, mmu: &mut MMU, opcode: u8) -> u32 {
             cpu.pc = cpu.pc.wrapping_add(2);
             20
         }
-        0x09 => add_hl(cpu, reg16(cpu, 0)), // ADD HL, BC (16) : N=0 H C, Z inchangé
+        0x09 => add_hl(cpu, reg16(cpu, 0)), // ADD HL, BC (8) : N=0 H C, Z inchangé
         0x0A => ld_mem_r16(cpu, mmu, 0, false), // LD A, (BC) (8)
         0x0B => inc_dec16(cpu, 0, -1),      // DEC BC (8)
         0x0C => inc8(cpu, mmu, 1),          // INC C (4) : Z N H C
@@ -677,7 +677,7 @@ pub fn execute(cpu: &mut CPU, mmu: &mut MMU, opcode: u8) -> u32 {
             let e8 = mmu.read(cpu.pc) as i8;
             jr(cpu, e8, true)
         } // JR e8 (12/4)
-        0x19 => add_hl(cpu, reg16(cpu, 1)),    // ADD HL, DE (16) : N=0 H C, Z inchangé
+        0x19 => add_hl(cpu, reg16(cpu, 1)),    // ADD HL, DE (8) : N=0 H C, Z inchangé
         0x1A => ld_mem_r16(cpu, mmu, 1, false), // LD A, (DE) (8)
         0x1B => inc_dec16(cpu, 1, -1),         // DEC DE (8)
         0x1C => inc8(cpu, mmu, 3),             // INC E (4) : Z N H C
@@ -703,7 +703,7 @@ pub fn execute(cpu: &mut CPU, mmu: &mut MMU, opcode: u8) -> u32 {
             let e8 = mmu.read(cpu.pc) as i8;
             jr(cpu, e8, cond_met(cpu, 1))
         } // JR Z,e8 (12/4)
-        0x29 => add_hl(cpu, cpu.hl()),     // ADD HL, HL (16) : N=0 H C, Z inchangé
+        0x29 => add_hl(cpu, cpu.hl()),     // ADD HL, HL (8) : N=0 H C, Z inchangé
         0x2A => ld_hl_dec(cpu, mmu, false), // LD A, (HL-) (12)
         0x2B => inc_dec16(cpu, 2, -1),     // DEC HL (8)
         0x2C => inc8(cpu, mmu, 5),         // INC L (4) : Z N H C
@@ -729,7 +729,7 @@ pub fn execute(cpu: &mut CPU, mmu: &mut MMU, opcode: u8) -> u32 {
             let e8 = mmu.read(cpu.pc) as i8;
             jr(cpu, e8, cond_met(cpu, 3))
         } // JR C,e8 (12/4)
-        0x39 => add_hl(cpu, cpu.sp),        // ADD HL, SP (16) : N=0 H C, Z inchangé
+        0x39 => add_hl(cpu, cpu.sp),        // ADD HL, SP (8) : N=0 H C, Z inchangé
         0x3A => ld_hl_dec(cpu, mmu, true),  // LD (HL-), A (12)
         0x3B => inc_dec16(cpu, 3, -1),      // DEC SP (8)
         0x3C => inc8(cpu, mmu, 7),          // INC A (4) : Z N H C
@@ -762,7 +762,7 @@ pub fn execute(cpu: &mut CPU, mmu: &mut MMU, opcode: u8) -> u32 {
         0xC2 => {
             let a16 = read_a16(mmu, cpu.pc);
             jp_cond(cpu, a16, cond_met(cpu, 0))
-        } // JP NZ,a16 (16/10)
+        } // JP NZ,a16 (16/12)
         0xC3 => {
             let a16 = read_a16(mmu, cpu.pc);
             cpu.pc = a16;
@@ -790,7 +790,7 @@ pub fn execute(cpu: &mut CPU, mmu: &mut MMU, opcode: u8) -> u32 {
         0xCA => {
             let a16 = read_a16(mmu, cpu.pc);
             jp_cond(cpu, a16, cond_met(cpu, 1))
-        } // JP Z,a16 (16/10)
+        } // JP Z,a16 (16/12)
         0xCB => {
             // CB prefix : sous-opcode à `cpu.pc`
             let sub = mmu.read(cpu.pc);
@@ -817,7 +817,7 @@ pub fn execute(cpu: &mut CPU, mmu: &mut MMU, opcode: u8) -> u32 {
         0xD2 => {
             let a16 = read_a16(mmu, cpu.pc);
             jp_cond(cpu, a16, cond_met(cpu, 2))
-        } // JP NC,a16 (16/10)
+        } // JP NC,a16 (16/12)
         0xD3 => 4, // $D3 : opcode invalide (hard-lock sur le matériel)
         0xD4 => {
             let a16 = read_a16(mmu, cpu.pc);
@@ -835,7 +835,7 @@ pub fn execute(cpu: &mut CPU, mmu: &mut MMU, opcode: u8) -> u32 {
         0xDA => {
             let a16 = read_a16(mmu, cpu.pc);
             jp_cond(cpu, a16, cond_met(cpu, 3))
-        } // JP C,a16 (16/10)
+        } // JP C,a16 (16/12)
         0xDB => 4, // $DB : opcode invalide (hard-lock sur le matériel)
         0xDC => {
             let a16 = read_a16(mmu, cpu.pc);
@@ -864,7 +864,7 @@ pub fn execute(cpu: &mut CPU, mmu: &mut MMU, opcode: u8) -> u32 {
             let e8 = mmu.read(cpu.pc) as i8;
             cpu.pc = cpu.pc.wrapping_add(1);
             add_sp(cpu, e8)
-        } // ADD SP, e8 (24) : Z=0 N=0 H C
+        } // ADD SP, e8 (16) : Z=0 N=0 H C
         0xE9 => {
             cpu.pc = cpu.hl();
             16
@@ -1019,7 +1019,7 @@ fn srl_reg(cpu: &mut CPU, mmu: &mut MMU, idx: u8) -> u32 {
     if idx == 6 { 16 } else { 8 }
 }
 
-/// BIT b,r8 (8 T-cycles, 16 si (HL)) : Z=(bit==0), N=0, H=1 ; C inchangé.
+/// BIT b,r8 (8 T-cycles, 12 si (HL)) : Z=(bit==0), N=0, H=1 ; C inchangé.
 fn bit_reg(cpu: &mut CPU, mmu: &mut MMU, bit: u8, idx: u8) -> u32 {
     let value = get_reg8(cpu, mmu, idx);
     let mut f = Flags::N | Flags::H;
@@ -1030,19 +1030,19 @@ fn bit_reg(cpu: &mut CPU, mmu: &mut MMU, bit: u8, idx: u8) -> u32 {
         f |= Flags::C;
     }
     cpu.set_flags(f);
+    if idx == 6 { 12 } else { 8 }
+}
+
+/// RES b,r8 (8 T-cycles, 16 si (HL)) : efface le bit ; pas de drapeaux.
+fn res_reg(cpu: &mut CPU, mmu: &mut MMU, bit: u8, idx: u8) -> u32 {
+    set_reg8(cpu, mmu, idx, get_reg8(cpu, mmu, idx) & !(1 << bit));
     if idx == 6 { 16 } else { 8 }
 }
 
-/// RES b,r8 (16 T-cycles, 24 si (HL)) : efface le bit ; pas de drapeaux.
-fn res_reg(cpu: &mut CPU, mmu: &mut MMU, bit: u8, idx: u8) -> u32 {
-    set_reg8(cpu, mmu, idx, get_reg8(cpu, mmu, idx) & !(1 << bit));
-    if idx == 6 { 24 } else { 16 }
-}
-
-/// SET b,r8 (16 T-cycles, 24 si (HL)) : pose le bit ; pas de drapeaux.
+/// SET b,r8 (8 T-cycles, 16 si (HL)) : pose le bit ; pas de drapeaux.
 fn set_reg(cpu: &mut CPU, mmu: &mut MMU, bit: u8, idx: u8) -> u32 {
     set_reg8(cpu, mmu, idx, get_reg8(cpu, mmu, idx) | (1 << bit));
-    if idx == 6 { 24 } else { 16 }
+    if idx == 6 { 16 } else { 8 }
 }
 
 /// Exécute le sous-opcode du préfixe CB déjà lu par `execute`.
@@ -1519,7 +1519,7 @@ mod tests {
         cpu.c = 0x20; // BC = $0020
         cpu.set_flags(Flags::Z); // Z n'est PAS modifié par ADD HL, rr.
 
-        assert_eq!(execute(&mut cpu, &mut mmu, 0x09), 16); // ADD HL,BC
+        assert_eq!(execute(&mut cpu, &mut mmu, 0x09), 8); // ADD HL,BC
         assert_eq!(cpu.hl(), 0x0010);
         let f = cpu.flags();
         assert!(f.contains(Flags::Z)); // inchangé
@@ -1543,7 +1543,7 @@ mod tests {
         cpu.sp = 0xFF00;
         cpu.pc = 0x0101; // pointe sur l'immédiat (comme après la lecture de l'opcode)
 
-        assert_eq!(execute(&mut cpu, &mut mmu, 0xE8), 24);
+        assert_eq!(execute(&mut cpu, &mut mmu, 0xE8), 16);
         assert_eq!(cpu.sp, 0xFF10);
         assert_eq!(cpu.flags(), Flags::empty()); // Z=0, N=0, ni H ni C
 
@@ -1645,7 +1645,7 @@ mod tests {
         cpu.set_flags(Flags::empty()); // un CPU neuf a Z posé (F=$B0)
 
         // Non pris (Z effacé) : le PC passe les deux octets de l'adresse.
-        assert_eq!(execute(&mut cpu, &mut mmu, 0xCA), 10);
+        assert_eq!(execute(&mut cpu, &mut mmu, 0xCA), 12);
         assert_eq!(cpu.pc, 0x0103);
 
         // Pris (Z posé).
@@ -1728,7 +1728,7 @@ mod tests {
         // SET b,r8 : pose le bit, drapeaux inchangés.
         cpu.b = 0x00;
         cpu.set_flags(Flags::Z | Flags::C);
-        assert_eq!(execute_cb(&mut cpu, &mut mmu, 0xE0), 16); // SET 4,B (forme registre)
+        assert_eq!(execute_cb(&mut cpu, &mut mmu, 0xE0), 8); // SET 4,B (forme registre)
         assert_eq!(cpu.b, 0x10);
         let f = cpu.flags();
         assert!(f.contains(Flags::Z)); // inchangés
@@ -1736,11 +1736,11 @@ mod tests {
 
         // RES b,r8 : efface le bit, drapeaux inchangés.
         cpu.b = 0xFF;
-        execute_cb(&mut cpu, &mut mmu, 0xA0); // RES 4,B (forme registre)
+        assert_eq!(execute_cb(&mut cpu, &mut mmu, 0xA0), 8); // RES 4,B (forme registre)
         assert_eq!(cpu.b, 0xEF);
         assert!(f.contains(Flags::Z));
 
-        // Forme (HL) : 16 T-cycles pour les rotations/BIT.
+        // Forme (HL) : 16 T-cycles pour les rotations.
         let mut mmu = rom_with(&[0xCB, 0x06]); // RLC (HL) à $0100
         let mut cpu = CPU::new();
         cpu.h = 0xC0;
@@ -1749,8 +1749,11 @@ mod tests {
         assert_eq!(execute_cb(&mut cpu, &mut mmu, 0x06), 16); // RLC (HL)
         assert_eq!(mmu.read(0xC000), 0x03);
 
-        // RES/SET sur (HL) : 24 T-cycles.
-        assert_eq!(execute_cb(&mut cpu, &mut mmu, 0xFE), 24); // SET 7,(HL)
+        // BIT b,(HL) : 12 T-cycles.
+        assert_eq!(execute_cb(&mut cpu, &mut mmu, 0x46), 12); // BIT 0,(HL)
+
+        // RES/SET sur (HL) : 16 T-cycles.
+        assert_eq!(execute_cb(&mut cpu, &mut mmu, 0xFE), 16); // SET 7,(HL)
         assert_eq!(mmu.read(0xC000), 0x83);
     }
 
