@@ -522,10 +522,12 @@ impl FarquaadGBApp {
             });
     }
 
-    /// Zone centrale, haut gauche : processeur (drapeaux, PC/SP, registres A/F B/C D/E H/L, IME/HALT, BOOTROM).
+    /// Zone centrale, haut gauche : processeur (drapeaux, PC/SP, registres A/F B/C D/E H/L + combinaisons 16 bits,
+    /// IME/HALT/EI delay, compteurs instructions/T-cycles, BOOTROM).
     fn show_processor_panel(&self, ui: &mut egui::Ui) {
-        // Le contenu (cadre des registres, titre « 🧠 Processor » inclus) défile si la zone est trop petite.
-        egui::ScrollArea::vertical()
+        // Le contenu (cadre des registres, titre « 🧠 Processor » inclus) défile si la zone est trop petite ;
+        // le scroll horizontal évite que le tableau des registres soit écrêté/déformé quand la zone est étroite.
+        egui::ScrollArea::both()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 self.show_cpu_info(ui);
@@ -680,34 +682,40 @@ impl FarquaadGBApp {
                 }
             });
     }
-    /// Informations CPU en style « table » : titre « 🧠 Processor », section drapeaux Z N H C, PC/SP et
-    /// paires de registres A|F B|C D|E H|L affichés en hexadécimal + expansion binaire, état IME/HALT
-    /// et indicateur BOOTROM. Toutes les lignes utilisent la police monospace avec des colonnes fixes
-    /// (étiquette 2 caractères + valeur) : le tableau reste parfaitement aligné quelle que soit la
-    /// valeur affichée.
+    /// Informations CPU en style « table » : titre « 🧠 Processor », section drapeaux Z N H C (+ registre F),
+    /// tableau complet des registres (PC|SP, paires de bytes A|B F|C D|E H|L, combinaisons 16 bits BC|DE HL|AF)
+    /// en hexadécimal + expansion binaire, état IME/HALT/EI delay, compteurs instructions/T-cycles et indicateur
+    /// BOOTROM. Les tableaux sont construits avec `egui_extras::TableBuilder` (colonnes auto-dimensionnées sur le
+    /// contenu monospace) : l'alignement est conservé quelle que soit la largeur du panneau — plus aucune
+    /// déformation quand la zone centrale redimensionne ou qu'un autre widget de débogage est activé à côté.
     fn show_cpu_info(&self, ui: &mut egui::Ui) {
+        use egui_extras::{Column, TableBuilder};
+
         let cpu = &self.emulator.cpu;
 
-        // Le cadre s'étend sur toute la largeur du panneau (les séparateurs internes sont des widgets expansifs).
-        egui::Frame::default()
-            .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(96, 96, 96)))
-            .inner_margin(8.0)
-            .show(ui, |ui| {
-                // Titre du panneau (centré).
-                ui.vertical_centered(|ui| {
-                    ui.label(egui::RichText::new("🧠 Processor").strong());
-                });
+        // Le cadre est centré dans le panneau avec une largeur minimale : le tableau ne peut plus être écrêté.
+        ui.vertical_centered(|ui| {
+            egui::Frame::default()
+                .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(96, 96, 96)))
+                .inner_margin(8.0)
+                .show(ui, |ui| {
+                    // egui 0.31 : `Frame` n'a pas de methode `min_size` ; la largeur minimale est
+                    // imposee sur le ui interne (le cadre s'adapte a `content_ui.min_rect()`).
+                    ui.set_min_size(egui::vec2(470.0, 0.0));
+                    // Titre du panneau (centré).
+                    ui.vertical_centered(|ui| {
+                        ui.label(egui::RichText::new("🧠 Processor").strong());
+                    });
 
-                ui.separator();
+                    ui.separator();
 
-                // Section drapeaux Z N H C : étiquettes orange, valeur allumée si levée.
-                ui.vertical_centered(|ui| {
-                    ui.label(egui::RichText::new("🚦 Flags CPU"));
-                });
-                ui.add_space(4.0);
-                ui.vertical_centered(|ui| {
+                    // Section drapeaux Z N H C : étiquettes orange, valeur allumée si levée + registre F.
+                    ui.vertical_centered(|ui| {
+                        ui.label(egui::RichText::new("🚦 Flags CPU"));
+                    });
+                    ui.add_space(4.0);
+                    let f = cpu.flags();
                     ui.horizontal(|ui| {
-                        let f = cpu.flags();
                         for (name, flag) in [
                             ('Z', Flags::Z),
                             ('N', Flags::N),
@@ -716,75 +724,190 @@ impl FarquaadGBApp {
                         ] {
                             Self::show_flag(ui, name, f.contains(flag));
                         }
+                        ui.add_space(16.0);
+                        ui.label(egui::RichText::new("F").color(Color32::ORANGE));
+                        ui.monospace(format!("=${:02X}", cpu.f & 0xF0));
                     });
-                });
 
-                ui.separator();
+                    ui.separator();
 
-                // PC et SP : hexadécimal + expansion binaire 16 bits.
-                Self::show_pointer_row(ui, "PC", cpu.pc);
-                ui.separator();
-                Self::show_pointer_row(ui, "SP", cpu.sp);
+                    // Tableau complet des registres : PC|SP, puis paires de bytes A|B F|C D|E H|L,
+                    // puis combinaisons 16 bits BC|DE HL|AF. Valeur hexadécimale + expansion binaire gris foncé.
+                    let table = TableBuilder::new(ui)
+                        .striped(false)
+                        .cell_layout(egui::Layout::left_to_right(egui::Align::TOP))
+                        .column(Column::auto()) // Registre (moitié gauche)
+                        .column(Column::auto()) // Valeur hexadécimale (gauche)
+                        .column(Column::auto()) // Expansion binaire (gauche)
+                        .column(Column::exact(18.0)) // Séparation entre les deux moitiés
+                        .column(Column::auto()) // Registre (moitié droite)
+                        .column(Column::auto()) // Valeur hexadécimale (droite)
+                        .column(Column::auto()); // Expansion binaire (droite)
 
-                // Paires de registres : grille 2 colonnes (A|F, B|C, D|E, H|L), hexadécimal + binaire.
-                let pairs = [
-                    ('A', cpu.a, 'F', cpu.f),
-                    ('B', cpu.b, 'C', cpu.c),
-                    ('D', cpu.d, 'E', cpu.e),
-                    ('H', cpu.h, 'L', cpu.l),
-                ];
-                for (i, (n1, v1, n2, v2)) in pairs.iter().enumerate() {
-                    if i > 0 {
-                        ui.separator();
-                    }
-                    ui.horizontal(|ui| {
-                        // Moitié de la largeur de la ligne (moins le séparateur central), bornée à une
-                        // valeur positive : `set_min_width` ne doit jamais recevoir une valeur négative,
-                        // même si la zone est extrêmement étroite.
-                        let half = ((ui.available_width() - 14.0) * 0.5).max(30.0);
-                        ui.scope(|ui| {
-                            ui.set_min_width(half);
-                            Self::show_register_cell(ui, *n1, *v1);
+                    let rows16: [(&str, u16, &str, u16); 3] = [
+                        ("PC", cpu.pc, "SP", cpu.sp),
+                        (
+                            "BC",
+                            ((cpu.b as u16) << 8) | cpu.c as u16,
+                            "DE",
+                            ((cpu.d as u16) << 8) | cpu.e as u16,
+                        ),
+                        ("HL", cpu.hl(), "AF", cpu.af()),
+                    ];
+
+                    // Toutes les lignes sont ajoutées dans le corps de la table : en egui_extras 0.31,
+                    // `row()` vit sur `TableBody` (obtenu via `TableBuilder::body`).
+                    table.body(|mut body| {
+                        // Ligne PC|SP (pointeurs 16 bits).
+                        let (n1, v1, n2, v2) = rows16[0];
+                        body.row(20.0, |mut row| {
+                            Self::show_register_half(
+                                &mut row,
+                                n1,
+                                format!("${v1:04X}"),
+                                format!("{:08b} {:08b}", (v1 >> 8) as u8, v1 as u8),
+                            );
+                            row.col(|_| {}); // Séparation entre les deux moitiés.
+                            Self::show_register_half(
+                                &mut row,
+                                n2,
+                                format!("${v2:04X}"),
+                                format!("{:08b} {:08b}", (v2 >> 8) as u8, v2 as u8),
+                            );
                         });
-                        ui.add(egui::Separator::default().vertical());
-                        ui.scope(|ui| {
-                            ui.set_min_width(half);
-                            Self::show_register_cell(ui, *n2, *v2);
+
+                        // Ligne d'espacement.
+                        body.row(6.0, |mut row| {
+                            row.col(|_| {});
+                        });
+
+                        // Paires de bytes A|B F|C D|E H|L.
+                        let pairs8: [(&str, u8, &str, u8); 4] = [
+                            ("A", cpu.a, "B", cpu.b),
+                            ("F", cpu.f, "C", cpu.c),
+                            ("D", cpu.d, "E", cpu.e),
+                            ("H", cpu.h, "L", cpu.l),
+                        ];
+                        for (n1, v1, n2, v2) in pairs8 {
+                            body.row(20.0, |mut row| {
+                                Self::show_register_half(
+                                    &mut row,
+                                    n1,
+                                    format!("${v1:02X}"),
+                                    format!("{:04b} {:04b}", v1 >> 4, v1 & 0x0F),
+                                );
+                                row.col(|_| {}); // Séparation entre les deux moitiés.
+                                Self::show_register_half(
+                                    &mut row,
+                                    n2,
+                                    format!("${v2:02X}"),
+                                    format!("{:04b} {:04b}", v2 >> 4, v2 & 0x0F),
+                                );
+                            });
+                        }
+
+                        // Ligne d'espacement.
+                        body.row(6.0, |mut row| {
+                            row.col(|_| {});
+                        });
+
+                        // Combinaisons 16 bits BC|DE HL|AF (les deux dernières lignes de `rows16`).
+                        for &(n1, v1, n2, v2) in &rows16[1..] {
+                            body.row(20.0, |mut row| {
+                                Self::show_register_half(
+                                    &mut row,
+                                    n1,
+                                    format!("${v1:04X}"),
+                                    format!("{:08b} {:08b}", (v1 >> 8) as u8, v1 as u8),
+                                );
+                                row.col(|_| {}); // Séparation entre les deux moitiés.
+                                Self::show_register_half(
+                                    &mut row,
+                                    n2,
+                                    format!("${v2:04X}"),
+                                    format!("{:08b} {:08b}", (v2 >> 8) as u8, v2 as u8),
+                                );
+                            });
+                        }
+                    });
+
+                    ui.separator();
+
+                    // État du processeur : IME / HALT / EI delay + compteurs instructions et T-cycles.
+                    let status = TableBuilder::new(ui)
+                        .striped(false)
+                        .cell_layout(egui::Layout::left_to_right(egui::Align::TOP))
+                        .column(Column::auto()) // Étiquette (groupe 1)
+                        .column(Column::auto()) // Valeur (groupe 1)
+                        .column(Column::exact(18.0))
+                        .column(Column::auto()) // Étiquette (groupe 2)
+                        .column(Column::auto()) // Valeur (groupe 2)
+                        .column(Column::exact(18.0))
+                        .column(Column::auto()) // Étiquette (groupe 3)
+                        .column(Column::auto()); // Valeur (groupe 3)
+
+                    let t_cycles = self.emulator.t_cycles;
+                    let frames_elapsed = t_cycles / crate::emulator::FRAME_TCYCLES;
+                    let dot_in_frame = t_cycles % crate::emulator::FRAME_TCYCLES;
+
+                    status.body(|mut body| {
+                        body.row(20.0, |mut row| {
+                            Self::show_state_cell(
+                                &mut row,
+                                "IME",
+                                if cpu.ime { "ON" } else { "OFF" }.to_owned(),
+                                if cpu.ime { Color32::GREEN } else { Self::DIM_GRAY },
+                            );
+                            row.col(|_| {});
+                            Self::show_state_cell(
+                                &mut row,
+                                "HALT",
+                                if cpu.halted { "ACTIVE" } else { "—" }.to_owned(),
+                                if cpu.halted { Color32::YELLOW } else { Self::DIM_GRAY },
+                            );
+                            row.col(|_| {});
+                            Self::show_state_cell(
+                                &mut row,
+                                "EI delay",
+                                cpu.ei_delay.to_string(),
+                                if cpu.ei_delay != 0 { Color32::GREEN } else { Self::DIM_GRAY },
+                            );
+                        });
+
+                        body.row(20.0, |mut row| {
+                            Self::show_state_cell(
+                                &mut row,
+                                "Instr",
+                                format!("#{}", self.emulator.instructions),
+                                Color32::from_rgb(190, 190, 190),
+                            );
+                            row.col(|_| {});
+                            Self::show_state_cell(
+                                &mut row,
+                                "TCyc",
+                                format!(
+                                    "#{t_cycles} · frame {frames_elapsed} · dot {dot_in_frame}/{}",
+                                    crate::emulator::FRAME_TCYCLES
+                                ),
+                                Color32::from_rgb(190, 190, 190),
+                            );
+                            row.col(|_| {}); // Groupe 3 vide (structure de colonnes conservée).
                         });
                     });
-                }
 
-                ui.separator();
+                    ui.separator();
 
-                // IME et HALT (allumés quand actifs).
-                ui.vertical_centered(|ui| {
-                    ui.horizontal(|ui| {
-                        let ime_color = if cpu.ime {
+                    // BOOTROM : allumé tant que la boot ROM DMG est encore mappée (séquence de démarrage en cours).
+                    let in_bootrom = !self.emulator.mmu.boot_rom_finished;
+                    ui.vertical_centered(|ui| {
+                        ui.label(egui::RichText::new("BOOTROM").color(if in_bootrom {
                             Color32::GREEN
                         } else {
                             Self::DIM_GRAY
-                        };
-                        ui.label(egui::RichText::new("IME").color(ime_color));
-                        ui.add_space(48.0);
-                        let halt_color = if cpu.halted {
-                            Color32::GREEN
-                        } else {
-                            Self::DIM_GRAY
-                        };
-                        ui.label(egui::RichText::new("HALT").color(halt_color));
+                        }));
                     });
                 });
-
-                // BOOTROM : allumé quand le PC est dans la région du boot ROM ($0100-$014F).
-                let in_bootrom = (0x0100..=0x014F).contains(&cpu.pc);
-                ui.vertical_centered(|ui| {
-                    ui.label(egui::RichText::new("BOOTROM").color(if in_bootrom {
-                        Color32::GREEN
-                    } else {
-                        Self::DIM_GRAY
-                    }));
-                });
-            });
+        });
     }
 
     /// Gris foncé pour les expansions binaires et les indicateurs inactifs.
@@ -810,43 +933,29 @@ impl FarquaadGBApp {
         });
     }
 
-    /// Ligne PC/SP (structure fixe) : étiquette monospace calée sur 2 caractères + valeur hexadécimale,
-    /// puis expansion binaire 16 bits en gris foncé. La colonne `$` est alignée avec les cellules de
-    /// registres ci-dessous.
-    fn show_pointer_row(ui: &mut egui::Ui, name: &str, value: u16) {
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new(format!("{name:<2}"))
-                    .monospace()
-                    .color(Color32::YELLOW),
-            );
-            ui.monospace(format!(" ${value:04X}"));
+    /// Moitié d'une ligne du tableau des registres : nom monospace cyan + valeur hexadécimale, puis expansion
+    /// binaire gris foncé. Les colonnes auto-dimensionnées de `TableBuilder` gardent l'alignement quel que soit
+    /// le contenu (largeurs fixes en police monospace).
+    fn show_register_half(row: &mut egui_extras::TableRow, name: &str, hex: String, bin: String) {
+        row.col(|ui| {
+            ui.label(egui::RichText::new(name).monospace().color(Color32::CYAN));
         });
-        let binary = format!("{:08b} {:08b}", (value >> 8) as u8, value & 0xFF);
-        ui.label(
-            egui::RichText::new(binary)
-                .monospace()
-                .color(Self::DIM_GRAY),
-        );
+        row.col(|ui| {
+            ui.monospace(hex);
+        });
+        row.col(|ui| {
+            ui.label(egui::RichText::new(bin).monospace().color(Self::DIM_GRAY));
+        });
     }
 
-    /// Cellule de registre (structure fixe) : nom monospace calé sur 2 caractères + valeur hexadécimale,
-    /// puis expansion binaire en gris foncé. La colonne `$` est alignée with the lines PC/SP au-dessus.
-    fn show_register_cell(ui: &mut egui::Ui, name: char, value: u8) {
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new(format!("{name:<2}"))
-                    .monospace()
-                    .color(Color32::CYAN),
-            );
-            ui.monospace(format!(" ${value:02X}"));
+    /// Cellule d'état (étiquette monospace jaune + valeur colorée) pour la section IME/HALT/EI delay/compteurs.
+    fn show_state_cell(row: &mut egui_extras::TableRow, name: &str, value: String, color: Color32) {
+        row.col(|ui| {
+            ui.label(egui::RichText::new(name).monospace().color(Color32::YELLOW));
         });
-        let binary = format!("{:04b} {:04b}", value >> 4, value & 0x0F);
-        ui.label(
-            egui::RichText::new(binary)
-                .monospace()
-                .color(Self::DIM_GRAY),
-        );
+        row.col(|ui| {
+            ui.label(egui::RichText::new(value).monospace().color(color));
+        });
     }
     /// Noms des huit boutons du joypad, dans the order of the indices (`crate::joypad::KEY_A`…`crate::joypad::KEY_DOWN`).
     const JOYPAD_BUTTON_NAMES: [&str; 8] =
