@@ -333,9 +333,9 @@ impl FarquaadGBApp {
                 let b1 = vram[base + row * 2 + 1];
                 let py = (tile / TILE_GRID) * TILE_SIZE + row; // position de la tuile dans la grille 16×16
                 for col in 0..TILE_SIZE {
-                    // Bits 7→0 de chaque octet : bit 7 = teinte 1, bit 6 = teinte 2 (index = b7 + 2×b6).
+                    // Bits 7→0 de chaque octet : b0 contient les MSB des pixels, b1 les LSB (index = 2×MSB + LSB).
                     let bit = 7 - col;
-                    let shade_index = ((b0 >> bit) & 1) | (((b1 >> bit) & 1) << 1);
+                    let shade_index = (((b0 >> bit) & 1) << 1) | ((b1 >> bit) & 1);
                     pixels[py * TILE_IMAGE_SIZE + (tile % TILE_GRID) * TILE_SIZE + col] =
                         colors[shade_index as usize];
                 }

@@ -506,8 +506,8 @@ mod tests {
         // these writes are not blocked by modes 2/3.
         emu.mmu.ppu.mode = 0;
         for row in 0..8 {
-            emu.mmu.write(0x8010 + 2 * row as u16, 0xFF); // moitié gauche → valeur 3
-            emu.mmu.write(0x8011 + 2 * row as u16, 0x00); // moitié droite → valeur 0
+            emu.mmu.write(0x8010 + 2 * row as u16, 0b11_11_00_00); // moitié gauche → valeur 3 (MSB des pixels)
+            emu.mmu.write(0x8011 + 2 * row as u16, 0b11_11_00_00); // moitié droite → valeur 0 (LSB des pixels)
         }
         for addr in 0x9800..=0x9BFF {
             emu.mmu.write(addr, 1);

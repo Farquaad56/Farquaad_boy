@@ -86,6 +86,21 @@ fn render_frame_with_empty_vram_uses_power_on_bgp() {
 }
 
 #[test]
+fn tile_pixel_combines_the_two_row_bytes_per_gb_spec() {
+    let mut vram = [0u8; 0x2000];
+    // Tuile $8030 : la ligne 3 a tous les MSB à 1 et les LSB à 0 (valeur 2) ; la ligne 4, l'inverse (valeur 1).
+    vram[0x36] = 0xFF; // premier octet de la ligne 3 : MSB des pixels
+    vram[0x37] = 0x00; // second octet : LSB des pixels
+    vram[0x38] = 0x00; // ligne 4 : MSB à 0
+    vram[0x39] = 0xFF; // LSB à 1
+
+    assert_eq!(PPU::tile_pixel(&vram, 0x30, 3, 0), 2); // pixel le plus à gauche (bit 7) : MSB=1, LSB=0
+    assert_eq!(PPU::tile_pixel(&vram, 0x30, 3, 7), 2); // pixel le plus à droite (bit 0) : même valeur
+    assert_eq!(PPU::tile_pixel(&vram, 0x30, 4, 0), 1); // MSB=0, LSB=1 — l'ordre des deux octets est respecté
+    assert_eq!(PPU::tile_pixel(&vram, 0x30, 4, 7), 1);
+}
+
+#[test]
 fn render_background_scrolls_and_selects_tiles() {
     let mut ppu = PPU::new();
     ppu.write_register(0xFF40, 0x81); // LCD allumé (bit 7) + fond activé (bit 0) ; tuiles non signées $8000-$8FFF (bit 4 à 0), carte $9800-$9BFF
@@ -93,8 +108,8 @@ fn render_background_scrolls_and_selects_tiles() {
 
     let mut vram = [0u8; 0x2000];
     for row in 0..8 {
-        vram[0x10 + 2 * row] = 0xFF; // tuile 1 ($8010-$801F) : moitié gauche → valeur 3
-        vram[0x11 + 2 * row] = 0x00; // moitié droite → valeur 0
+        vram[0x10 + 2 * row] = 0b11_11_00_00; // tuile 1 ($8010-$801F) : moitié gauche → valeur 3 (MSB des pixels)
+        vram[0x11 + 2 * row] = 0b11_11_00_00; // moitié droite → valeur 0 (LSB des pixels)
     }
     vram[0x1800..0x1A00].fill(1); // carte $9800-$9BFF : tuile 1 partout
     let oam = [0u8; 0xA0]; // OAM vide : aucun sprite
@@ -111,7 +126,9 @@ fn render_background_scrolls_and_selects_tiles() {
 
     ppu.scx = 0;
     for row in 0..8 {
-        vram[0x10 + 2 * row] = if row == 1 { 0xFF } else { 0x00 }; // seule la ligne 1 of the tuile est noire
+        let v = if row == 1 { 0xFF } else { 0x00 }; // seule la ligne 1 de la tuile est noire (valeur 3)
+        vram[0x10 + 2 * row] = v; // MSB des pixels
+        vram[0x11 + 2 * row] = v; // LSB des pixels
     }
     ppu.scy = 1; // défilement vertical : la ligne écran 0 montre the line 1 of the tuile
     ppu.render_frame(&vram, &oam);
@@ -127,8 +144,10 @@ fn render_background_selects_tile_set_and_map() {
 
     let mut vram = [0u8; 0x2000];
     for row in 0..8 {
-        vram[0x7F0 + 2 * row] = 0xFF; // tuile $87F0 : noire (index non signé $7F)
-        vram[0x0FF0 + 2 * row] = 0xFF; // tuile $8FF0 : noire (index signé +$7F)
+        vram[0x7F0 + 2 * row] = 0xFF; // tuile $87F0 : noire (index non signé $7F) — MSB des pixels
+        vram[0x7F1 + 2 * row] = 0xFF; // LSB des pixels
+        vram[0x0FF0 + 2 * row] = 0xFF; // tuile $8FF0 : noire (index signé +$7F) — MSB des pixels
+        vram[0x0FF1 + 2 * row] = 0xFF; // LSB des pixels
     }
 
     vram[BG_MAP_9800] = 0x7F; // cellule (0,0) of the carte $9800
@@ -157,7 +176,8 @@ fn render_window_layer() {
 
     let mut vram = [0u8; 0x2000]; // fond blanc : carte $9800 nulle → tuile nulle → valeur 0
     for row in 0..8 {
-        vram[TILE_SET_8800 + 5 * 16 + 2 * row] = 0xFF; // tuile 5 of $8800 : noire
+        vram[TILE_SET_8800 + 5 * 16 + 2 * row] = 0xFF; // tuile 5 de $8800 : noire (MSB des pixels)
+        vram[TILE_SET_8800 + 5 * 16 + 2 * row + 1] = 0xFF; // LSB des pixels
     }
     vram[BG_MAP_9C00 + 1] = 5; // cellule (ligne 0, colonne 1) of the carte $9C00 → tuile 5
 
@@ -171,8 +191,8 @@ fn render_window_layer() {
 
     ppu.lcdc &= !LCDC_WIN_TILE_8800; // bit 6 du LCDC à 0 : la fenêtre utilise the tuiles $8000-$8FFF
     for row in 0..8 {
-        vram[5 * 16 + 2 * row] = 0xFF; // tuile 5 of $8000 : noire (moitié gauche)
-        vram[5 * 16 + 2 * row + 1] = 0xFF;
+        vram[5 * 16 + 2 * row] = 0xFF; // tuile 5 de $8000 : noire (MSB des pixels)
+        vram[5 * 16 + 2 * row + 1] = 0xFF; // LSB des pixels
     }
     ppu.render_frame(&vram, &oam);
     assert_eq!(ppu.framebuffer[32 * SCREEN_WIDTH + 16], PPU::shade(3)); // fenêtre noire via the tuile 5 of $8000
@@ -274,7 +294,8 @@ fn render_sprite_horizontal_flip() {
 
     let mut vram = [0u8; 0x2000];
     for row in 0..8 {
-        vram[0x10 + 2 * row] = 0xFF; // tuile 1 ($8010-$801F) : moitié gauche → valeur 3, moitié droite → valeur 0 (transparente)
+        vram[0x10 + 2 * row] = 0b11_11_00_00; // tuile 1 ($8010-$801F) : moitié gauche → valeur 3, moitié droite → valeur 0 (transparente) — MSB des pixels
+        vram[0x11 + 2 * row] = 0b11_11_00_00; // LSB des pixels
     }
 
     let mut oam = [0u8; 0xA0];
@@ -321,8 +342,10 @@ fn render_sprite_selects_tile_set_8800() {
 
     let mut vram = [0u8; 0x2000];
     for row in 0..8 {
-        vram[0x10 + 2 * row] = 0xFF; // tuile 1 of $8000 : moitié gauche → valeur 3
-        vram[TILE_SET_8800 + 0x10 + 2 * row] = 0xFF; // tuile 1 of $8800 : moitié gauche → valeur 3
+        vram[0x10 + 2 * row] = 0b11_11_00_00; // tuile 1 de $8000 : moitié gauche → valeur 3 (MSB des pixels)
+        vram[0x11 + 2 * row] = 0b11_11_00_00; // LSB des pixels
+        vram[TILE_SET_8800 + 0x10 + 2 * row] = 0b11_11_00_00; // tuile 1 de $8800 : moitié gauche → valeur 3 (MSB des pixels)
+        vram[TILE_SET_8800 + 0x11 + 2 * row] = 0b11_11_00_00; // LSB des pixels
     }
 
     let mut oam = [0u8; 0xA0];
@@ -337,7 +360,8 @@ fn render_sprite_selects_tile_set_8800() {
     ppu.render_frame(&vram, &oam);
     assert_eq!(ppu.framebuffer[15 * SCREEN_WIDTH + 32], PPU::shade(3)); // moitié gauche of the tuile 1 of $8800
 
-    vram[TILE_SET_8800 + 0x10] = 0; // efface les pixels 0..3 of the first line of the tuile $8810
+    vram[TILE_SET_8800 + 0x10] = 0; // efface la première ligne de la tuile $8810 (MSB des pixels)
+    vram[TILE_SET_8800 + 0x11] = 0; // ...et ses LSB : les pixels deviennent transparents
     ppu.render_frame(&vram, &oam);
     assert_eq!(ppu.framebuffer[15 * SCREEN_WIDTH + 32], PPU::shade(0)); // ligne Y-1 → transparente → fond white
 }
@@ -350,7 +374,8 @@ fn render_sprite_transparent_pixels() {
 
     let mut vram = [0u8; 0x2000];
     for row in 0..8 {
-        vram[0x10 + 2 * row] = 0xFF; // tuile 1 ($8010-$801F) : moitié gauche → valeur 3, moitié droite → valeur 0 (transparente)
+        vram[0x10 + 2 * row] = 0b11_11_00_00; // tuile 1 ($8010-$801F) : moitié gauche → valeur 3, moitié droite → valeur 0 (transparente) — MSB des pixels
+        vram[0x11 + 2 * row] = 0b11_11_00_00; // LSB des pixels
     }
 
     let mut oam = [0u8; 0xA0];
@@ -398,8 +423,8 @@ fn render_sprite_priority_over_background() {
     for row in 0..8 {
         vram[0x10 + 2 * row] = 0xFF; // tuile 1 : toutes the values of pixel valent 3 (fond noir)
         vram[0x11 + 2 * row] = 0xFF;
-        vram[0x20 + 2 * row] = 0x55; // tuile 2 : toutes the values of pixel valent 1 (sprite claire)
-        vram[0x21 + 2 * row] = 0x55;
+        vram[0x20 + 2 * row] = 0x00; // tuile 2 : toutes les valeurs de pixel valent 1 (sprite claire) — MSB des pixels à 0
+        vram[0x21 + 2 * row] = 0xFF; // LSB des pixels à 1
     }
     vram[BG_MAP_9800..BG_MAP_9800 + 32 * 32].fill(1); // carte $9800-$9BFF : tuile 1 partout (fond noir)
 
@@ -511,8 +536,8 @@ fn render_objects_16px_height_and_tile_selection() {
 
     // Tuile 5 en $8050 : moitié gauche value 3, moitié droite value 0 ; tuile 4 ($8040) reste vide (value 0).
     for row in 0..8 {
-        vram[0x0050 + 2 * row] = 0b11_11_11_11; // moitié gauche of the line `row` → value 3
-        vram[0x0051 + 2 * row] = 0b00_00_00_00; // moitié droite of the line `row` → value 0
+        vram[0x0050 + 2 * row] = 0b11_11_00_00; // moitié gauche de la ligne `row` → value 3 (MSB des pixels)
+        vram[0x0051 + 2 * row] = 0b11_11_00_00; // moitié droite → value 0 (LSB des pixels)
     }
 
     oam[0] = 32; // Y = 32 : objet affiché on the lines écran 16..31 (Y-16 .. Y-1)
@@ -542,10 +567,10 @@ fn render_objects_drawn_in_oam_order_later_overwrites_earlier() {
 
     // Tuile 1 en $8010 : all pixels value 3 ; tuile 2 en $8020 : all pixels value 2.
     for row in 0..8 {
-        vram[0x0010 + row] = 0b11_11_11_11;
-        vram[0x0018 + row] = 0b11_11_11_11;
-        vram[0x0020 + row] = 0b10_10_10_10;
-        vram[0x0028 + row] = 0b10_10_10_10;
+        vram[0x0010 + 2 * row] = 0b11_11_11_11; // tuile $8010 : MSB des pixels à 1
+        vram[0x0011 + 2 * row] = 0b11_11_11_11; // LSB des pixels à 1 → valeur 3
+        vram[0x0020 + 2 * row] = 0b10_10_10_10; // tuile $8020 : MSB des pixels à 1, LSB à 0 → valeur 2
+        vram[0x0021 + 2 * row] = 0x00;
     }
 
     // L'objet B (X=48 → colonnes 48..55, tuile 2) is declared first dans l'OAM ; les sprites are

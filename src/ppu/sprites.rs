@@ -84,22 +84,22 @@ impl PPU {
         (0..8u32).any(|j| (oam_x as u32 + j) & 0xFF < SCREEN_WIDTH as u32)
     }
 
-    /// Valeur (0..3) du pixel `col` of the line `row` d'une tuile 8×8 : chaque colonne occupe 2 bits, MSB en premier.
+    /// Valeur (0..3) du pixel `col` de la ligne `row` d'une tuile 8×8 (Pan Docs « Tile »/GBCTR) : le premier octet de la
+    /// ligne contient les bits de poids fort (MSB) des pixels, le second les bits de poids faible (LSB), bit 7 = pixel le plus à gauche.
     pub(crate) fn tile_pixel(vram: &[u8], tile_addr: usize, row: u32, col: u32) -> u8 {
-        let word = ((vram[tile_addr + 2 * row as usize] as u32) << 8) | vram[tile_addr + 2 * row as usize + 1] as u32;
-        (word >> (2 * (7 - col)) & 3) as u8
+        let byte1 = vram[tile_addr + 2 * row as usize]; // MSB des pixels de la ligne
+        let byte2 = vram[tile_addr + 2 * row as usize + 1]; // LSB des pixels de la ligne
+        let bit_index = 7 - col; // le pixel 0 est à gauche (bit 7)
+
+        let msb = (byte1 >> bit_index) & 1;
+        let lsb = (byte2 >> bit_index) & 1;
+
+        (msb << 1) | lsb // valeur du pixel : 0, 1, 2 ou 3
     }
 
     /// Convertit a teinte DMG (2 bits of BGP/OBP) en pixel du framebuffer (R dans l'octet le plus bas).
     pub fn shade(bits: u8) -> u32 {
         let bits = bits & 3;
-        // --- DIAGNOSTIC TEMPORAIRE (Cause B) : teinte 0 → rouge vif, teinte 3 → blanc.
-        if bits == 0 {
-            return 0xFF00_00FF; // R=255, G=0, B=0 (format AARRGGBB du framebuffer)
-        }
-        if bits == 3 {
-            return 0xFF00_FFFF; // blanc
-        }
         let [r, g, b] = DMG_SHADES[bits as usize];
         0xFF00_0000 | ((b as u32) << 16) | ((g as u32) << 8) | r as u32
     }
