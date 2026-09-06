@@ -3,8 +3,8 @@
 
 use crate::ppu::constants::{
     BG_MAP_9800, BG_MAP_9C00, LCDC_BG, LCDC_BG_MAP_9C00, LCDC_LCD_ON, LCDC_OBJ_SIZE_16,
-    LCDC_SPRITE_ON, LCDC_TILE_SET_8800, LCDC_WINDOW, LCDC_WIN_TILE_8800, SCREEN_HEIGHT,
-    SCREEN_WIDTH, TILE_SET_8800,
+    LCDC_SPRITE_ON, LCDC_TILE_SET_8800, LCDC_WINDOW, LCDC_WIN_MAP_9800, SCREEN_HEIGHT,
+    SCREEN_WIDTH, TILE_SET_9000,
 };
 
 use super::PPU;
@@ -39,9 +39,13 @@ impl PPU {
         let scy = self.scy as u32;
         let bg_on = self.lcdc & LCDC_BG != 0;
         let map_base = if self.lcdc & LCDC_BG_MAP_9C00 != 0 { BG_MAP_9C00 } else { BG_MAP_9800 };
-        let signed_tiles = self.lcdc & LCDC_TILE_SET_8800 != 0;
+        // Pan Docs « LCDC » : bit 4 set → tuiles du fond $8000-$8FFF (indices non signés) ; à 0 → $8800-$97FF, l'octet v
+        // pointant vers $9000 + v*16 avec v interprété comme signé (-128..127).
+        let unsigned_tiles = self.lcdc & LCDC_TILE_SET_8800 != 0;
         let window_on = self.lcdc & LCDC_WINDOW != 0;
-        let win_tile_base = if self.lcdc & LCDC_WIN_TILE_8800 != 0 { TILE_SET_8800 } else { 0 };
+        // Bit 6 du LCDC selects the character map of the fenêtre ($9800-$9BFF if set, $9C00-$9FFF if clear) ; les données de tuiles sont
+        // partagées with le fond (bit 4 : unsigned $8000 or signed, origine $9000).
+        let win_map_base = if self.lcdc & LCDC_WIN_MAP_9800 != 0 { BG_MAP_9800 } else { BG_MAP_9C00 };
 
         // Sélection des sprites recouvrant cette ligne : au plus 10, les premiers dans l'ordre OAM (Pan Docs « Sprite »).
         // Les objets sont rendus only when the couche d'objets est activée (bit 1 du LCDC) ; sans fond ni fenêtre,
@@ -75,11 +79,10 @@ impl PPU {
                 // Défilement horizontal en pixels : colonne de tuile + pixel dans la tuile.
                 let bg_x = (scx + x) & 0xFF;
                 let tile_index = vram[map_base + map_row * 32 + (bg_x >> 3) as usize];
-                let tile_addr = if signed_tiles {
-                    // Indices signés : la valeur v pointe vers $8800 + v*16 ($8000-$97FF).
-                    (TILE_SET_8800 as i32 + (tile_index as i8) as i32 * 16) as usize
+                let tile_addr = if unsigned_tiles {
+                    tile_index as usize * 16 // $8000 + idx*16 : index non signé ($8000-$8FFF)
                 } else {
-                    tile_index as usize * 16 // indices non signés ($8000-$8FFF)
+                    (TILE_SET_9000 as i32 + (tile_index as i8) as i32 * 16) as usize // $9000 + idx signé*16 ($8800-$97FF)
                 };
                 let pixel = Self::tile_pixel(vram, tile_addr, bg_y & 7, bg_x & 7);
                 under[x as usize] = Some(pixel);
@@ -95,13 +98,13 @@ impl PPU {
             let win_y = y - self.wy as u32;
             for x in (self.wx as u32 + 1)..SCREEN_WIDTH as u32 {
                 let win_x = x - self.wx as u32 - 1; // colonne de la fenêtre : le pixel le plus à gauche est en WX+1
-                let tile_index = vram[BG_MAP_9C00 + (win_y >> 3) as usize * 32 + (win_x >> 3) as usize];
-                let pixel = Self::tile_pixel(
-                    vram,
-                    win_tile_base + tile_index as usize * 16, // indices non signés ; ensemble $8800-$97FF or $8000-$8FFF (bit 6 du LCDC)
-                    win_y & 7,
-                    win_x & 7,
-                );
+                let tile_index = vram[win_map_base + (win_y >> 3) as usize * 32 + (win_x >> 3) as usize];
+                let tile_addr = if unsigned_tiles {
+                    tile_index as usize * 16 // $8000 + idx*16 : index non signé ($8000-$8FFF) — partagé with le fond (bit 4 du LCDC)
+                } else {
+                    (TILE_SET_9000 as i32 + (tile_index as i8) as i32 * 16) as usize // $9000 + idx signé*16 ($8800-$97FF)
+                };
+                let pixel = Self::tile_pixel(vram, tile_addr, win_y & 7, win_x & 7);
                 if pixel != 0 {
                     // Les pixels de valeur 0 are transparents : la couche en dessous passes au travers.
                     under[x as usize] = Some(pixel);

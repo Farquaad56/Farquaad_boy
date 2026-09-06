@@ -78,7 +78,7 @@ fn framebuffer_starts_opaque_black() {
 
 #[test]
 fn render_frame_with_empty_vram_uses_power_on_bgp() {
-    let mut ppu = PPU::new(); // LCDC = $91 : LCD allumé (bit 7) + tuiles signées $8800 (bit 4) + fond activé (bit 0) ; BGP = $FC : valeur 0 → teinte claire, 1-3 → foncée
+    let mut ppu = PPU::new(); // LCDC = $91 : LCD allumé (bit 7) + fond activé (bit 0), tuiles du fond non signées $8000-$8FFF (bit 4 set) ; BGP = $FC : valeur 0 → teinte claire, 1-3 → foncée
     let vram = [0u8; 0x2000]; // tuiles et cartes nulles : toutes les valeurs de pixel valent 0
     let oam = [0u8; 0xA0]; // OAM vide : aucun sprite
     ppu.render_frame(&vram, &oam);
@@ -103,7 +103,7 @@ fn tile_pixel_combines_the_two_row_bytes_per_gb_spec() {
 #[test]
 fn render_background_scrolls_and_selects_tiles() {
     let mut ppu = PPU::new();
-    ppu.write_register(0xFF40, 0x81); // LCD allumé (bit 7) + fond activé (bit 0) ; tuiles non signées $8000-$8FFF (bit 4 à 0), carte $9800-$9BFF
+    ppu.write_register(0xFF40, 0x91); // LCD allumé (bit 7) + fond activé (bit 0) ; tuiles non signées $8000-$8FFF (bit 4 set), carte $9800-$9BFF
     ppu.bgp = 0xE4; // teinte v for a pixel value v (bits 2v..2v+1 valent v)
 
     let mut vram = [0u8; 0x2000];
@@ -139,15 +139,13 @@ fn render_background_scrolls_and_selects_tiles() {
 #[test]
 fn render_background_selects_tile_set_and_map() {
     let mut ppu = PPU::new();
-    ppu.write_register(0xFF40, 0x81); // LCD allumé + fond activé ; tuiles $8000-$8FFF (non signées), carte $9800-$9BFF
+    ppu.write_register(0xFF40, 0x91); // LCD allumé + fond activé ; bit 4 set : tuiles $8000-$8FFF (non signées), carte $9800-$9BFF
     ppu.bgp = 0xE4; // teinte v for a pixel value v
 
     let mut vram = [0u8; 0x2000];
     for row in 0..8 {
         vram[0x7F0 + 2 * row] = 0xFF; // tuile $87F0 : noire (index non signé $7F) — MSB des pixels
         vram[0x7F1 + 2 * row] = 0xFF; // LSB des pixels
-        vram[0x0FF0 + 2 * row] = 0xFF; // tuile $8FF0 : noire (index signé +$7F) — MSB des pixels
-        vram[0x0FF1 + 2 * row] = 0xFF; // LSB des pixels
     }
 
     vram[BG_MAP_9800] = 0x7F; // cellule (0,0) of the carte $9800
@@ -155,13 +153,21 @@ fn render_background_selects_tile_set_and_map() {
     ppu.render_frame(&vram, &oam);
     assert_eq!(ppu.framebuffer[0], PPU::shade(3)); // non signé : tuile $87F0 → noire
 
-    ppu.lcdc |= LCDC_TILE_SET_8800; // bit 4 du LCDC : indices signés — la même value pointe vers $8FF0
+    ppu.lcdc &= !LCDC_TILE_SET_8800; // bit 4 du LCDC à 0 : indices signés — la même value pointe vers $97F0 (origine $9000)
+    for row in 0..8 {
+        vram[0x17F0 + 2 * row] = 0xFF; // tuile $97F0 : noire (index signé +$7F) — MSB des pixels
+        vram[0x17F1 + 2 * row] = 0xFF; // LSB des pixels
+    }
     ppu.render_frame(&vram, &oam);
-    assert_eq!(ppu.framebuffer[0], PPU::shade(3)); // signé +$7F : tuile $8FF0 → noire
+    assert_eq!(ppu.framebuffer[0], PPU::shade(3)); // signé +$7F : tuile $97F0 → noire
 
     vram[BG_MAP_9800] = 0; // carte $9800 : tuile nulle → blanche
     ppu.lcdc |= LCDC_BG_MAP_9C00; // bit 3 du LCDC : carte $9C00-$9BFF
-    vram[BG_MAP_9C00] = 0xFF; // cellule (0,0) of the carte $9C00 → tuile -1 → $87F0 (noire)
+    vram[BG_MAP_9C00] = 0xFF; // cellule (0,0) of the carte $9C00 → tuile -1 → $8FF0 (noire)
+    for row in 0..8 {
+        vram[0x0FF0 + 2 * row] = 0xFF; // tuile $8FF0 : noire (index signé -$01) — MSB des pixels
+        vram[0x0FF1 + 2 * row] = 0xFF; // LSB des pixels
+    }
     ppu.render_frame(&vram, &oam);
     assert_eq!(ppu.framebuffer[0], PPU::shade(3)); // carte $9C00 : noire
 }
@@ -169,33 +175,40 @@ fn render_background_selects_tile_set_and_map() {
 #[test]
 fn render_window_layer() {
     let mut ppu = PPU::new();
-    ppu.write_register(0xFF40, 0xF1); // LCD allumé (bit 7) + fond activé (bit 0, tuiles non signées $8000-$8FFF) + fenêtre activée (bit 5) ; bit 6 : tuiles of the fenêtre en $8800-$97FF
+    // LCD allumé (bit 7) + fond activé (bit 0) + fenêtre activée (bit 5) ; bit 6 set : la carte de la fenêtre est en $9800-$9BFF,
+    // and bit 3 set : the carte du fond is en $9C00-$9FFF — les deux couches lisent des cartes distinctes.
+    ppu.write_register(0xFF40, 0xF9);
     ppu.bgp = 0xE4; // teinte v for a pixel value v
     ppu.wy = 32; // ligne du haut of the fenêtre
     ppu.wx = 7; // le pixel le plus à gauche est en colonne 8 (Pan Docs « Window »)
 
-    let mut vram = [0u8; 0x2000]; // fond blanc : carte $9800 nulle → tuile nulle → valeur 0
+    let mut vram = [0u8; 0x2000]; // fond blanc : carte $9C00 nulle → tuile nulle → valeur 0
     for row in 0..8 {
-        vram[TILE_SET_8800 + 5 * 16 + 2 * row] = 0xFF; // tuile 5 de $8800 : noire (MSB des pixels)
-        vram[TILE_SET_8800 + 5 * 16 + 2 * row + 1] = 0xFF; // LSB des pixels
+        vram[5 * 16 + 2 * row] = 0xFF; // tuile 5 de $8000 (bit 4 set : index non signé) : noire
+        vram[5 * 16 + 2 * row + 1] = 0xFF;
     }
-    vram[BG_MAP_9C00 + 1] = 5; // cellule (ligne 0, colonne 1) of the carte $9C00 → tuile 5
+    vram[BG_MAP_9800 + 1] = 5; // cellule (ligne 0, colonne 1) of the carte $9800 → tuile 5
 
     let oam = [0u8; 0xA0]; // OAM vide : aucun sprite
 
     ppu.render_frame(&vram, &oam);
-    assert_eq!(ppu.framebuffer[32 * SCREEN_WIDTH + 16], PPU::shade(3)); // ligne WY : fenêtre noire (cellule (0,1))
+    assert_eq!(ppu.framebuffer[32 * SCREEN_WIDTH + 16], PPU::shade(3)); // ligne WY : fenêtre noire (cellule (0,1) of the carte $9800)
     assert_eq!(ppu.framebuffer[(32 - 1) * SCREEN_WIDTH + 16], PPU::shade(0)); // ligne WY-1 : fond blanc
     assert_eq!(ppu.framebuffer[32 * SCREEN_WIDTH + 7], PPU::shade(0)); // colonne ≤ WX : pas de fenêtre
     assert_eq!(ppu.framebuffer[32 * SCREEN_WIDTH + 8], PPU::shade(0)); // cellule (0,0) nulle → transparente → fond blanc
 
-    ppu.lcdc &= !LCDC_WIN_TILE_8800; // bit 6 du LCDC à 0 : la fenêtre utilise the tuiles $8000-$8FFF
+    ppu.lcdc &= !LCDC_WIN_MAP_9800; // bit 6 du LCDC à 0 : la carte de la fenêtre passe en $9C00-$9FFF
+    vram[BG_MAP_9C00 + 1] = 5; // cellule (ligne 0, colonne 1) of the carte $9C00 → tuile 5
+    ppu.render_frame(&vram, &oam);
+    assert_eq!(ppu.framebuffer[32 * SCREEN_WIDTH + 16], PPU::shade(3)); // fenêtre noire via la carte $9C00 (données de tuiles toujours en $8000)
+
+    ppu.lcdc = 0xE9; // bit 6 set again (carte $9800) and bit 4 à 0 : les indices de tuiles sont signés (origine $9000) — partagé fond/fenêtre
     for row in 0..8 {
-        vram[5 * 16 + 2 * row] = 0xFF; // tuile 5 de $8000 : noire (MSB des pixels)
-        vram[5 * 16 + 2 * row + 1] = 0xFF; // LSB des pixels
+        vram[0x1050 + 2 * row] = 0xFF; // tuile 5 signé : $9000 + 5*16 = $9050 → noire (seules données posées)
+        vram[0x1051 + 2 * row] = 0xFF;
     }
     ppu.render_frame(&vram, &oam);
-    assert_eq!(ppu.framebuffer[32 * SCREEN_WIDTH + 16], PPU::shade(3)); // fenêtre noire via the tuile 5 of $8000
+    assert_eq!(ppu.framebuffer[32 * SCREEN_WIDTH + 16], PPU::shade(3)); // fenêtre noire via the tuile $9050 (index signé) — pas $8050
 }
 
 #[test]
@@ -211,7 +224,7 @@ fn lcd_off_renders_black() {
 #[test]
 fn render_sprite_basic_placement() {
     let mut ppu = PPU::new();
-    ppu.write_register(0xFF40, 0x83); // LCD allumé (bit 7) + fond activé (bit 0) + sprites activées (bit 1), tuiles non signées
+    ppu.write_register(0xFF40, 0xC3); // LCD allumé (bit 7) + fond activé (bit 0) + sprites activées (bit 1) ; bit 6 set : tuiles de la fenêtre non signées
     ppu.bgp = 0xE4; // teinte v for a pixel value v
     ppu.obp0 = 0xE4;
 
@@ -237,7 +250,7 @@ fn render_sprite_basic_placement() {
 #[test]
 fn render_sprite_wraps_around_the_screen() {
     let mut ppu = PPU::new();
-    ppu.write_register(0xFF40, 0x83); // LCD allumé (bit 7) + fond activé (bit 0) + sprites activées (bit 1), tuiles non signées
+    ppu.write_register(0xFF40, 0xC3); // LCD allumé (bit 7) + fond activé (bit 0) + sprites activées (bit 1) ; bit 6 set : tuiles de la fenêtre non signées
     ppu.bgp = 0xE4; // teinte v for a pixel value v
     ppu.obp0 = 0xE4;
 
@@ -261,7 +274,7 @@ fn render_sprite_wraps_around_the_screen() {
 #[test]
 fn render_sprite_y_visibility_window() {
     let mut ppu = PPU::new();
-    ppu.write_register(0xFF40, 0x83); // LCD allumé (bit 7) + fond activé (bit 0) + sprites activées (bit 1), tuiles non signées
+    ppu.write_register(0xFF40, 0x83); // LCD allumé (bit 7) + fond activé (bit 0) + sprites activées (bit 1)
     ppu.bgp = 0xE4; // teinte v for a pixel value v
     ppu.obp0 = 0xE4;
 
@@ -288,7 +301,7 @@ fn render_sprite_y_visibility_window() {
 #[test]
 fn render_sprite_horizontal_flip() {
     let mut ppu = PPU::new();
-    ppu.write_register(0xFF40, 0x83); // LCD allumé (bit 7) + fond activé (bit 0) + sprites activées (bit 1), tuiles non signées
+    ppu.write_register(0xFF40, 0x83); // LCD allumé (bit 7) + fond activé (bit 0) + sprites activées (bit 1)
     ppu.bgp = 0xE4; // teinte v for a pixel value v
     ppu.obp0 = 0xE4;
 
@@ -312,7 +325,7 @@ fn render_sprite_horizontal_flip() {
 #[test]
 fn render_sprite_vertical_flip() {
     let mut ppu = PPU::new();
-    ppu.write_register(0xFF40, 0x83); // LCD allumé (bit 7) + fond activé (bit 0) + sprites activées (bit 1), tuiles non signées
+    ppu.write_register(0xFF40, 0x83); // LCD allumé (bit 7) + fond activé (bit 0) + sprites activées (bit 1)
     ppu.bgp = 0xE4; // teinte v for a pixel value v
     ppu.obp0 = 0xE4;
 
@@ -336,7 +349,7 @@ fn render_sprite_vertical_flip() {
 #[test]
 fn render_sprite_selects_tile_set_8800() {
     let mut ppu = PPU::new();
-    ppu.write_register(0xFF40, 0x83); // LCD allumé (bit 7) + fond activé (bit 0) + sprites activées (bit 1), tuiles non signées
+    ppu.write_register(0xFF40, 0x83); // LCD allumé (bit 7) + fond activé (bit 0) + sprites activées (bit 1)
     ppu.bgp = 0xE4; // teinte v for a pixel value v
     ppu.obp0 = 0xE4;
 
@@ -369,7 +382,7 @@ fn render_sprite_selects_tile_set_8800() {
 #[test]
 fn render_sprite_transparent_pixels() {
     let mut ppu = PPU::new();
-    ppu.write_register(0xFF40, 0x83); // LCD allumé (bit 7) + fond activé (bit 0) + sprites activées (bit 1), tuiles non signées
+    ppu.write_register(0xFF40, 0x83); // LCD allumé (bit 7) + fond activé (bit 0) + sprites activées (bit 1)
     ppu.bgp = 0xE4; // teinte v for a pixel value v
 
     let mut vram = [0u8; 0x2000];
@@ -391,7 +404,7 @@ fn render_sprite_transparent_pixels() {
 #[test]
 fn render_sprite_selects_obp_palette() {
     let mut ppu = PPU::new();
-    ppu.write_register(0xFF40, 0x83); // LCD allumé (bit 7) + fond activé (bit 0) + sprites activées (bit 1), tuiles non signées
+    ppu.write_register(0xFF40, 0x83); // LCD allumé (bit 7) + fond activé (bit 0) + sprites activées (bit 1)
     ppu.bgp = 0xE4; // teinte v for a pixel value v
     ppu.obp0 = 0xE4; // OBP0 : teinte v for a pixel value v
     ppu.obp1 = 0x8C; // OBP1 : valeurs 0-1 → teinte claire, 2-3 → foncée
@@ -415,7 +428,7 @@ fn render_sprite_selects_obp_palette() {
 #[test]
 fn render_sprite_priority_over_background() {
     let mut ppu = PPU::new();
-    ppu.write_register(0xFF40, 0x83); // LCD allumé (bit 7) + fond activé (bit 0) + sprites activées (bit 1), tuiles non signées
+    ppu.write_register(0xFF40, 0x93); // LCD allumé (bit 7) + fond activé (bit 0) + sprites activées (bit 1), tuiles non signées $8000-$8FFF (bit 4 set)
     ppu.bgp = 0xE4; // teinte v for a pixel value v
     ppu.obp0 = 0xE4;
 
@@ -449,7 +462,7 @@ fn render_sprite_priority_over_background() {
 
 #[test]
 fn render_sprites_disabled_when_lcdc_bit_1_clear() {
-    let mut ppu = PPU::new(); // LCDC = $91 : LCD allumé (bit 7) + tuiles signées (bit 4) + fond activé (bit 0), sprites éteintes (bit 1 à 0)
+    let mut ppu = PPU::new(); // LCDC = $91 : LCD allumé (bit 7) + fond activé (bit 0), sprites éteintes (bit 1 à 0), tuiles du fond non signées $8000-$8FFF (bit 4 set)
     ppu.bgp = 0xE4; // teinte v for a pixel value v
     ppu.obp0 = 0xE4;
 
@@ -475,7 +488,7 @@ fn render_sprites_disabled_when_lcdc_bit_1_clear() {
 #[test]
 fn render_sprite_limit_of_ten_per_line() {
     let mut ppu = PPU::new();
-    ppu.write_register(0xFF40, 0x83); // LCD allumé (bit 7) + fond activé (bit 0) + sprites activées (bit 1), tuiles non signées
+    ppu.write_register(0xFF40, 0x83); // LCD allumé (bit 7) + fond activé (bit 0) + sprites activées (bit 1)
     ppu.bgp = 0xE4; // teinte v for a pixel value v
     ppu.obp0 = 0xE4;
 

@@ -78,7 +78,7 @@ impl PPU {
     /// (OAM Scan) sur the line 0 ; le framebuffer is noir opaque (aucune frame rendue).
     pub fn new() -> Self {
         Self {
-            lcdc: 0x91, // LCD allumé (bit 7) + tuiles signées $8800-$97FF (bit 4) + fond activé (bit 0)
+            lcdc: 0x91, // LCD allumé (bit 7) + tuiles non signées $8000-$8FFF (bit 4 set) + fond activé (bit 0)
             stat: 0x00,
             scy: 0x00,
             scx: 0x00,
