@@ -527,28 +527,32 @@ fn ld_mem_r16(cpu: &mut CPU, mmu: &mut MMU, idx: u8, to_mem: bool) -> u32 {
     8
 }
 
-/// LD (HL+), A / LD A, (HL+) (12 T-cycles) ; HL incrémenté après l'accès.
-fn ld_hl_inc(cpu: &mut CPU, mmu: &mut MMU, to_mem: bool) -> u32 {
-    let addr = cpu.hl();
-    if to_mem {
-        mmu.write(addr, cpu.a);
-    } else {
-        cpu.a = mmu.read(addr);
-    }
-    set_reg16(cpu, 2, addr.wrapping_add(1));
+/// LD HL,(a16) (12 T-cycles) : lit l'adresse a16 à `cpu.pc`, puis charge HL depuis cette adresse.
+fn ld_hl_a16(cpu: &mut CPU, mmu: &mut MMU) -> u32 {
+    let addr = read_a16(mmu, cpu.pc);
+    set_reg16(
+        cpu,
+        2,
+        u16::from_le_bytes([mmu.read(addr), mmu.read(addr.wrapping_add(1))]),
+    );
+    cpu.pc = cpu.pc.wrapping_add(2); // passe l'immédiat a16
     12
 }
 
-/// LD (HL-), A / LD A, (HL-) (12 T-cycles) ; HL décrémenté après l'accès.
-fn ld_hl_dec(cpu: &mut CPU, mmu: &mut MMU, to_mem: bool) -> u32 {
-    let addr = cpu.hl();
-    if to_mem {
-        mmu.write(addr, cpu.a);
-    } else {
-        cpu.a = mmu.read(addr);
-    }
-    set_reg16(cpu, 2, addr.wrapping_sub(1));
-    12
+/// LD (a16),A (16 T-cycles) : écrit A à l'adresse a16 lue à `cpu.pc`.
+fn ld_a16_a(cpu: &mut CPU, mmu: &mut MMU) -> u32 {
+    let addr = read_a16(mmu, cpu.pc);
+    mmu.write(addr, cpu.a);
+    cpu.pc = cpu.pc.wrapping_add(2); // passe l'immédiat a16
+    16
+}
+
+/// LD A,(a16) (16 T-cycles) : lit le byte à l'adresse a16 lue à `cpu.pc` dans A.
+fn ld_a_a16(cpu: &mut CPU, mmu: &mut MMU) -> u32 {
+    let addr = read_a16(mmu, cpu.pc);
+    cpu.a = mmu.read(addr);
+    cpu.pc = cpu.pc.wrapping_add(2); // passe l'immédiat a16
+    16
 }
 
 /// LDH [n8],A (8 T-cycles) : écrit A dans le port $FF00+n8. L'immédiat est à `cpu.pc`.
@@ -567,11 +571,23 @@ fn out_n_a(cpu: &mut CPU, mmu: &mut MMU) -> u32 {
     12
 }
 
-/// IN A,(n8) (12 T-cycles) : lit le port $FF00+n8 dans A. L'immédiat est à `cpu.pc`.
+/// IN A,(n8) (12 T-cycles) : lit le port $FF00+n8 dans A and sets the flags from the result :
+/// Z=(A==0), N=0, H=(bit 4 of A set), C=(bit 0 of A set). L'immédiat est à `cpu.pc`.
 fn in_a_n(cpu: &mut CPU, mmu: &mut MMU) -> u32 {
     let n = mmu.read(cpu.pc);
     cpu.pc = cpu.pc.wrapping_add(1); // passe l'immédiat n8
     cpu.a = mmu.read(0xFF00u16.wrapping_add(n as u16));
+    let mut f = Flags::empty(); // N=0
+    if cpu.a == 0 {
+        f |= Flags::Z;
+    }
+    if cpu.a & 0x10 != 0 {
+        f |= Flags::H;
+    }
+    if cpu.a & 0x01 != 0 {
+        f |= Flags::C;
+    }
+    cpu.set_flags(f);
     12
 }
 
@@ -692,7 +708,7 @@ pub fn execute(cpu: &mut CPU, mmu: &mut MMU, opcode: u8) -> u32 {
             jr(cpu, e8, cond_met(cpu, 0))
         } // JR NZ,e8 (12/4)
         0x21 => ld_r16_imm(cpu, mmu, 2),   // LD HL, n16 (12)
-        0x22 => ld_hl_inc(cpu, mmu, true), // LD (HL+), A (12)
+        0x22 => ldh_a8(cpu, mmu),             // LDH [n8],A (8) : écrit A dans le port $FF00+n8
         0x23 => inc_dec16(cpu, 2, 1),      // INC HL (8)
         0x24 => inc8(cpu, mmu, 4),         // INC H (4) : Z N H C
         0x25 => dec8(cpu, mmu, 4),         // DEC H (4) : Z N=1 H C
@@ -705,8 +721,11 @@ pub fn execute(cpu: &mut CPU, mmu: &mut MMU, opcode: u8) -> u32 {
             let e8 = mmu.read(cpu.pc) as i8;
             jr(cpu, e8, cond_met(cpu, 1))
         } // JR Z,e8 (12/4)
-        0x29 => add_hl(cpu, cpu.hl()),     // ADD HL, HL (8) : N=0 H C, Z inchangé
-        0x2A => ld_hl_dec(cpu, mmu, false), // LD A, (HL-) (12)
+        0x29 => {
+            // ADD HL,HL (16 T-cycles on DMG) : N=0 H C, Z inchangé.
+            add_hl(cpu, cpu.hl()) + 8
+        }
+        0x2A => ld_hl_a16(cpu, mmu),          // LD HL,(a16) (12)
         0x2B => inc_dec16(cpu, 2, -1),     // DEC HL (8)
         0x2C => inc8(cpu, mmu, 5),         // INC L (4) : Z N H C
         0x2D => dec8(cpu, mmu, 5),         // DEC L (4) : Z N=1 H C
@@ -718,7 +737,7 @@ pub fn execute(cpu: &mut CPU, mmu: &mut MMU, opcode: u8) -> u32 {
             jr(cpu, e8, cond_met(cpu, 2))
         } // JR NC,e8 (12/4)
         0x31 => ld_r16_imm(cpu, mmu, 3),    // LD SP, n16 (12)
-        0x32 => ld_hl_inc(cpu, mmu, false), // LD A, (HL+) (12)
+        0x32 => ld_a16_a(cpu, mmu),           // LD (a16),A (16)
         0x33 => inc_dec16(cpu, 3, 1),       // INC SP (8)
         0x34 => inc8(cpu, mmu, 6),          // INC (HL) (12) : Z N H C
         0x35 => dec8(cpu, mmu, 6),          // DEC (HL) (12) : Z N=1 H C
@@ -731,8 +750,11 @@ pub fn execute(cpu: &mut CPU, mmu: &mut MMU, opcode: u8) -> u32 {
             let e8 = mmu.read(cpu.pc) as i8;
             jr(cpu, e8, cond_met(cpu, 3))
         } // JR C,e8 (12/4)
-        0x39 => add_hl(cpu, cpu.sp),        // ADD HL, SP (8) : N=0 H C, Z inchangé
-        0x3A => ld_hl_dec(cpu, mmu, true),  // LD (HL-), A (12)
+        0x39 => {
+            // ADD HL,SP (16 T-cycles on DMG) : N=0 H C, Z inchangé.
+            add_hl(cpu, cpu.sp) + 8
+        }
+        0x3A => ld_a_a16(cpu, mmu),           // LD A,(a16) (16)
         0x3B => inc_dec16(cpu, 3, -1),      // DEC SP (8)
         0x3C => inc8(cpu, mmu, 7),          // INC A (4) : Z N H C
         0x3D => dec8(cpu, mmu, 7),          // DEC A (4) : Z N=1 H C
@@ -1202,15 +1224,23 @@ pub fn disasm(cpu: &CPU, mmu: &MMU) -> String {
             read_a16(mmu, cpu.pc.wrapping_add(1))
         ),
 
-        // LD (r16), A / LD A, (r16) et variantes HL±
+        // LD (r16), A / LD A, (r16)
         0x02 => "ld (bc), a".to_string(),
         0x0A => "ld a, (bc)".to_string(),
         0x12 => "ld (de), a".to_string(),
         0x1A => "ld a, (de)".to_string(),
-        0x22 => "ld (hl+), a".to_string(),
-        0x32 => "ld a, (hl+)".to_string(),
-        0x2A => "ld a, (hl-)".to_string(),
-        0x3A => "ld (hl-), a".to_string(),
+
+        // LDH [n8],A / LD HL,(a16) / LD (a16),A / LD A,(a16)
+        0x22 => format!("ldh [${:02X}], a", mmu.read(cpu.pc.wrapping_add(1))),
+        0x2A => format!(
+            "ld hl, (${ :04X})",
+            read_a16(mmu, cpu.pc.wrapping_add(1))
+        ),
+        0x32 => format!("ld (${ :04X}), a", read_a16(mmu, cpu.pc.wrapping_add(1))),
+        0x3A => format!(
+            "ld a, (${ :04X})",
+            read_a16(mmu, cpu.pc.wrapping_add(1))
+        ),
 
         // INC/DEC r16
         0x03 | 0x13 | 0x23 | 0x33 => format!("inc {}", reg16_name(opcode >> 4)),
@@ -1413,6 +1443,97 @@ mod tests {
         assert_eq!(execute(&mut cpu, &mut mmu, 0xF2), 8);
         assert_eq!(cpu.pc, 0x0102);
         assert_eq!(mmu.read(0xFFC0), 0x78); // le port $FFC0 (HRAM) reçoit A
+    }
+
+    /// LDH [n8],A ($22) : écrit A dans le port $FF00+n8 (l'immédiat n8, pas le registre C).
+    #[test]
+    fn ldh_n_a_at_0x22_writes_the_accumulator_to_the_io_port() {
+        let mut mmu = rom_with(&[0x22, 0xC0]); // $0100 : LDH [$C0],A
+        let mut cpu = CPU::new();
+        cpu.pc = 0x0101; // pointe sur l'immédiat (comme après the lecture of the opcode)
+        cpu.a = 0x78;
+        assert_eq!(execute(&mut cpu, &mut mmu, 0x22), 8);
+        assert_eq!(cpu.pc, 0x0102);
+        assert_eq!(mmu.read(0xFFC0), 0x78); // le port $FFC0 (HRAM) reçoit A
+    }
+
+    /// LD (a16),A ($32) : écrit A à l'adresse a16 — c'est the instruction that the boot ROM DMG uses at $0007
+    /// (`LD ($7CCB),A`) to clear VRAM.
+    #[test]
+    fn ld_a16_a_writes_the_accumulator_to_memory() {
+        let mut mmu = rom_with(&[0x32, 0xCB, 0x7C]); // $0100 : LD ($7CCB),A
+        let mut cpu = CPU::new();
+        cpu.pc = 0x0101; // pointe sur the first octet of a16 (comme after the lecture of the opcode)
+        cpu.a = 0x42;
+        assert_eq!(execute(&mut cpu, &mut mmu, 0x32), 16);
+        assert_eq!(cpu.pc, 0x0103); // passe les deux octets de l'adresse
+        assert_eq!(mmu.read(0x7CCB), 0x42);
+    }
+
+    /// LD A,(a16) ($3A) : lit le byte à l'adresse a16 dans A.
+    #[test]
+    fn ld_a_a16_reads_memory_into_the_accumulator() {
+        let mut mmu = rom_with(&[0x3A, 0xCB, 0x7C]); // $0100 : LD A,($7CCB)
+        let mut cpu = CPU::new();
+        cpu.pc = 0x0101;
+        mmu.write(0x7CCB, 0xAB);
+        assert_eq!(execute(&mut cpu, &mut mmu, 0x3A), 16);
+        assert_eq!(cpu.pc, 0x0103);
+        assert_eq!(cpu.a, 0xAB);
+    }
+
+    /// LD HL,(a16) ($2A) : charge HL depuis l'adresse a16 (octet bas puis octet haut).
+    #[test]
+    fn ld_hl_a16_loads_hl_from_memory() {
+        let mut mmu = rom_with(&[0x2A, 0xCB, 0x7C]); // $0100 : LD HL,($7CCB)
+        let mut cpu = CPU::new();
+        cpu.pc = 0x0101;
+        mmu.write(0x7CCB, 0x34); // octet bas
+        mmu.write(0x7CCC, 0x12); // octet haut
+        assert_eq!(execute(&mut cpu, &mut mmu, 0x2A), 12);
+        assert_eq!(cpu.pc, 0x0103);
+        assert_eq!(cpu.hl(), 0x1234);
+    }
+
+    /// ADD HL,HL ($29) / ADD HL,SP ($39) : 16 T-cycles on DMG (8 on CGB).
+    #[test]
+    fn add_hl_self_and_sp_take_16_cycles_on_dmg() {
+        let mut mmu = MMU::new();
+        let mut cpu = CPU::new();
+
+        cpu.h = 0x00;
+        cpu.l = 0x20; // HL = $0020
+        assert_eq!(execute(&mut cpu, &mut mmu, 0x29), 16); // ADD HL,HL
+        assert_eq!(cpu.hl(), 0x0040);
+
+        cpu.h = 0xFF;
+        cpu.l = 0xF0; // HL = $FFF0 ; SP = $FFFE (reset)
+        assert_eq!(execute(&mut cpu, &mut mmu, 0x39), 16); // ADD HL,SP
+        assert_eq!(cpu.hl(), 0xFFEE);
+    }
+
+    /// IN A,(n8) ($F0) : sets the flags from the result — Z=(A==0), N=0, H=(bit 4 set), C=(bit 0 set).
+    #[test]
+    fn in_a_n_sets_flags_from_the_result() {
+        let mut mmu = rom_with(&[0xF0, 0xC0]); // $0100 : IN A,($C0)
+        let mut cpu = CPU::new();
+        cpu.pc = 0x0101;
+
+        mmu.write(0xFFC0, 0x11); // bit 4 set, bit 0 set
+        execute(&mut cpu, &mut mmu, 0xF0);
+        assert_eq!(cpu.a, 0x11);
+        let f = cpu.flags();
+        assert!(!f.contains(Flags::Z));
+        assert!(!f.contains(Flags::N));
+        assert!(f.contains(Flags::H));
+        assert!(f.contains(Flags::C));
+
+        mmu.write(0xFFC0, 0x00); // all bits clear
+        execute(&mut cpu, &mut mmu, 0xF0);
+        let f = cpu.flags();
+        assert!(f.contains(Flags::Z));
+        assert!(!f.contains(Flags::H));
+        assert!(!f.contains(Flags::C));
     }
 
     #[test]
