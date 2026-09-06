@@ -2,9 +2,12 @@
 //!
 //! PanDocs « Serial Data Transfer » : le port série émet un octet à la fois sur
 //! le câble link, **sans appareil branché de l'autre côté**. Les ROMs de test
-//! (retrio/gb-test-roms, cpu_instrs…) rapportent leurs résultats par ce port :
-//! elles écrivent le caractère dans SB puis $81 dans SC (bit 7 = Transfer
-//! enable), sans polling ni interruption.
+//! rapportent leurs résultats par ce port : elles écrivent le caractère dans SB
+//! puis $81 dans SC (bit 7 = Transfer enable), sans polling ni interruption.
+//! À noter : les builds livrés des ROM blargg cpu_instrs (retrio/gb-test-roms)
+//! font exception — leurs macros `sta`/`wreg` se développent en lectures de RAM
+//! basse (E0 nn) au lieu d'écritures IO (F0 nn), si bien qu'elles ne pilotent
+//! jamais ce port ; voir les tests dans emulator.rs.
 //!
 //! Chaque octet émis en mode master est affiché immédiatement dans la console hôte
 //! (stdout) : caractères ASCII imprimables tels quels, 0x0A → newline,
@@ -68,6 +71,7 @@ impl Serial {
     /// - bit 7 seul (SC = $80, horloge externe / esclave) : the transfer reste en attente d'une horloge which n'arrivera jamais ; le bit 7 se lit à 1.
     /// Seuls les bits 7 and 0 are écriturables sur DMG.
     pub fn write_sc(&mut self, value: u8) {
+        log::info!("[Serial] write_sc appelé avec value={:02X}", value); // diagnostic : révéler si le CPU atteint la SCC du tout
         // Bit 7 = Transfer Start Flag : seuls les bits 7 et 0 sont pris en compte (DMG).
         self.sc = (self.sc & !0x81) | (value & 0x81);
 
