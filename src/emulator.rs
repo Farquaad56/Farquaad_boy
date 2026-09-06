@@ -72,7 +72,9 @@ impl Emulator {
     /// `rom/Boot_room.gb` (repli sur l'image DMG embarquée si absent/invalide). Use this for real
     /// cartridges; unit tests that want to jump straight into game code should use [`Emulator::load_rom`]
     /// (post-boot hand-off at $0100) instead. C'est la séquence de démarrage par défaut de l'application :
-    /// `FarquaadGBApp` charge chaque ROM via cette méthode.
+    /// `FarquaadGBApp` charge chaque ROM via cette méthode, sauf si « ⏭ Skip Boot ROM » est cochée dans the menu bar,
+    /// ou if le logo Nintendo de la cartouche ($0104-$0133) is invalide — auquel cas the bypass est activé automatiquement
+    /// (la boot ROM réelle se verrouillerait en boucle infinie) et un avertissement est affiché dans the menu bar.
     pub fn load_rom_with_boot(&mut self, data: Vec<u8>) {
         self.mmu.load_rom(data);
         self.power_on();
@@ -195,10 +197,10 @@ impl Emulator {
         if frame_done {
             log::debug!("[PPU] Frame boundary crossed at t_cycles={}", self.t_cycles);
 
-            // --- Traceur de PC amélioré : si l'opcode au PC est $F0 (LDH), on lit l'octet suivant pour
-            //     voir l'adresse I/O ciblée ($FFnn) — permet d'identifier le registre lu/écrit. ---
+            // --- Traceur de PC amélioré : si l'opcode au PC est $E0/$F0/$F2 (OUT/IN/LDH avec n8), on lit
+            //     l'octet suivant pour voir l'adresse I/O ciblée ($FFnn) — permet d'identifier le registre lu/écrit. ---
             let opcode = self.mmu.read(self.cpu.pc);
-            let operand = if opcode == 0xF0 {
+            let operand = if matches!(opcode, 0xE0 | 0xF0 | 0xF2) {
                 format!(
                     "(n=${:02X} -> Addr=$FF{:02X})",
                     self.mmu.read(self.cpu.pc + 1),
@@ -579,12 +581,12 @@ mod tests {
         let code: &[u8] = &[
             0x31, 0xFF, 0xDF, // LD SP,$DFFF
             0x3E, 0x01, // LD A,$01
-            0xF0, 0xFF, // LDH [$FFFF],A → IE = $01 : VBlank uniquement
+            0xF2, 0xFF, // LDH [$FFFF],A → IE = $01 : VBlank uniquement
             0xFB, // EI (IME effectif after the next instruction)
             0x76, // HALT
         ];
         rom[0x0100..0x0100 + code.len()].copy_from_slice(code);
-        rom[0x40] = 0xF0; // LDH [$FFC0],A : VBlank handler marker
+        rom[0x40] = 0xF2; // LDH [$FFC0],A : VBlank handler marker
         rom[0x41] = 0xC0;
         rom[0x42] = 0xC9; // RET
 

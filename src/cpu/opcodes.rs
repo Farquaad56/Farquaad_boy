@@ -551,17 +551,28 @@ fn ld_hl_dec(cpu: &mut CPU, mmu: &mut MMU, to_mem: bool) -> u32 {
     12
 }
 
-/// LDH [a8], A / LDH A, [a8] (8 T-cycles) : accès à $FF00+a8. L'immédiat est à `cpu.pc`.
-fn ldh_a8(cpu: &mut CPU, mmu: &mut MMU, to_mem: bool) -> u32 {
-    let a8 = mmu.read(cpu.pc);
+/// LDH [n8],A (8 T-cycles) : écrit A dans le port $FF00+n8. L'immédiat est à `cpu.pc`.
+fn ldh_a8(cpu: &mut CPU, mmu: &mut MMU) -> u32 {
+    let n = mmu.read(cpu.pc);
     cpu.pc = cpu.pc.wrapping_add(1); // passe l'immédiat n8
-    let addr = 0xFF00u16.wrapping_add(a8 as u16);
-    if to_mem {
-        mmu.write(addr, cpu.a);
-    } else {
-        cpu.a = mmu.read(addr);
-    }
+    mmu.write(0xFF00u16.wrapping_add(n as u16), cpu.a);
     8
+}
+
+/// OUT (n8),A (12 T-cycles) : écrit A dans le port $FF00+n8. L'immédiat est à `cpu.pc`.
+fn out_n_a(cpu: &mut CPU, mmu: &mut MMU) -> u32 {
+    let n = mmu.read(cpu.pc);
+    cpu.pc = cpu.pc.wrapping_add(1); // passe l'immédiat n8
+    mmu.write(0xFF00u16.wrapping_add(n as u16), cpu.a);
+    12
+}
+
+/// IN A,(n8) (12 T-cycles) : lit le port $FF00+n8 dans A. L'immédiat est à `cpu.pc`.
+fn in_a_n(cpu: &mut CPU, mmu: &mut MMU) -> u32 {
+    let n = mmu.read(cpu.pc);
+    cpu.pc = cpu.pc.wrapping_add(1); // passe l'immédiat n8
+    cpu.a = mmu.read(0xFF00u16.wrapping_add(n as u16));
+    12
 }
 
 /// LDH [C], A / LDH A, [C] (12 T-cycles) : accès à $FF00+C.
@@ -840,7 +851,7 @@ pub fn execute(cpu: &mut CPU, mmu: &mut MMU, opcode: u8) -> u32 {
             8
         } // SBC A,n8 (8)
 
-        0xE0 => ldh_a8(cpu, mmu, false),       // LDH A, [n8] (8) : lit $FF00+n8 dans A
+        0xE0 => out_n_a(cpu, mmu),             // OUT (n8),A (12) : écrit A dans le port $FF00+n8
         0xE1 => pop_r16(cpu, mmu, 2),          // POP HL (12)
         0xE2 => ldh_c(cpu, mmu, false),        // LDH A, [C] (12)
         0xE3 | 0xE4 | 0xEB | 0xEC | 0xED => 4, // opcodes invalides (hard-lock sur le matériel)
@@ -873,9 +884,9 @@ pub fn execute(cpu: &mut CPU, mmu: &mut MMU, opcode: u8) -> u32 {
             8
         } // XOR A,n8 (8)
 
-        0xF0 => ldh_a8(cpu, mmu, true),  // LDH [n8], A (8) : écrit A dans $FF00+n8
+        0xF0 => in_a_n(cpu, mmu),        // IN A,(n8) (12) : lit le port $FF00+n8 dans A
         0xF1 => pop_r16(cpu, mmu, 3),    // POP AF (12)
-        0xF2 => ldh_c(cpu, mmu, true),   // LDH [C], A (12)
+        0xF2 => ldh_a8(cpu, mmu),        // LDH [n8],A (8) : écrit A dans le port $FF00+n8
         0xF3 => {
             cpu.ime = false;
             cpu.ei_delay = 0;
@@ -1318,11 +1329,11 @@ pub fn disasm(cpu: &CPU, mmu: &MMU) -> String {
         // Préfixe CB (sous-opcode à pc+1)
         0xCB => format!("cb {}", cb_mnemonic(mmu.read(cpu.pc.wrapping_add(1)))),
 
-        // LDH / LD a16 / ADD SP / DI / EI
-        0xE0 => format!("ldh a, [${:02X}]", mmu.read(cpu.pc.wrapping_add(1))),
-        0xF0 => format!("ldh [${:02X}], a", mmu.read(cpu.pc.wrapping_add(1))),
-        0xE2 => "ldh a, [c]".to_string(),
-        0xF2 => "ldh [c], a".to_string(),
+        // OUT / IN / LDH / LD a16 / ADD SP / DI / EI
+        0xE0 => format!("out (${:02X}), a", mmu.read(cpu.pc.wrapping_add(1))),
+        0xF0 => format!("in a, (${:02X})", mmu.read(cpu.pc.wrapping_add(1))),
+        0xE2 => "ldh a,(c)".to_string(),
+        0xF2 => format!("ldh [${:02X}], a", mmu.read(cpu.pc.wrapping_add(1))),
         0xEA => format!("ld (${ :04X}), a", read_a16(mmu, cpu.pc.wrapping_add(1))),
         0xFA => format!("ld a, (${ :04X})", read_a16(mmu, cpu.pc.wrapping_add(1))),
         0xE8 => format!("add sp, ${:02X}", mmu.read(cpu.pc.wrapping_add(1))),
@@ -1365,6 +1376,43 @@ mod tests {
         assert_eq!(cpu.pc, 0x0100); // cible du vecteur de reset
         assert!(!cpu.ime);
         assert!(!cpu.halted);
+    }
+
+    /// OUT (n8),A ($E0) : écrit A dans le port $FF00+n8 — c'est l'instruction dont la boot ROM DMG
+    /// se sert pour écrire rBANK ($FF50) et se dé-mapper.
+    #[test]
+    fn out_n_a_writes_the_accumulator_to_the_io_port() {
+        let mut mmu = rom_with(&[0xE0, 0xC0]); // $0100 : OUT ($C0),A
+        let mut cpu = CPU::new();
+        cpu.pc = 0x0101; // pointe sur l'immédiat (comme après la lecture de l'opcode)
+        cpu.a = 0x42;
+        assert_eq!(execute(&mut cpu, &mut mmu, 0xE0), 12);
+        assert_eq!(cpu.pc, 0x0102);
+        assert_eq!(mmu.read(0xFFC0), 0x42); // le port $FFC0 (HRAM) reçoit A
+    }
+
+    /// IN A,(n8) ($F0) : lit le port $FF00+n8 dans A.
+    #[test]
+    fn in_a_n_reads_the_io_port_into_the_accumulator() {
+        let mut mmu = rom_with(&[0xF0, 0xC0]); // $0100 : IN A,($C0)
+        let mut cpu = CPU::new();
+        cpu.pc = 0x0101; // pointe sur l'immédiat (comme après la lecture de l'opcode)
+        mmu.write(0xFFC0, 0xAB);
+        assert_eq!(execute(&mut cpu, &mut mmu, 0xF0), 12);
+        assert_eq!(cpu.pc, 0x0102);
+        assert_eq!(cpu.a, 0xAB); // A reçoit le port $FFC0 (HRAM)
+    }
+
+    /// LDH [n8],A ($F2) : écrit A dans le port $FF00+n8 (l'immédiat n8, pas le registre C).
+    #[test]
+    fn ldh_n_a_writes_the_accumulator_to_the_io_port() {
+        let mut mmu = rom_with(&[0xF2, 0xC0]); // $0100 : LDH [$C0],A
+        let mut cpu = CPU::new();
+        cpu.pc = 0x0101; // pointe sur l'immédiat (comme après la lecture de l'opcode)
+        cpu.a = 0x78;
+        assert_eq!(execute(&mut cpu, &mut mmu, 0xF2), 8);
+        assert_eq!(cpu.pc, 0x0102);
+        assert_eq!(mmu.read(0xFFC0), 0x78); // le port $FFC0 (HRAM) reçoit A
     }
 
     #[test]

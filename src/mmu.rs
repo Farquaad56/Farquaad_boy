@@ -176,6 +176,15 @@ impl MMU {
         self.read_plain(addr)
     }
 
+    /// Debug read (memory editor): reads a byte across the full 16-bit address map without PPU/DMA bus blocking;
+    /// a debugger must always show actual RAM contents, even during OAM Scan / Drawing modes or DMA transfers.
+    pub fn read_debug(&self, addr: u16) -> u8 {
+        if !self.boot_rom_finished && addr < 0x100 {
+            return self.boot_rom[addr as usize];
+        }
+        self.read_plain(addr)
+    }
+
     /// La PPU bloque-t-elle la VRAM ($8000-$9FFF) au CPU ? Seulement pendant le mode Drawing (3), et
     /// uniquement quand le LCD est allumé (bit 7 du LCDC) — Pan Docs « PPU ».
     fn vram_blocked(&self) -> bool {
@@ -370,6 +379,12 @@ impl MMU {
             Some(byte) => *byte,
             None => 0xFF,
         }
+    }
+
+    /// Raw cartridge ROM byte at a flat offset (bank 0 first), $FF beyond the end of the file
+    /// (open bus) — used by the Pattern Table widget to render raw ROM banks as tile grids.
+    pub fn rom_raw(&self, idx: usize) -> u8 {
+        self.read_rom_at(idx as u32)
     }
 }
 
