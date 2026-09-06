@@ -32,6 +32,9 @@ pub struct CPU {
     pub ime: bool,
     /// Le CPU est-il en état HALT ? (sorti par une interruption pendante — le « HALT bug »).
     pub halted: bool,
+    /// Bug HALT DMG : posé quand le CPU sort de l'état HALT à cause d'une interruption pendante (bit de IF) ; la
+    /// prochaine instruction fetchée est exécutée deux fois (le même opcode est re-fetché sans avancer le PC).
+    pub halt_bug: bool,
     /// Retard d'activation de IME après un EI : IME n'est réactivé qu'une fois l'instruction
     /// EI suivante exécutée (Pan Docs « CPU Instruction Set »). 0 = pas de retard en cours.
     pub ei_delay: u8,
@@ -57,6 +60,7 @@ impl CPU {
             pc: 0x0100, // cible du vecteur de reset
             ime: false,
             halted: false,
+            halt_bug: false,
             ei_delay: 0,
             t_cycles: 0,
             isr_log_frame: u32::MAX,
@@ -91,15 +95,17 @@ impl CPU {
 
     /// Exécute une instruction et renvoie le nombre de T-cycles consommés.
     ///
-    /// Si le CPU est en HALT et qu'une interruption est pendante, l'état HALT est
-    /// annulé (le « HALT bug ») et l'interruption est servie même si IME est faux.
+    /// Bug HALT DMG : si le CPU est en HALT and any bit of IF ($FF0F) is set — even if IME is faux or the flag
+    /// n'est pas activé dans IE — l'état HALT is annulé (le « HALT bug ») and la prochaine instruction fetchée is exécutée
+    /// deux times : le même opcode est re-fetché sans avancer le PC for ce second fetch. Si IME is en plus vrai, the
+    /// interruption is additionally servied (voir `opcodes::handle_interrupts`).
     ///
     /// Le retard d'EI est décrémenté après chaque instruction exécutée : IME n'est
     /// réactivé qu'une fois l'instruction EI suivante exécutée (Pan Docs).
     pub fn step(&mut self, mmu: &mut MMU) -> u32 {
-        // Check for interrupts before fetching the next opcode.
+        // Check for interrupts before fetching the next opcode (also exits HALT — see handle_interrupts).
         if let Some(cycles) = opcodes::handle_interrupts(self, mmu) {
-            return cycles;
+            return cycles; // un halt_bug posé par la sortie de HALT persiste jusqu'au fetch suivant
         }
 
         // If halted and no interrupt is pending, consume 4 T-cycles (HALT loop).
@@ -107,7 +113,16 @@ impl CPU {
             return 4;
         }
 
-        let opcode = mmu.read(self.pc);
+        // Bug HALT DMG : quand le CPU vient de sortir de l'état HALT à cause d'une interruption pendante, la
+        // prochaine instruction est exécutée deux times — le même opcode est re-fetché sans avancer le PC for ce
+        // second fetch (les opérandes sont re-lus à leurs offsets habituels).
+        let doubled = self.halt_bug;
+        self.halt_bug = false;
+
+        let start_pc = self.pc;
+        let mut cycles = 0u32;
+        for i in 0..(if doubled { 2 } else { 1 }) {
+            let opcode = mmu.read(self.pc);
 
         // 🚨 DÉTECTEUR DE CRASH : Si le PC entre in HRAM, on le loggue immediately — cela nous dira how the CPU got there.
         if self.pc >= 0xFF00 && self.pc <= 0xFFFE {
@@ -135,8 +150,12 @@ impl CPU {
             }
         }
 
-        self.pc = self.pc.wrapping_add(1);
-        let cycles = opcodes::execute(self, mmu, opcode);
+            self.pc = self.pc.wrapping_add(1);
+            cycles += opcodes::execute(self, mmu, opcode);
+            if doubled && i == 0 {
+                self.pc = start_pc; // re-fetch du même opcode sans avancer le PC for ce second fetch (entre les deux exécutions seulement)
+            }
+        }
         // EI : IME devient effectif après l'instruction EI suivante (2 étapes : la fin de
         // l'instruction EI elle-même, puis celle qui suit).
         if self.ei_delay > 0 {

@@ -5,8 +5,6 @@
 //! et les instructions d'interruption EI/DI/RETI (PanDocs « CPU Instruction Set »,
 //! gbdev « GameBoy CPU »).
 
-use std::sync::atomic::{AtomicU32, Ordering};
-
 use crate::cpu::CPU;
 use crate::cpu::flags::Flags;
 use crate::mmu::MMU;
@@ -447,7 +445,9 @@ fn ret_cond(cpu: &mut CPU, mmu: &mut MMU, taken: bool) -> u32 {
 /// RETI (16 T-cycles) : comme RET mais réactive IME.
 fn reti(cpu: &mut CPU, mmu: &mut MMU) -> u32 {
     let return_addr = pop16(cpu, mmu);
-    cpu.ime = true; // le drapeau IF correspondant n'est effacé que par the jeu (write-1-to-clear dans $FF0F)
+    cpu.ime = true; // le bit IF correspondant a déjà été effacé par le matériel au moment du service (GBCTR Chapter 7) :
+                    // un RETI ne re-déclenche donc pas la même interruption ; si d'autres sources restent en attente,
+                    // c'est au jeu de les acknowledge via un write-1-to-clear dans $FF0F
 
     log::debug!(
         "[CPU] RETI: return_addr=${:04X}, SP=${:04X}, IME re-enabled, IF={:02X}",
@@ -1066,19 +1066,23 @@ pub fn execute_cb(cpu: &mut CPU, mmu: &mut MMU, sub_opcode: u8) -> u32 {
 
 /// Traite les interruptions pendantes avant la prochaine instruction.
 ///
-/// Renvoie `Some(20)` si une interruption est servied : IME est désactivé, le bit IF
-/// correspondant à l'interruption acceptée est effacé automatiquement par le matériel,
-/// le PC est poussé sur la pile et le CPU saute vers le vecteur de l'interruption
-/// pendante+activée de plus bas (V-Blank $40, LC3C $48, Timer $50, Serial $58, Joypad $60).
+/// Renvoie `Some(20)` si une interruption est servied : IME est désactivé, le bit IF correspondant à
+/// l'interruption acceptée est effacé automatiquement par le matériel au moment de l'acknowledgment
+/// (GBCTR Chapter 7 / Pan Docs « Interrupt Sources ») — sans cet effacement, un RETI qui réactive IME
+/// re-déclencherait immédiatement la même interruption (boucle infinie dans l'ISR). Le PC est poussé sur
+/// la pile et le CPU saute vers le vecteur de l'interruption pendante+activée de plus bas (V-Blank $40,
+/// LCDC $48, Timer $50, Serial $58, Joypad $60).
 ///
-/// HALT bug : si le CPU est en HALT et qu'une interruption est pendante (même si IME=false), l'état HALT est annulé ;
-/// si IME est également vrai, l'interruption est servied.
+/// Bug HALT DMG : si le CPU est in HALT and any bit of IF ($FF0F) is set — even if IME is false or the flag n'est pas activé dans IE —
+/// l'état HALT is annulé and la prochaine instruction fetchée is exécutée deux times (voir `CPU::step`) ; si IME is en plus vrai,
+/// the interruption is additionally servied.
 pub fn handle_interrupts(cpu: &mut CPU, mmu: &mut MMU) -> Option<u32> {
     let pending = mmu.io[0x0F] & mmu.ie; // IF ($FF0F) & IE
 
-    if cpu.halted && pending != 0 {
-        // HALT bug : une interruption pendante sort du HALT même si IME est false.
+    if cpu.halted && (mmu.io[0x0F] & 0x1F) != 0 {
+        // Bug HALT DMG : n'importe quel bit de IF posé sort du HALT — même si IME is false or the drapeau n'est pas activé dans IE.
         cpu.halted = false;
+        cpu.halt_bug = true; // la prochaine instruction fetchée sera exécutée deux times (voir `CPU::step`)
         log::debug!(
             "[CPU] HALT exited: pending={:02X}, IF={:02X}, IE={:02X}",
             pending,
@@ -1088,52 +1092,37 @@ pub fn handle_interrupts(cpu: &mut CPU, mmu: &mut MMU) -> Option<u32> {
     }
 
     if !cpu.ime || pending == 0 {
-        if !cpu.ime && pending != 0 {
-            // Throttle : loggue une occurrence sur 4096 pour éviter le spam instruction par instruction,
-            // tout en révélant où le CPU tourne avec IME éteint (PC constant = boucle bloquée).
-            static IRQ_OFF_COUNT: AtomicU32 = AtomicU32::new(0);
-            let n = IRQ_OFF_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-            if n % 4096 == 1 {
-                log::debug!(
-                    "[CPU] Interrupts pending but IME=OFF: PC=${:04X}, opcode=${:02X}, pending={:02X}, IF={:02X}, IE={:02X}",
-                    cpu.pc,
-                    mmu.read(cpu.pc),
-                    pending,
-                    mmu.io[0x0F],
-                    mmu.ie,
-                );
-            }
-        }
         return None;
     }
 
-    // On récupère l'adresse du vecteur corresponding au bit d'interruption le plus prioritaire (bit 0 > bit 4).
-    let vector = match pending {
-        p if p & 0x01 != 0 => 0x40, // V-Blank (IF bit 0)
-        p if p & 0x02 != 0 => 0x48, // LCDC / STAT (IF bit 1)
-        p if p & 0x04 != 0 => 0x50, // Timer (IF bit 2)
-        p if p & 0x08 != 0 => 0x58, // Serial (IF bit 3)
-        _ => 0x60, // Joypad (IF bit 4) — bits parasites : repli sur le vecteur Joypad
+    // On récupère l'adresse du vecteur et le bit IF corresponding au bit d'interruption le plus prioritaire (bit 0 > bit 4).
+    let (vector, bit_to_clear) = match pending {
+        p if p & 0x01 != 0 => (0x40, 0x01), // V-Blank (IF bit 0)
+        p if p & 0x02 != 0 => (0x48, 0x02), // LCDC / STAT (IF bit 1)
+        p if p & 0x04 != 0 => (0x50, 0x04), // Timer (IF bit 2)
+        p if p & 0x08 != 0 => (0x58, 0x08), // Serial (IF bit 3)
+        _ => (0x60, 0x10),                  // Joypad (IF bit 4) — bits parasites : repli sur le vecteur Joypad
     };
 
     log::debug!(
-        "[CPU] INTERRUPT ACCEPTED: PC=${:04X} → ${:04X}, IF={:02X}, IE={:02X}, IME=ON→OFF",
+        "[CPU] INTERRUPT ACCEPTED: PC=${:04X} → ${:04X}, IF={:02X}→${:02X}, IE={:02X}, IME=ON→OFF",
         cpu.pc,
         vector,
         mmu.io[0x0F],
+        mmu.io[0x0F] & !bit_to_clear,
         mmu.ie,
     );
 
-    // ✅ On efface le bit d'interruption dans le registre IF pour éviter la boucle infinie !
-    // Comportement matériel (Pan Docs « Interrupt Sources ») : le service de l'interruption n'efface PAS le bit
-    // correspondant du registre IF — il reste posé jusqu'à ce que the jeu écrive un 1 dans ce bit de $FF0F
-    // (write-1-to-clear, géré par `MMU::write`). Si the ISR ne l'acknowledge pas et réactive IME (RETI),
-    // l'interruption se re-déclenche immédiatement : c'est le comportement réel du matériel, pas un bug de l'émulateur.
+    // 🚨 CORRECTION CRITIQUE (GBCTR Chapter 7 / Pan Docs « Interrupt Sources ») : le matériel efface AUTOMATIQUEMENT
+    // le bit IF correspondant à l'interruption acceptée au moment de l'acknowledgment. Sans cet effacement, un RETI qui
+    // réactive IME verrait the bit toujours posé and re-déclencherait immédiatement la même interruption (boucle infinie
+    // dans l'ISR — le code principal du jeu ne s'exécute jamais). Les autres bits IF restent posés : c'est au jeu, dans
+    // its ISR, d'acknowledge an interrupt supplémentaire en writing a 1 in $FF0F (write-1-to-clear, géré par `MMU::write`).
     cpu.ime = false;
-    // ✅ Comportement matériel (Pan Docs « Interrupt Sources ») : l'adresse de retour est poussée sur la pile
-    // avant le saut au vecteur — ici `cpu.pc` pointe sur la prochaine instruction à exécuter (fetch pas encore
-    // fait), donc RETI repart exactement là où le code a été interrompu. Sans ce push, RETI poppe de la
-    // poubelle en RAM ($0000) et le CPU reste bloqué dans une boucle d'interruptions.
+    mmu.io[0x0F] &= !bit_to_clear;
+
+    // ✅ Comportement matériel : l'adresse de retour est poussée sur la pile avant le saut au vecteur — ici `cpu.pc` pointe
+    // sur la prochaine instruction à exécuter (fetch pas encore fait), donc RETI repart exactement là où le code a été interrompu.
     push16(cpu, mmu, cpu.pc);
     cpu.pc = vector;
 
@@ -1764,8 +1753,9 @@ mod tests {
         assert_eq!(cpu.sp, 0xFFFC); // FFFE - 2 (un u16 poussé)
         assert_eq!(mmu.read(0xFFFD), 0x01); // octet haut de l'adresse de retour
         assert_eq!(mmu.read(0xFFFC), 0x50);
-        // Le matériel n'efface PAS le bit IF : il reste posé jusqu'à ce que the jeu écrive un 1 dans $FF0F (write-1-to-clear).
-        assert_eq!(mmu.io[0x0F], 0x01);
+        // Le matériel efface le bit IF correspondant à l'interruption acceptée (GBCTR Chapter 7) : un RETI qui réactive IME
+        // ne re-déclenche pas la même interruption.
+        assert_eq!(mmu.io[0x0F], 0x00);
 
         // Pas de service quand IME est faux (même interruption en attente).
         let mut cpu = CPU::new();
@@ -1773,22 +1763,22 @@ mod tests {
         mmu.ie = 0x07;
         assert_eq!(handle_interrupts(&mut cpu, &mut mmu), None);
 
-        // Le bit le plus bas (pendant+activé) gagne.
+        // Le bit le plus bas (pendant+activé) gagne ; seul son bit IF est effacé par le matériel.
         let mut cpu = CPU::new();
         cpu.ime = true;
         mmu.io[0x0F] = 0x03; // V-Blank + LC3C
         assert_eq!(handle_interrupts(&mut cpu, &mut mmu), Some(20));
         assert_eq!(cpu.pc, 0x40);
-        // Aucun bit n'est effacé par le service : V-Blank (bit 0) ET LC3C (bit 1) restent en attente.
-        assert_eq!(mmu.io[0x0F], 0x03);
+        // Seul le bit V-Blank (bit 0) est effacé par le service : LC3C (bit 1) reste en attente.
+        assert_eq!(mmu.io[0x0F], 0x02);
 
         let mut cpu = CPU::new();
         cpu.ime = true;
         mmu.io[0x0F] = 0x06; // LC3C + Timer
         assert_eq!(handle_interrupts(&mut cpu, &mut mmu), Some(20));
         assert_eq!(cpu.pc, 0x48);
-        // Aucun bit n'est effacé par le service : LC3C (bit 1) ET Timer (bit 2) restent en attente.
-        assert_eq!(mmu.io[0x0F], 0x06);
+        // Seul le bit LC3C (bit 1) est effacé par le service : Timer (bit 2) reste en attente.
+        assert_eq!(mmu.io[0x0F], 0x04);
 
         let mut cpu = CPU::new();
         cpu.ime = true;
@@ -1796,7 +1786,7 @@ mod tests {
         mmu.ie = 0x0F; // toutes les interruptions activées
         assert_eq!(handle_interrupts(&mut cpu, &mut mmu), Some(20));
         assert_eq!(cpu.pc, 0x58);
-        assert_eq!(mmu.io[0x0F], 0x08); // le bit Serial reste posé : seul un write-1-to-clear du jeu l'acknowledge
+        assert_eq!(mmu.io[0x0F], 0x00); // le bit Serial est effacé par le matériel au moment de l'acknowledgment
 
         // HALT bug : une interruption en attente sort du HALT même si IME=false (sans service).
         let mut cpu = CPU::new();
@@ -1815,20 +1805,67 @@ mod tests {
         assert_eq!(handle_interrupts(&mut cpu, &mut mmu), Some(20));
         assert!(!cpu.halted);
         assert_eq!(cpu.pc, 0x40);
+
+        // Bug HALT DMG : any bit of IF exits HALT even when the flag n'est pas activé dans IE (no service) — and posés halt_bug.
+        let mut cpu = CPU::new();
+        cpu.halted = true;
+        mmu.io[0x0F] = 0x02; // STAT en attente
+        mmu.ie = 0x00; // aucune interruption activée
+        assert_eq!(handle_interrupts(&mut cpu, &mut mmu), None); // IME=false → pas de service
+        assert!(!cpu.halted); // l'état HALT is annulé quand même (DMG)
+        assert!(cpu.halt_bug); // la prochaine instruction fetchée sera exécutée deux times
+    }
+
+    #[test]
+    fn halt_bug_doubles_the_next_instruction() {
+        let mut rom = vec![0xFF; 0x4000]; // ROM NROM : l'adresse $0150 lit rom[0x0150]
+        rom[0x0150] = 0x04; // INC B
+        let mut mmu = MMU::new();
+        mmu.load_rom(rom);
+        let mut cpu = CPU::new();
+        cpu.pc = 0x0150;
+        cpu.halted = true;
+        mmu.io[0x0F] = 0x04; // drapeau Timer en attente — IE=0 and IME=false : pas de service, mais le HALT is sorti (DMG)
+        cpu.b = 0;
+
+        let cycles = cpu.step(&mut mmu);
+        assert!(!cpu.halted);
+        assert_eq!(cpu.b, 2); // bug HALT DMG : INC B exécutée deux times
+        assert_eq!(cpu.pc, 0x0151); // le PC n'avance qu'une fois au-delà de l'instruction
+        assert_eq!(cycles, 8); // 4 T-cycles par exécution
+    }
+
+    #[test]
+    fn halt_bug_doubles_multi_byte_instruction_with_operands() {
+        let mut rom = vec![0xFF; 0x4000];
+        rom[0x0200] = 0x3E; // LD A,n (multi-byte) — 0x36 serait LD (HL),n8
+        rom[0x0201] = 0x55;
+        let mut mmu = MMU::new();
+        mmu.load_rom(rom);
+        let mut cpu = CPU::new();
+        cpu.pc = 0x0200;
+        cpu.halted = true;
+        mmu.io[0x0F] = 0x10; // drapeau Joypad en attente — IE=0 : pas de service
+        cpu.a = 0;
+
+        let cycles = cpu.step(&mut mmu);
+        assert_eq!(cpu.a, 0x55); // l'opérande est re-lu au même offset sur les deux exécutions
+        assert_eq!(cpu.pc, 0x0202); // le PC n'avance qu'une fois au-delà de l'opcode + opérande
+        assert_eq!(cycles, 16); // LD A,n = 8 T-cycles × 2
     }
 
     #[test]
     fn joypad_interrupt_vector_and_priority() {
         let mut mmu = MMU::new();
 
-        // Joypad seul (IF bit 4) : saut à $60, le bit reste posé (pas d'effacement automatique).
+        // Joypad seul (IF bit 4) : saut à $60, le bit est effacé automatiquement par le matériel.
         let mut cpu = CPU::new();
         cpu.ime = true;
         mmu.io[0x0F] = 0x10;
         mmu.ie = 0x1F; // toutes les interruptions activées
         assert_eq!(handle_interrupts(&mut cpu, &mut mmu), Some(20));
         assert_eq!(cpu.pc, 0x60);
-        assert_eq!(mmu.io[0x0F], 0x10);
+        assert_eq!(mmu.io[0x0F], 0x00); // le bit Joypad est effacé automatiquement par le matériel au moment de l'acknowledgment
 
         // Serial + Joypad en attente : le Serial (bit 3) a priorité matérielle sur le Joypad (bit 4).
         let mut cpu = CPU::new();
@@ -1836,7 +1873,7 @@ mod tests {
         mmu.io[0x0F] = 0x18;
         assert_eq!(handle_interrupts(&mut cpu, &mut mmu), Some(20));
         assert_eq!(cpu.pc, 0x58);
-        assert_eq!(mmu.io[0x0F], 0x18); // le bit Joypad reste en attente (le service n'efface aucun bit)
+        assert_eq!(mmu.io[0x0F], 0x10); // seul le bit Serial est effacé : the bit Joypad reste en attente
 
         // Bits parasites (IF bits 5-7) : IE n'active que les bits 4-0 → rien de pendan, pas de service.
         let mut cpu = CPU::new();
