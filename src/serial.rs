@@ -5,9 +5,8 @@
 //! rapportent leurs résultats par ce port : elles écrivent le caractère dans SB
 //! puis $81 dans SC (bit 7 = Transfer enable), sans polling ni interruption.
 //! À noter : les builds livrés des ROM blargg cpu_instrs (retrio/gb-test-roms)
-//! font exception — leurs macros `sta`/`wreg` se développent en lectures de RAM
-//! basse (E0 nn) au lieu d'écritures IO (F0 nn), si bien qu'elles ne pilotent
-//! jamais ce port ; voir les tests dans emulator.rs.
+//! font exception : leurs macros `sta`/`wreg` se développent en `OUT ($nn),A` (E0 nn — genuine IO writes,
+//! verified by byte-level scan in `target/scan_roms.py`) : they write the character to SB ($FF01) then $81 to SC ($FF02).
 //!
 //! Chaque octet émis en mode master est affiché immédiatement dans la console hôte
 //! (stdout) : caractères ASCII imprimables tels quels, 0x0A → newline,

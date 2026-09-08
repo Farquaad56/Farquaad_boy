@@ -7,12 +7,13 @@ use crate::ppu::constants::*;
 fn power_on_values() {
     let ppu = PPU::new();
     assert_eq!(ppu.lcdc, 0x91); // LCD allumé, fond activé (fenêtre éteinte) — Pan Docs « Power-On Values »
-    assert_eq!(ppu.stat, 0x00);
+    assert_eq!(ppu.stat & 0x78, 0x04); // bit 3 posé au hand-off : le STAT se lit $85 (PanDocs « Power Up Sequence », colonne DMG/MGB)
+    assert_eq!(ppu.read_register(0xFF41), 0x85); // drapeau LYC==LY (bit 7, car LY = LYC = $00) | mode OAM Scan (bits 0-1) | select LYC==LY (bit 3)
     assert_eq!(ppu.scy, 0x00);
     assert_eq!(ppu.scx, 0x00);
     assert_eq!(ppu.ly, 0x00); // LY = 0 au power-on
     assert_eq!(ppu.lyc, 0x00);
-    assert_eq!(ppu.dma, 0x00);
+    assert_eq!(ppu.dma, 0xFF); // le registre DMA se lit $FF au hand-off DMG/MGB (PanDocs « Power Up Sequence »)
     assert_eq!(ppu.bgp, 0xFC);
     assert_eq!(ppu.obp0, 0xFF); // non initialisées par le boot ROM — valeur la plus fréquente (PanDocs « Power Up Sequence »)
     assert_eq!(ppu.obp1, 0xFF);
@@ -645,6 +646,48 @@ fn full_frame_returns_to_line_zero() {
     assert!(ppu.step(FRAME_DOTS as u32, &vram, &oam)); // exactly one frame : frontière franchée
     assert_eq!((ppu.mode_clock, ppu.mode, ppu.ly), (0, 2, 0));
     assert!(!ppu.step(1, &vram, &oam)); // pas of new frame after a single dot
+}
+
+#[test]
+fn full_frame_traces_every_line_transition() {
+    let mut ppu = PPU::new(); // Line 0, mode_clock 0: OAM scan (LCD on)
+    let vram = [0u8; 0x2000];
+    let oam = [0u8; 0xA0];
+
+    // Advance one T-cycle at a time over an entire frame (like the real lockstep CPU/PPU), and record
+    // each distinct (ly, mode) state along with the cycle at which it begins. Lines 0..=143 must pass through OAM scan (2) → drawing (3) → HBlank (0);
+    // lines 144..=153 are VBlank (1); after line 153, LY is reset to 0 and the PPU returns to mode 2.
+    let mut transitions: Vec<(u64, u8, u8)> = vec![(0, ppu.ly, ppu.mode)]; // State at power-on
+    let mut boundary_at: Option<u64> = None;
+
+    for t in 1..=FRAME_DOTS {
+        if ppu.step(1, &vram, &oam) && boundary_at.is_none() {
+            boundary_at = Some(t); // The frame boundary is crossed exactly once per frame.
+        }
+        let state = (ppu.ly, ppu.mode);
+        if transitions.last().map(|&(_, ly, mode)| (ly, mode)) != Some(state) {
+            transitions.push((t, ppu.ly, ppu.mode));
+        }
+    }
+
+    assert_eq!(boundary_at, Some(FRAME_DOTS)); // The frame boundary is crossed exactly at the end of the frame.
+
+    // Expected sequence: for each line 0..=143 → (ly,2) at dot ly×456, (ly,3) at +80, (ly,0) at +252 ;
+    // then VBlank lines 144..=153 in mode 1, each starting at dot line×456; and finally the return to (0,2).
+    let mut expected: Vec<(u64, u8, u8)> =
+        Vec::with_capacity(3 * SCREEN_HEIGHT + (FRAME_LINES - SCREEN_HEIGHT as u32) as usize + 1);
+    for line in 0..SCREEN_HEIGHT {
+        let base = (line as u64) * DOTS_PER_LINE as u64;
+        expected.push((base, line as u8, 2)); // OAM scan (80 dots)
+        expected.push((base + MODE_OAM_CYCLES as u64, line as u8, 3)); // Drawing (172 dots)
+        expected.push((base + (MODE_OAM_CYCLES + MODE_DRAW_CYCLES) as u64, line as u8, 0)); // HBlank (204 dots)
+    }
+    for line in SCREEN_HEIGHT..FRAME_LINES as usize {
+        expected.push(((line as u64) * DOTS_PER_LINE as u64, line as u8, 1)); // VBlank (lines 144..=153, 456 dots each)
+    }
+    expected.push((FRAME_DOTS, 0, 2)); // Return to the start of the next frame
+
+    assert_eq!(transitions, expected);
 }
 
 #[test]

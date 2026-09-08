@@ -71,20 +71,22 @@ pub struct PPU {
 }
 
 impl PPU {
-    /// Crée une PPU à l'état post-boot ROM (PanDocs « Power Up Sequence ») : LCDC = $91 (LCD allumé,
-    /// fond activé, fenêtre éteinte), BGP = $FC ; OBP0/OBP1 sont laissées non initialisées par the boot
-    /// ROM — la valeur la plus fréquente, $FF, is retenue. Les autres registres valent $00 ; LY = 0
-    /// and le compteur de dots est à 0. Le LCD étant allumé au power-on, la PPU démarre en mode 2
-    /// (OAM Scan) sur the line 0 ; le framebuffer is noir opaque (aucune frame rendue).
+    /// Crée une PPU à l'état post-boot ROM (PanDocs « Power Up Sequence », colonne DMG/MGB) :
+    /// LCDC = $91 (LCD allumé, fond activé, fenêtre éteinte), BGP = $FC ; OBP0/OBP1 sont laissées non
+    /// initialisées par the boot ROM — la valeur la plus fréquente, $FF, is retenue. SCY/SCX/LYC/WX/WY valent $00 ;
+    /// le registre DMA ($FF46) se lit $FF au hand-off (la boot ROM ne l'écrit jamais). LY = 0 and le compteur de
+    /// dots est à 0 : la PPU démarre en mode 2 (OAM Scan) sur the line 0. Le STAT se lit $85 au hand-off —
+    /// drapeau LYC==LY posé (bit 7, car LY = LYC = $00), bits de mode (bits 0-1) et select d'interruption
+    /// LYC==LY activé (bit 3) : `stat` est donc initialisé à $04 (seuls les bits 3..6 sont écriturables).
     pub fn new() -> Self {
         Self {
             lcdc: 0x91, // LCD allumé (bit 7) + tuiles non signées $8000-$8FFF (bit 4 set) + fond activé (bit 0)
-            stat: 0x00,
+            stat: 0x04, // bit 3 posé au hand-off : le STAT se lit $85 (drapeau LYC==LY | mode | select LYC==LY) — PanDocs « Power Up Sequence »
             scy: 0x00,
             scx: 0x00,
             ly: 0x00, // LY = 0 au power-on (en lecture seule)
             lyc: 0x00,
-            dma: 0x00,
+            dma: 0xFF, // le registre DMA se lit $FF au hand-off DMG/MGB (PanDocs « Power Up Sequence »)
             bgp: 0xFC, // valeurs of pixel 0-1 → teinte claire, 2-3 → teinte foncée (Pan Docs « Power-On Values »)
             obp0: 0xFF, // non initialisées par the boot ROM — valeur la plus fréquente (PanDocs « Power Up Sequence »)
             obp1: 0xFF,

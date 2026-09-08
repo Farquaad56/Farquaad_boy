@@ -17,6 +17,8 @@
 //! registre Joypad $FF00 est routé vers [`joypad::Joypad`]. Le tableau `io` ne stocke que les
 //! valeurs brutes des autres registres I/O.
 
+use std::cell::Cell;
+
 use crate::cartridge::{CartridgeHeader, parse_header};
 use crate::joypad::Joypad;
 use crate::mbc::{HEADER_TYPE_ADDR, Mbc, MbcType};
@@ -80,6 +82,11 @@ pub struct MMU {
     /// Posé quand $FF46 est écrit pendant l'instruction courante : le transfert démarre après cette
     /// instruction (l'écriture a lieu sur son dernier M-cycle) — consommé par [`MMU::advance_dma`].
     dma_just_started: bool,
+
+    // --- Diagnostic log des lectures de LY ($FF44), debug only ---
+    /// Dernière valeur loguée pour une lecture de $FF44 : le diagnostic n'est émis que quand la valeur
+    /// renvoyée change (une boucle de polling peut lire ce registre des milliers de fois par frame).
+    last_ly_read_log: Cell<Option<u8>>,
 }
 
 impl MMU {
@@ -170,10 +177,24 @@ impl MMU {
         if !self.boot_rom_finished && addr < 0x100 {
             return self.boot_rom[addr as usize];
         }
-        if self.dma_active() && !Self::is_hram(addr) {
-            return 0xFF; // Bus occupé par le transfert OAM : lecture CPU bloquée.
+        let value = if self.dma_active() && !Self::is_hram(addr) {
+            0xFF // Bus occupé par le transfert OAM : lecture CPU bloquée.
+        } else {
+            self.read_plain(addr)
+        };
+        // Diagnostic (debug only) : valeur exacte renvoyée pour une lecture de LY ($FF44), émise uniquement quand elle change —
+        // une boucle de polling peut lire ce registre des milliers de fois par frame, loguer chaque accès noierait le journal.
+        if addr == 0xFF44 && self.last_ly_read_log.get() != Some(value) {
+            log::debug!(
+                "[MMU] Read $FF44 (LY) → ${:02X} — PPU ly={}, mode={}, dma_active={}",
+                value,
+                self.ppu.ly,
+                self.ppu.mode,
+                self.dma_active(),
+            );
+            self.last_ly_read_log.set(Some(value));
         }
-        self.read_plain(addr)
+        value
     }
 
     /// Debug read (memory editor): reads a byte across the full 16-bit address map without PPU/DMA bus blocking;
@@ -414,6 +435,8 @@ impl Default for MMU {
             dma_remaining: 0,                   // aucun transfert OAM en cours au power-on.
             dma_source_addr: 0,
             dma_just_started: false,
+
+            last_ly_read_log: Cell::new(None), // aucune lecture de $FF44 loguée encore.
         };
         mmu.reset_memory(); // valeurs au power-on (PanDocs « Power Up Sequence ») : VRAM/OAM/HRAM = $FF, WRAM banque 0 = $11 / banque 1 = $FF.
         mmu

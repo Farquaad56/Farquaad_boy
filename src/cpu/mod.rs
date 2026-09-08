@@ -33,7 +33,9 @@ pub struct CPU {
     /// Le CPU est-il en état HALT ? (sorti par une interruption pendante — le « HALT bug »).
     pub halted: bool,
     /// Bug HALT DMG : posé quand le CPU sort de l'état HALT à cause d'une interruption pendante (bit de IF) ; la
-    /// prochaine instruction fetchée est exécutée deux fois (le même opcode est re-fetché sans avancer le PC).
+    /// prochaine instruction fetchée est exécutée avec un décalage d'un octet — l'octet à PC est sauté et l'opcode
+    /// est lu depuis PC+1 (GBCTR Chapitre 6.8). Ce n'est PAS « exécuter deux fois » : c'est un saut d'un octet qui
+    /// réinterprète les bytes suivants comme un nouvel opcode.
     pub halt_bug: bool,
     /// Retard d'activation de IME après un EI : IME n'est réactivé qu'une fois l'instruction
     /// EI suivante exécutée (Pan Docs « CPU Instruction Set »). 0 = pas de retard en cours.
@@ -97,7 +99,7 @@ impl CPU {
     ///
     /// Bug HALT DMG : si le CPU est en HALT and any bit of IF ($FF0F) is set — even if IME is faux or the flag
     /// n'est pas activé dans IE — l'état HALT is annulé (le « HALT bug ») and la prochaine instruction fetchée is exécutée
-    /// deux times : le même opcode est re-fetché sans avancer le PC for ce second fetch. Si IME is en plus vrai, the
+    /// avec un décalage d'un octet : l'octet à PC est sauté et l'opcode est lu depuis PC+1 (GBCTR Chapitre 6.8). Si IME is en plus vrai, the
     /// interruption is additionally servied (voir `opcodes::handle_interrupts`).
     ///
     /// Le retard d'EI est décrémenté après chaque instruction exécutée : IME n'est
@@ -114,15 +116,14 @@ impl CPU {
         }
 
         // Bug HALT DMG : quand le CPU vient de sortir de l'état HALT à cause d'une interruption pendante, la
-        // prochaine instruction est exécutée deux times — le même opcode est re-fetché sans avancer le PC for ce
-        // second fetch (les opérandes sont re-lus à leurs offsets habituels).
-        let doubled = self.halt_bug;
-        self.halt_bug = false;
+        // prochaine instruction est fetchée avec un décalage d'un octet — l'octet à PC est sauté et l'opcode est lu depuis PC+1 (GBCTR Chapitre 6.8).
+        if self.halt_bug {
+            self.pc = self.pc.wrapping_add(1); // saute un octet : l'opcode suivant est lu à PC+1
+            self.halt_bug = false;
+        }
 
-        let start_pc = self.pc;
         let mut cycles = 0u32;
-        for i in 0..(if doubled { 2 } else { 1 }) {
-            let opcode = mmu.read(self.pc);
+        let opcode = mmu.read(self.pc);
 
         // 🚨 DÉTECTEUR DE CRASH : Si le PC entre in HRAM, on le loggue immediately — cela nous dira how the CPU got there.
         if self.pc >= 0xFF00 && self.pc <= 0xFFFE {
@@ -150,12 +151,8 @@ impl CPU {
             }
         }
 
-            self.pc = self.pc.wrapping_add(1);
-            cycles += opcodes::execute(self, mmu, opcode);
-            if doubled && i == 0 {
-                self.pc = start_pc; // re-fetch du même opcode sans avancer le PC for ce second fetch (entre les deux exécutions seulement)
-            }
-        }
+        self.pc = self.pc.wrapping_add(1);
+        cycles += opcodes::execute(self, mmu, opcode);
         // EI : IME devient effectif après l'instruction EI suivante (2 étapes : la fin de
         // l'instruction EI elle-même, puis celle qui suit).
         if self.ei_delay > 0 {

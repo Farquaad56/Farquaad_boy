@@ -571,24 +571,13 @@ fn out_n_a(cpu: &mut CPU, mmu: &mut MMU) -> u32 {
     12
 }
 
-/// IN A,(n8) (12 T-cycles) : lit le port $FF00+n8 dans A and sets the flags from the result :
-/// Z=(A==0), N=0, H=(bit 4 of A set), C=(bit 0 of A set). L'immédiat est à `cpu.pc`.
-fn in_a_n(cpu: &mut CPU, mmu: &mut MMU) -> u32 {
+/// LDH A,(n8) (8 T-cycles) : lit le port $FF00+n8 dans A ; ne modifie pas les drapeaux.
+/// L'immédiat est à `cpu.pc`. (Sur la Game Boy, $F0 nn n'est PAS un IN A,(n8) Z80.)
+fn ldh_a_n(cpu: &mut CPU, mmu: &mut MMU) -> u32 {
     let n = mmu.read(cpu.pc);
     cpu.pc = cpu.pc.wrapping_add(1); // passe l'immédiat n8
     cpu.a = mmu.read(0xFF00u16.wrapping_add(n as u16));
-    let mut f = Flags::empty(); // N=0
-    if cpu.a == 0 {
-        f |= Flags::Z;
-    }
-    if cpu.a & 0x10 != 0 {
-        f |= Flags::H;
-    }
-    if cpu.a & 0x01 != 0 {
-        f |= Flags::C;
-    }
-    cpu.set_flags(f);
-    12
+    8
 }
 
 /// LDH [C], A / LDH A, [C] (12 T-cycles) : accès à $FF00+C.
@@ -906,7 +895,7 @@ pub fn execute(cpu: &mut CPU, mmu: &mut MMU, opcode: u8) -> u32 {
             8
         } // XOR A,n8 (8)
 
-        0xF0 => in_a_n(cpu, mmu),        // IN A,(n8) (12) : lit le port $FF00+n8 dans A
+        0xF0 => ldh_a_n(cpu, mmu),       // LDH A,(n8) (8) : lit le port $FF00+n8 dans A, sans drapeaux
         0xF1 => pop_r16(cpu, mmu, 3),    // POP AF (12)
         0xF2 => ldh_a8(cpu, mmu),        // LDH [n8],A (8) : écrit A dans le port $FF00+n8
         0xF3 => {
@@ -1107,15 +1096,17 @@ pub fn execute_cb(cpu: &mut CPU, mmu: &mut MMU, sub_opcode: u8) -> u32 {
 /// LCDC $48, Timer $50, Serial $58, Joypad $60).
 ///
 /// Bug HALT DMG : si le CPU est in HALT and any bit of IF ($FF0F) is set — even if IME is false or the flag n'est pas activé dans IE —
-/// l'état HALT is annulé and la prochaine instruction fetchée is exécutée deux times (voir `CPU::step`) ; si IME is en plus vrai,
-/// the interruption is additionally servied.
+/// l'état HALT is annulé. La prochaine instruction fetchée is exécutée with a one-byte offset (l'octet à PC est sauté, voir `CPU::step`) ONLY when no ISR runs ; si IME is en plus vrai and une interruption valide est pendante, the interruption is additionally servied — le saut vers le vecteur ISR "absorbe" the offset, donc après RETI l'exécution reprend normalement (sans décalage).
 pub fn handle_interrupts(cpu: &mut CPU, mmu: &mut MMU) -> Option<u32> {
     let pending = mmu.io[0x0F] & mmu.ie; // IF ($FF0F) & IE
 
     if cpu.halted && (mmu.io[0x0F] & 0x1F) != 0 {
         // Bug HALT DMG : n'importe quel bit de IF posé sort du HALT — même si IME is false or the drapeau n'est pas activé dans IE.
         cpu.halted = false;
-        cpu.halt_bug = true; // la prochaine instruction fetchée sera exécutée deux times (voir `CPU::step`)
+        // Le décalage d'un octet ne s'applique QUE si l'interruption n'est PAS servied : quand IME=true and une interruption valide est pendante, le saut vers le vecteur ISR "absorbe" the offset — après RETI, l'exécution reprend normalement (sans décalage). C'est only when no ISR runs that la prochaine instruction is fetchée with a one-byte offset.
+        if !cpu.ime || pending == 0 {
+            cpu.halt_bug = true; // la prochaine instruction fetchée sera exécutée avec un décalage d'un octet (l'octet à PC est sauté, voir `CPU::step`)
+        }
         log::debug!(
             "[CPU] HALT exited: pending={:02X}, IF={:02X}, IE={:02X}",
             pending,
@@ -1359,9 +1350,9 @@ pub fn disasm(cpu: &CPU, mmu: &MMU) -> String {
         // Préfixe CB (sous-opcode à pc+1)
         0xCB => format!("cb {}", cb_mnemonic(mmu.read(cpu.pc.wrapping_add(1)))),
 
-        // OUT / IN / LDH / LD a16 / ADD SP / DI / EI
+        // OUT / LDH / LD a16 / ADD SP / DI / EI
         0xE0 => format!("out (${:02X}), a", mmu.read(cpu.pc.wrapping_add(1))),
-        0xF0 => format!("in a, (${:02X})", mmu.read(cpu.pc.wrapping_add(1))),
+        0xF0 => format!("ldh a,(${:02X})", mmu.read(cpu.pc.wrapping_add(1))),
         0xE2 => "ldh a,(c)".to_string(),
         0xF2 => format!("ldh [${:02X}], a", mmu.read(cpu.pc.wrapping_add(1))),
         0xEA => format!("ld (${ :04X}), a", read_a16(mmu, cpu.pc.wrapping_add(1))),
@@ -1421,14 +1412,14 @@ mod tests {
         assert_eq!(mmu.read(0xFFC0), 0x42); // le port $FFC0 (HRAM) reçoit A
     }
 
-    /// IN A,(n8) ($F0) : lit le port $FF00+n8 dans A.
+    /// LDH A,(n8) ($F0) : lit le port $FF00+n8 dans A en 8 T-cycles.
     #[test]
-    fn in_a_n_reads_the_io_port_into_the_accumulator() {
-        let mut mmu = rom_with(&[0xF0, 0xC0]); // $0100 : IN A,($C0)
+    fn ldh_a_n_reads_the_io_port_into_the_accumulator() {
+        let mut mmu = rom_with(&[0xF0, 0xC0]); // $0100 : LDH A,($C0)
         let mut cpu = CPU::new();
         cpu.pc = 0x0101; // pointe sur l'immédiat (comme après la lecture de l'opcode)
         mmu.write(0xFFC0, 0xAB);
-        assert_eq!(execute(&mut cpu, &mut mmu, 0xF0), 12);
+        assert_eq!(execute(&mut cpu, &mut mmu, 0xF0), 8);
         assert_eq!(cpu.pc, 0x0102);
         assert_eq!(cpu.a, 0xAB); // A reçoit le port $FFC0 (HRAM)
     }
@@ -1512,28 +1503,28 @@ mod tests {
         assert_eq!(cpu.hl(), 0xFFEE);
     }
 
-    /// IN A,(n8) ($F0) : sets the flags from the result — Z=(A==0), N=0, H=(bit 4 set), C=(bit 0 set).
+    /// LDH A,(n8) ($F0) : ne modifie pas les drapeaux (seules les instructions arithmétiques/logiques le font).
     #[test]
-    fn in_a_n_sets_flags_from_the_result() {
-        let mut mmu = rom_with(&[0xF0, 0xC0]); // $0100 : IN A,($C0)
+    fn ldh_a_n_does_not_modify_the_flags() {
+        let mut mmu = rom_with(&[0xF0, 0xC0]); // $0100 : LDH A,($C0)
         let mut cpu = CPU::new();
         cpu.pc = 0x0101;
 
-        mmu.write(0xFFC0, 0x11); // bit 4 set, bit 0 set
+        cpu.set_flags(Flags::Z | Flags::N); // F = $C0 : drapeaux à préserver
+        mmu.write(0xFFC0, 0x11); // bit 4 + bit 0 set — un IN A,(n8) y aurait posé H et C
         execute(&mut cpu, &mut mmu, 0xF0);
         assert_eq!(cpu.a, 0x11);
         let f = cpu.flags();
-        assert!(!f.contains(Flags::Z));
-        assert!(!f.contains(Flags::N));
-        assert!(f.contains(Flags::H));
-        assert!(f.contains(Flags::C));
+        assert!(f.contains(Flags::Z)); // Z préservé
+        assert!(f.contains(Flags::N)); // N préservé (un IN A,(n8) l'aurait effacé)
+        assert!(!f.contains(Flags::H)); // H non posé depuis la valeur lue
+        assert!(!f.contains(Flags::C)); // C non posé depuis la valeur lue
 
-        mmu.write(0xFFC0, 0x00); // all bits clear
+        mmu.write(0xFFC0, 0x00); // tous bits à zéro — un IN A,(n8) y aurait posé Z
         execute(&mut cpu, &mut mmu, 0xF0);
         let f = cpu.flags();
-        assert!(f.contains(Flags::Z));
-        assert!(!f.contains(Flags::H));
-        assert!(!f.contains(Flags::C));
+        assert!(f.contains(Flags::Z)); // toujours le Z d'origine...
+        assert!(f.contains(Flags::N)); // ...et le N d'origine : F n'a pas été recalculé
     }
 
     #[test]
@@ -1982,13 +1973,14 @@ mod tests {
         mmu.ie = 0x00; // aucune interruption activée
         assert_eq!(handle_interrupts(&mut cpu, &mut mmu), None); // IME=false → pas de service
         assert!(!cpu.halted); // l'état HALT is annulé quand même (DMG)
-        assert!(cpu.halt_bug); // la prochaine instruction fetchée sera exécutée deux times
+        assert!(cpu.halt_bug); // la prochaine instruction fetchée sera exécutée avec un décalage d'un octet (saut de 1 octet)
     }
 
     #[test]
-    fn halt_bug_doubles_the_next_instruction() {
+    fn halt_bug_skips_one_byte_of_the_next_instruction() {
         let mut rom = vec![0xFF; 0x4000]; // ROM NROM : l'adresse $0150 lit rom[0x0150]
-        rom[0x0150] = 0x04; // INC B
+        rom[0x0150] = 0xEE; // XOR A,A — un octet qui serait normalement l'opcode suivant ; il est sauté par le bug
+        rom[0x0151] = 0x04; // INC B — devient le nouvel opcode après le décalage d'un octet
         let mut mmu = MMU::new();
         mmu.load_rom(rom);
         let mut cpu = CPU::new();
@@ -1996,19 +1988,22 @@ mod tests {
         cpu.halted = true;
         mmu.io[0x0F] = 0x04; // drapeau Timer en attente — IE=0 and IME=false : pas de service, mais le HALT is sorti (DMG)
         cpu.b = 0;
+        cpu.a = 0x77;
 
         let cycles = cpu.step(&mut mmu);
         assert!(!cpu.halted);
-        assert_eq!(cpu.b, 2); // bug HALT DMG : INC B exécutée deux times
-        assert_eq!(cpu.pc, 0x0151); // le PC n'avance qu'une fois au-delà de l'instruction
-        assert_eq!(cycles, 8); // 4 T-cycles par exécution
+        // Bug HALT DMG (GBCTR Chapitre 6.8) : la prochaine instruction est fetchée avec un décalage d'un octet — l'octet à $0150 is sauté, and INC B at $0151 becomes the new opcode (exécutée ONCE, not twice).
+        assert_eq!(cpu.b, 1); // INC B exécutée une seule fois (depuis $0151)
+        assert_eq!(cpu.a, 0x77); // A inchangé : l'octet à $0150 (XOR A,A) n'a PAS été exécutée (sauté)
+        assert_eq!(cpu.pc, 0x0152); // le PC avance au-delà de l'instruction à $0151
+        assert_eq!(cycles, 4); // INC B = 4 T-cycles (exécutée une fois)
     }
 
     #[test]
-    fn halt_bug_doubles_multi_byte_instruction_with_operands() {
+    fn halt_bug_reinterprets_following_bytes_as_new_opcode() {
         let mut rom = vec![0xFF; 0x4000];
-        rom[0x0200] = 0x3E; // LD A,n (multi-byte) — 0x36 serait LD (HL),n8
-        rom[0x0201] = 0x55;
+        rom[0x0200] = 0x3E; // LD A,n — l'opcode qui serait normalement exécuté ; il est sauté par le bug
+        rom[0x0201] = 0x4D; // devient le nouvel opcode : LD C,L (single-byte) — dest=C(1), src=L(5)
         let mut mmu = MMU::new();
         mmu.load_rom(rom);
         let mut cpu = CPU::new();
@@ -2016,11 +2011,16 @@ mod tests {
         cpu.halted = true;
         mmu.io[0x0F] = 0x10; // drapeau Joypad en attente — IE=0 : pas de service
         cpu.a = 0;
+        cpu.c = 0;
+        cpu.l = 0xAB;
 
         let cycles = cpu.step(&mut mmu);
-        assert_eq!(cpu.a, 0x55); // l'opérande est re-lu au même offset sur les deux exécutions
-        assert_eq!(cpu.pc, 0x0202); // le PC n'avance qu'une fois au-delà de l'opcode + opérande
-        assert_eq!(cycles, 16); // LD A,n = 8 T-cycles × 2
+        assert!(!cpu.halted);
+        // Bug HALT DMG (GBCTR Chapitre 6.8) : l'octet à $0200 is sauté, and the byte at $0201 (0x4D = LD C,L) becomes the new opcode — it's réinterprété, NOT exécutée deux fois avec son opérande d'origine.
+        assert_eq!(cpu.c, 0xAB); // LD C,L : C prend la valeur de L
+        assert_eq!(cpu.a, 0); // A inchangé (LD A,n n'a PAS été exécutée)
+        assert_eq!(cpu.pc, 0x0202); // le PC avance au-delà du single-byte instruction à $0201
+        assert_eq!(cycles, 4); // LD C,L = 4 T-cycles (single-byte, executed once)
     }
 
     #[test]

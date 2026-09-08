@@ -7,8 +7,11 @@
 //! Étape 3 : le rendu est forcé à chaque frontière de frame même LCD éteint (bit 7 de LCDC à 0) — la PPU
 //! gèle son timing mais le compteur global de T-cycles continue d'avancer, donc l'écran devient noir au
 //! lieu de rester figé (règle interne de `render_frame`).
-//! Étape 4 : le forçage de STAT=$20 au hand-off est temporairement retiré (voir `power_on`) — le jeu doit configurer lui-même STAT,
-//! afin d'éviter de déclencher une interruption VBlank avant que le jeu n'ait fini d'initialiser sa pile ou ses vecteurs.
+//! Étape 4 : l'état post-boot ROM est celui documenté pour le hand-off DMG/MGB (PanDocs « Power Up Sequence ») —
+//! voir `power_on` : le STAT ($FF41) se lit $85 (la boot ROM ne l'écrit jamais ; c'est l'état matériel, dont le select
+//! d'interruption LYC==LY activé), le registre DMA ($FF46) se lit $FF, et IF ($FF0F) se lit $E1 — le drapeau VBlank (bit 0)
+//! est posé car la boot ROM entre en VBlank sans jamais l'effacer. Le drapeau VBlank est de plus levé inconditionnellement à
+//! chaque entrée en VBlank, donc un jeu qui ne configure jamais STAT se réveille quand même au premier VBlank après EI.
 
 use crate::cpu::CPU;
 use crate::mmu::MMU;
@@ -126,9 +129,10 @@ impl Emulator {
 
         // Registres PPU
         self.mmu.write(0xFF40, 0x91); // LCDC ($FF40) : LCD ON (bit 7), tuiles non signées $8000-$8FFF (bit 4 set), fond activé (bit 0), carte $9800-$9BFF.
-                                      // STAT ($FF41) left at the hardware default ($00): l'entrée en VBlank lève désormais le drapeau VBlank
-                                      // (bit 0 de IF) inconditionnellement, so forcing STAT=$20 is no longer needed for a game that never configures
-                                      // STAT to wake from HALT — the flag will be raised at each frame anyway.
+                                      // STAT ($FF41) se lit $85 au hand-off DMG/MGB (PanDocs « Power Up Sequence ») : la boot ROM ne l'écrit jamais,
+                                      // c'est l'état matériel — drapeau LYC==LY posé (bit 7, car LY = LYC = $00), bits de mode et select d'interruption
+                                      // LYC==LY activé (bit 3). `PPU::default()` pose déjà ce bit ; le drapeau VBlank (bit 0 de IF) est en outre levé
+                                      // inconditionnellement à chaque entrée en VBlank, donc un jeu qui ne configure jamais STAT se réveille quand même.
         self.mmu.write(0xFF47, 0xFC); // BGP ($FF47) : palette background (valeur post-boot standard).
         self.mmu.write(0xFF48, 0xFF); // OBP0 ($FF48) : palette sprite 0.
         self.mmu.write(0xFF49, 0xFF); // OBP1 ($FF49) : palette sprite 1.
@@ -139,9 +143,12 @@ impl Emulator {
 
         // Interrupt Enable : Désactivé au hand-off (le jeu le configurera).
         self.mmu.ie = 0x00; // IE ($FFFF) : toutes les sources d'interruption désactivées au hand-off.
+        // IF ($FF0F) se lit $E1 au hand-off DMG/MGB (PanDocs « Power Up Sequence ») : le drapeau VBlank (bit 0) est posé —
+        // la boot ROM entre en VBlank plusieurs fois sans jamais l'effacer — et les bits non définis se lisent à 1.
+        self.mmu.io[0x0F] = 0xE1;
 
         log::info!(
-            "[Emulator] Post-boot initialization complete: STAT left at hardware default ($00) — le drapeau VBlank (bit 0 de IF) est levé inconditionnellement à chaque entrée en VBlank"
+            "[Emulator] Post-boot initialization complete: STAT se lit $85, IF se lit $E1 (drapeau VBlank posé) — état post-boot ROM DMG documenté (PanDocs « Power Up Sequence »)"
         );
     }
 
@@ -197,7 +204,7 @@ impl Emulator {
         if frame_done {
             log::debug!("[PPU] Frame boundary crossed at t_cycles={}", self.t_cycles);
 
-            // --- Traceur de PC amélioré : si l'opcode au PC est $E0/$F0/$F2 (OUT/IN/LDH avec n8), on lit
+            // --- Traceur de PC amélioré : si l'opcode au PC est $E0/$F0/$F2 (OUT/LDH avec n8), on lit
             //     l'octet suivant pour voir l'adresse I/O ciblée ($FFnn) — permet d'identifier le registre lu/écrit. ---
             let opcode = self.mmu.read(self.cpu.pc);
             let operand = if matches!(opcode, 0xE0 | 0xF0 | 0xF2) {
@@ -211,8 +218,10 @@ impl Emulator {
             };
 
             log::debug!(
-                "[TRACEUR] Frame rendue. CPU: PC=${:04X}, Opcode=${:02X} {}, SP=${:04X}, IME={}, IF=${:02X}, IE=${:02X}",
+                "[TRACEUR] Frame rendue. CPU: PC=${:04X}, A=${:02X}, F=${:02X}, Opcode=${:02X} {}, SP=${:04X}, IME={}, IF=${:02X}, IE=${:02X}",
                 self.cpu.pc,
+                self.cpu.a, // accumulateur : valeur lue dans le port (ex. LY=$90 après LDH A,($FF44))
+                self.cpu.f, // drapeaux : bits 7..4 = Z,N,H,C ; bit 7 levé => JR NZ saute
                 opcode,
                 operand,
                 self.cpu.sp,
@@ -354,14 +363,72 @@ mod tests {
         assert_eq!(emu.mmu.read(0xFF05), 0x00); // TIMA
         assert_eq!(emu.mmu.read(0xFF06), 0x00); // TMA
         assert_eq!(emu.mmu.read(0xFF07), 0xF8); // TAC : bits 7-3 lus à 1, timer désactivé
+        assert_eq!(emu.mmu.io[0x0F], 0xE1); // IF : drapeau VBlank posé (la boot ROM entre en VBlank sans l'effacer) + bits non définis lus à 1
         assert_eq!(emu.mmu.read(0xFF48), 0xFF); // OBP0 : non initialisée par le boot ROM → valeur la plus fréquente
         assert_eq!(emu.mmu.read(0xFF49), 0xFF); // OBP1
         assert_eq!(emu.mmu.read(0xFFFF), 0x00); // IE : toutes les sources d'interruption désactivées au hand-off
+
+        // Registres PPU au hand-off (PanDocs « Power Up Sequence », colonne DMG/MGB).
+        assert_eq!(emu.mmu.read(0xFF40), 0x91); // LCDC : LCD allumé, tuiles $8000-$8FFF, fond activé
+        assert_eq!(emu.mmu.read(0xFF41), 0x85); // STAT : drapeau LYC==LY (bit 7) | bits de mode | select d'interruption LYC==LY (bit 3)
+        assert_eq!(emu.mmu.read(0xFF42), 0x00); // SCY
+        assert_eq!(emu.mmu.read(0xFF43), 0x00); // SCX
+        assert_eq!(emu.mmu.read(0xFF44), 0x00); // LY : ligne 0 au hand-off DMG/MGB
+        assert_eq!(emu.mmu.read(0xFF45), 0x00); // LYC
+        assert_eq!(emu.mmu.read(0xFF46), 0xFF); // DMA : se lit $FF au hand-off (la boot ROM ne l'écrit jamais)
+        assert_eq!(emu.mmu.read(0xFF47), 0xFC); // BGP
+        assert_eq!(emu.mmu.read(0xFF4A), 0x00); // WY
+        assert_eq!(emu.mmu.read(0xFF4B), 0x00); // WX
 
         // L'état CPU post-boot ROM est inchangé.
         assert_eq!(emu.cpu.pc, 0x0100);
         assert_eq!(emu.cpu.sp, 0xFFFE);
         assert_eq!(emu.cpu.af(), 0x01B0);
+    }
+
+    /// La boot ROM DMG réelle (exécutée instruction par instruction) doit dé-mapper elle-même via rBANK ($FF50)
+    /// pour un logo + checksum valides, et le hand-off vers $0100 doit avoir lieu près de la frontière de frame —
+    /// PanDocs « Power Up Sequence » enregistre LY = $00 au PC=$0100 (colonne DMG/MGB).
+    #[test]
+    fn real_boot_rom_handoff_matches_pandocs_power_up_sequence() {
+        let mut rom = vec![0xFF; 0x8000];
+        let logo: [u8; 48] = [
+            0xCE, 0xED, 0x66, 0x66, 0xCC, 0x0D, 0x00, 0x0B, 0x03, 0x73, 0x00, 0x83,
+            0x00, 0x0C, 0x00, 0x0D, 0x00, 0x08, 0x11, 0x1F, 0x88, 0x89, 0x00, 0x0E,
+            0xDC, 0xCC, 0x6E, 0xE6, 0xDD, 0xDD, 0xD9, 0x99, 0xBB, 0xBB, 0x67, 0x63,
+            0x6E, 0x0E, 0xEC, 0xCC, 0xDD, 0xDC, 0x99, 0x9F, 0xBB, 0xB9, 0x33, 0x3E,
+        ];
+        rom[0x0104..0x0104 + logo.len()].copy_from_slice(&logo);
+        // Checksum de l'en-tête valide : la boot ROM somme $0134-$0150 puis ajoute [$0151] à $19 ;
+        // avec un corps tout en $FF, il faut [$0151] = $00 pour que le total tombe à 0.
+        rom[0x0151] = 0x00;
+
+        let mut emu = Emulator::new();
+        emu.load_rom_with_boot(rom);
+        assert!(!emu.mmu.boot_rom_finished); // boot ROM mappée au power-on
+        assert_eq!(emu.cpu.pc, 0x0000);
+
+        // La boot ROM DMG prend ~3168 frames (défilement du logo + son) avant le hand-off : marge généreuse.
+        let mut t: u64 = 0;
+        while !emu.mmu.boot_rom_finished && t < FRAME_TCYCLES * 4096 {
+            emu.run_tcycles(FRAME_TCYCLES);
+            t += FRAME_TCYCLES;
+        }
+
+        assert!(emu.mmu.boot_rom_finished, "la boot ROM doit dé-mapper elle-même via rBANK ($FF50)");
+        assert_eq!(emu.cpu.pc, 0x0100); // hand-off : la première instruction du jeu est à $0100
+        assert_eq!(emu.mmu.read(0xFF50), 0xFF); // rBANK se lit $FF une fois dé-mappée
+
+        // Le hand-off a lieu près de la frontière de frame (PanDocs enregistre LY = $00 au PC=$0100).
+        let ly = emu.mmu.read(0xFF44);
+        println!(
+            ">>> hand-off : t={} frames, LY={}, mode={}, STAT se lit ${:02X}",
+            t / FRAME_TCYCLES,
+            ly,
+            emu.mmu.ppu.mode,
+            emu.mmu.read(0xFF41),
+        );
+        assert!(ly == 0 || ly >= 144, "le hand-off doit avoir lieu près de la frontière de frame (LY={})", ly);
     }
 
     #[test]
@@ -514,6 +581,36 @@ mod tests {
     }
 
     #[test]
+    fn vblank_wait_loop_reads_live_ly_through_the_mmu() {
+        // Mini-ROM qui poll le LY ($FF44) via la MMU : d'abord attend le VBlank (LY == $90), puis attend la ligne 0 (LY == $00).
+        // Si le PPU était bloqué sur un LY fixe, ou si la MMU renvoyait une valeur stale/hidden, l'une des deux boucles ne se terminerait jamais.
+        let mut rom = vec![0x00; 0x4000]; // NOPs partout (SM83 valide)
+        let code: &[u8] = &[
+            0xF0, 0x44, // LDH A,($44) — read LY via the MMU
+            0xFE, 0x90, // CP $90     — compare with 144 (VBlank start)
+            0x20, 0xFA, // JR NZ,-6   — loop while not in VBlank → back to LDH A,($44)
+            0x3E, 0x42, // LD A,$42
+            0x32, 0x50, 0xC0, // LD ($C050),A — marker: reached VBlank (a16 little-endian : $50 puis $C0)
+            0xF0, 0x44, // LDH A,($44) — read LY again
+            0xFE, 0x00, // CP $00     — compare with line 0 (frame start)
+            0x20, 0xFA, // JR NZ,-6   — loop while not on line 0 → back to LDH A,($44)
+            0x3E, 0x84, // LD A,$84
+            0x32, 0x51, 0xC0, // LD ($C051),A — marker: left VBlank and LY was reset to 0 (a16 little-endian : $51 puis $C0)
+        ];
+        rom[0x0100..0x0100 + code.len()].copy_from_slice(code);
+
+        let mut emu = Emulator::new();
+        emu.load_rom(rom);
+        assert_eq!(emu.mmu.read_debug(0xC050), 0x11); // WRAM bank 0 power-on value, not yet written.
+        assert_eq!(emu.mmu.read_debug(0xC051), 0x11);
+
+        emu.run_tcycles(FRAME_TCYCLES * 2); // Two full frames: plenty of time to reach VBlank and then line 0.
+
+        assert_eq!(emu.mmu.read_debug(0xC050), 0x42); // The first loop terminated: the CPU read LY == $90 (144) via the MMU.
+        assert_eq!(emu.mmu.read_debug(0xC051), 0x84); // The second loop terminated: the PPU left VBlank and reset LY to 0.
+    }
+
+    #[test]
     fn timer_overflow_raises_the_if_flag() {
         let mut emu = Emulator::new();
         emu.load_test_program(); // programme qui tourne en boucle de NOP/JR
@@ -552,15 +649,15 @@ mod tests {
         let code: &[u8] = &[
             0x31, 0xFF, 0xDF, // LD SP,$DFFF
             0x3E, 0x20, // LD A,$20
-            0xF0,
+            0xF2,
             0x41, // LDH [$FF41],A → STAT = $20 : bit 5 posé (interruption VBlank activée)
             0x3E, 0x01, // LD A,$01
-            0xF0, 0xFF, // LDH [$FFFF],A → IE = $01 : VBlank uniquement
+            0xF2, 0xFF, // LDH [$FFFF],A → IE = $01 : VBlank uniquement
             0xFB, // EI (IME effectif après l'instruction suivante)
             0x76, // HALT
         ];
         rom[0x0100..0x0100 + code.len()].copy_from_slice(code);
-        rom[0x40] = 0xF0; // LDH [$FFC0],A : marqueur du handler VBlank
+        rom[0x40] = 0xF2; // LDH [$FFC0],A : marqueur du handler VBlank
         rom[0x41] = 0xC0;
         rom[0x42] = 0xC9; // RET
 
@@ -607,16 +704,16 @@ mod tests {
         let code: &[u8] = &[
             0x31, 0xFF, 0xDF, // LD SP,$DFFF
             0x3E, 0xFC, // LD A,$FC
-            0xF0, 0x07, // LDH [$FF07],A → TAC = $FC : timer activé (bit 2), sélection 00
+            0xF2, 0x07, // LDH [$FF07],A → TAC = $FC : timer activé (bit 2), sélection 00
             0x3E, 0xFF, // LD A,$FF
-            0xF0, 0x05, // LDH [$FF05],A → TIMA = $FF : débordement au prochain tick
+            0xF2, 0x05, // LDH [$FF05],A → TIMA = $FF : débordement au prochain tick
             0x3E, 0x04, // LD A,$04
-            0xF0, 0xFF, // LDH [$FFFF],A → IE = $04 : Timer uniquement
+            0xF2, 0xFF, // LDH [$FFFF],A → IE = $04 : Timer uniquement
             0xFB, // EI (IME effectif après l'instruction suivante)
             0x76, // HALT
         ];
         rom[0x0100..0x0100 + code.len()].copy_from_slice(code);
-        rom[0x50] = 0xF0; // LDH [$FFC0],A : marqueur du handler Timer
+        rom[0x50] = 0xF2; // LDH [$FFC0],A : marqueur du handler Timer
         rom[0x51] = 0xC0;
         rom[0x52] = 0xC9; // RET
 
@@ -639,20 +736,20 @@ mod tests {
         let code: &[u8] = &[
             0x31, 0xFF, 0xDF, // LD SP,$DFFF
             0x3E, 0xFC, // LD A,$FC
-            0xF0, 0x07, // LDH [$FF07],A → TAC = $FC : timer activé (bit 2), sélection 00
+            0xF2, 0x07, // LDH [$FF07],A → TAC = $FC : timer activé (bit 2), sélection 00
             0x3E, 0xFF, // LD A,$FF
-            0xF0, 0x05, // LDH [$FF05],A → TIMA = $FF : débordement au prochain tick
+            0xF2, 0x05, // LDH [$FF05],A → TIMA = $FF : débordement au prochain tick
             0x3E, 0x04, // LD A,$04
-            0xF0, 0xFF, // LDH [$FFFF],A → IE = $04 : Timer uniquement
+            0xF2, 0xFF, // LDH [$FFFF],A → IE = $04 : Timer uniquement
             0xFB, // EI (IME effectif after the next instruction)
             0x76, // HALT ($0110)
             0x76, // HALT ($0111) : ré-entrée en HALT après le RETI du handler
         ];
         rom[0x0100..0x0100 + code.len()].copy_from_slice(code);
-        rom[0x50] = 0xE0; // LDH A,[$FFC0] : lecture du compteur
+        rom[0x50] = 0xF0; // LDH A,($FFC0) : lecture du compteur
         rom[0x51] = 0xC0;
         rom[0x52] = 0x3C; // INC A
-        rom[0x53] = 0xF0; // LDH [$FFC0],A : écriture du compteur incrémenté
+        rom[0x53] = 0xF2; // LDH [$FFC0],A : écriture du compteur incrémenté
         rom[0x54] = 0xC0;
         rom[0x55] = 0xD9; // RETI (IME réactivé — aucun acknowledge !)
 
@@ -673,19 +770,19 @@ mod tests {
         let code: &[u8] = &[
             0x31, 0xFF, 0xDF, // LD SP,$DFFF
             0x3E, 0xFC, // LD A,$FC
-            0xF0, 0x07, // LDH [$FF07],A → TAC = $FC : timer activé (bit 2), sélection 00
+            0xF2, 0x07, // LDH [$FF07],A → TAC = $FC : timer activé (bit 2), sélection 00
             0x3E, 0xFF, // LD A,$FF
-            0xF0, 0x05, // LDH [$FF05],A → TIMA = $FF : débordement au prochain tick
+            0xF2, 0x05, // LDH [$FF05],A → TIMA = $FF : débordement au prochain tick
             0x3E, 0x04, // LD A,$04
-            0xF0, 0xFF, // LDH [$FFFF],A → IE = $04 : Timer uniquement
+            0xF2, 0xFF, // LDH [$FFFF],A → IE = $04 : Timer uniquement
             0xFB, // EI (IME effectif after the next instruction)
             0x76, // HALT ($0110)
             0x76, // HALT ($0111) : ré-entrée en HALT après le RETI du handler
         ];
         rom[0x0100..0x0100 + code.len()].copy_from_slice(code);
-        rom[0x50] = 0xF0; // LDH [$FFC0],A : marqueur du handler Timer (A = $04)
+        rom[0x50] = 0xF2; // LDH [$FFC0],A : marqueur du handler Timer (A = $04)
         rom[0x51] = 0xC0;
-        rom[0x52] = 0xF0; // LDH [$FF0F],A : acknowledge the interruption Timer (write-1-to-clear bit 2)
+        rom[0x52] = 0xF2; // LDH [$FF0F],A : acknowledge the interruption Timer (write-1-to-clear bit 2)
         rom[0x53] = 0x0F;
         rom[0x54] = 0xD9; // RETI
 
@@ -707,24 +804,24 @@ mod tests {
         let code: &[u8] = &[
             0x31, 0xFF, 0xDF, // LD SP,$DFFF
             0x3E, 0x20, // LD A,$20
-            0xF0,
+            0xF2,
             0x41, // LDH [$FF41],A → STAT = $20 : bit 5 posé (interruption VBlank activée)
             0x3E, 0x01, // LD A,$01
-            0xF0, 0xFF, // LDH [$FFFF],A → IE = $01 : VBlank uniquement
+            0xF2, 0xFF, // LDH [$FFFF],A → IE = $01 : VBlank uniquement
             0xFB, // EI (IME effectif après l'instruction suivante)
             0x76, // HALT ($010C)
             0x76, // HALT ($010D) : ré-entrée en HALT après le RETI du handler
         ];
         rom[0x0100..0x0100 + code.len()].copy_from_slice(code);
         // Handler VBlank à $40 : incrémente un compteur dans HRAM puis RETI (IME réactivé).
-        rom[0x40] = 0xE0; // LDH A,[$FFC0] (8) : lecture du compteur
+        rom[0x40] = 0xF0; // LDH A,($FFC0) (8) : lecture du compteur
         rom[0x41] = 0xC0;
         rom[0x42] = 0x3C; // INC A (4)
-        rom[0x43] = 0xF0; // LDH [$FFC0],A (8) : écriture du compteur incrémenté
+        rom[0x43] = 0xF2; // LDH [$FFC0],A (8) : écriture du compteur incrémenté
         rom[0x44] = 0xC0;
         rom[0x45] = 0x3E; // LD A,$01
         rom[0x46] = 0x01;
-        rom[0x47] = 0xF0; // LDH [$FF0F],A (8) : acknowledge VBlank (write-1-to-clear bit 0 de IF)
+        rom[0x47] = 0xF2; // LDH [$FF0F],A (8) : acknowledge VBlank (write-1-to-clear bit 0 de IF)
         rom[0x48] = 0x0F;
         rom[0x49] = 0xD9; // RETI (16) : retour à $010D + IME réactivé
 
@@ -771,14 +868,14 @@ mod tests {
         let code: &[u8] = &[
             0x31, 0xFF, 0xDF, // LD SP, $DFFF
             0x3E, 0x48, // LD A,'H'
-            0xF0, 0x01, // LDH [$FF01],A → SB='H'
+            0xF2, 0x01, // LDH [$FF01],A → SB='H'
             0x3E, 0x81, // LD A,$81
-            0xF0, 0x02, // LDH [$FF02],A → SC=$81 : transfert démarré ('H')
-            0x3E, 0x65, 0xF0, 0x01, 0x3E, 0x81, 0xF0, 0x02, // 'e'
-            0x3E, 0x6C, 0xF0, 0x01, 0x3E, 0x81, 0xF0, 0x02, // 'l' (premier)
-            0x3E, 0x6C, 0xF0, 0x01, 0x3E, 0x81, 0xF0, 0x02, // 'l' (deuxième)
-            0x3E, 0x6F, 0xF0, 0x01, 0x3E, 0x81, 0xF0, 0x02, // 'o'
-            0x3E, 0x0A, 0xF0, 0x01, 0x3E, 0x81, 0xF0,
+            0xF2, 0x02, // LDH [$FF02],A → SC=$81 : transfert démarré ('H')
+            0x3E, 0x65, 0xF2, 0x01, 0x3E, 0x81, 0xF2, 0x02, // 'e'
+            0x3E, 0x6C, 0xF2, 0x01, 0x3E, 0x81, 0xF2, 0x02, // 'l' (premier)
+            0x3E, 0x6C, 0xF2, 0x01, 0x3E, 0x81, 0xF2, 0x02, // 'l' (deuxième)
+            0x3E, 0x6F, 0xF2, 0x01, 0x3E, 0x81, 0xF2, 0x02, // 'o'
+            0x3E, 0x0A, 0xF2, 0x01, 0x3E, 0x81, 0xF2,
             0x02, // '\n' : la ligne « Hello » est émise dans le log hôte
             0x00, // NOP
             0x20, 0xFD, // JR -3 → boucle infinie (NOP + JR)
@@ -803,9 +900,9 @@ mod tests {
         let code: &[u8] = &[
             0x31, 0xFF, 0xDF, // LD SP,$DFFF
             0x3E, 0x41, // LD A,'A'
-            0xF0, 0x01, // LDH [$FF01],A → SB='A'
+            0xF2, 0x01, // LDH [$FF01],A → SB='A'
             0x3E, 0x81, // LD A,$81
-            0xF0, 0x02, // LDH [$FF02],A → SC=$81 : transfert démarré ('A')
+            0xF2, 0x02, // LDH [$FF02],A → SC=$81 : transfert démarré ('A')
             // .loop (0x0105) : polling pur — wait for bit 7 of SC to retombe à 0, pas d'interruption.
             0xF0, 0x02, // LDH A,[$FF02]
             0x05, // RRCA
@@ -1108,9 +1205,9 @@ mod tests {
         let code: &[u8] = &[
             0x31, 0xFF, 0xDF, // LD SP,$DFFF
             0x3E, 0x42, // LD A,'B'
-            0xF0, 0x01, // LDH [$FF01],A → SB='B'
+            0xF2, 0x01, // LDH [$FF01],A → SB='B'
             0x3E, 0x81, // LD A,$81
-            0xF0, 0x02, // LDH [$FF02],A → SC=$81 : transfert démarré (64 T-cycles)
+            0xF2, 0x02, // LDH [$FF02],A → SC=$81 : transfert démarré (64 T-cycles)
             0x00, // NOP
             0x20, 0xFD, // JR -3 → boucle infinie (NOP + JR)
         ];
@@ -1133,7 +1230,7 @@ mod tests {
         let code: &[u8] = &[
             0x31, 0xFF, 0xDF, // LD SP,$DFFF
             0x3E, 0xC0, // LD A,$C0
-            0xF0, 0x46, // LDH [$FF46],A → DMA OAM démarré (source $C000)
+            0xF2, 0x46, // LDH [$FF46],A → DMA OAM démarré (source $C000)
             0x00, // NOP
             0x20, 0xFD, // JR -3 → boucle infinie (NOP + JR)
         ];
@@ -1235,6 +1332,36 @@ mod tests {
             "final: finished={} unmap_frame={:?} PC=${:04X}",
             emu.mmu.boot_rom_finished, reported_unmap, emu.cpu.pc,
         );
+    }
+
+    #[test]
+    fn diag_boot_rom_ly_trace() {
+        let logo: [u8; 48] = [
+            0xCE, 0xED, 0x66, 0x66, 0xCC, 0x0D, 0x00, 0x0B, 0x03, 0x73, 0x00, 0x83,
+            0x00, 0x0C, 0x00, 0x0D, 0x00, 0x08, 0x11, 0x1F, 0x88, 0x89, 0x00, 0x0E,
+            0xDC, 0xCC, 0x6E, 0xE6, 0xDD, 0xDD, 0xD9, 0x99, 0xBB, 0xBB, 0x67, 0x63,
+            0x6E, 0x0E, 0xEC, 0xCC, 0xDD, 0xDC, 0x99, 0x9F, 0xBB, 0xB9, 0x33, 0x3E,
+        ];
+        // Brute-force the header-checksum byte position × value to find what makes this ROM variant
+        // reach hand-off (unmap). A valid boot unmmaps around frame 60-70; a stuck one never does.
+        let mut found: Vec<(u16, u8)> = Vec::new();
+        for pos in 0x0134..=0x015F {
+            for val in 0u8..=255 {
+                let mut rom = vec![0xFF; 0x8000];
+                rom[0x0104..0x0104 + logo.len()].copy_from_slice(&logo);
+                rom[pos as usize] = val;
+                let mut emu = Emulator::new();
+                emu.load_rom_with_boot(rom);
+                for frame in 0..80 {
+                    emu.run_tcycles(FRAME_TCYCLES);
+                    if emu.mmu.boot_rom_finished {
+                        found.push((pos, val));
+                        break;
+                    }
+                }
+            }
+        }
+        println!("checksum candidates that unmap within 80 frames: {:?}", found);
     }
 
     #[test]
