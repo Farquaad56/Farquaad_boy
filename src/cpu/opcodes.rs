@@ -314,21 +314,32 @@ fn ld_hl_sp(cpu: &mut CPU, e8: i8) -> u32 {
 /// DAA (4 T-cycles) : ajuste A en BCD après ADD/ADC/SUB/SBC.
 /// N est conservé, H est toujours effacé, C selon l'ajustement des dizaines.
 fn daa(cpu: &mut CPU) {
-    let a = cpu.a;
     let flags = cpu.flags();
-    let is_sub = flags.contains(Flags::N);
-    let (sign6, sign60): (i16, i16) = if is_sub { (-6, -0x60) } else { (6, 0x60) };
-    let mut v = a as i16;
-    if (a & 0x0F) > 0x09 || flags.contains(Flags::H) {
-        v += sign6;
+    let mut a = cpu.a;
+    let mut carry = flags.contains(Flags::C);
+
+    if !flags.contains(Flags::N) {
+        // Après une addition
+        if carry || a > 0x99 {
+            a = a.wrapping_add(0x60);
+            carry = true;
+        }
+        if flags.contains(Flags::H) || (a & 0x0F) > 0x09 {
+            a = a.wrapping_add(0x06);
+        }
+    } else {
+        // Après une soustraction : PAS de test sur le nibble, uniquement les flags
+        if carry {
+            a = a.wrapping_sub(0x60);
+        }
+        if flags.contains(Flags::H) {
+            a = a.wrapping_sub(0x06);
+        }
     }
-    let carry = (v as u8 & 0xF0) > 0x90 || flags.contains(Flags::C);
-    if carry {
-        v += sign60;
-    }
-    cpu.a = v as u8;
-    let mut f = if is_sub { Flags::N } else { Flags::empty() };
-    if v as u8 == 0 {
+
+    cpu.a = a;
+    let mut f = flags & Flags::N; // N est préservé, tout le reste est recalculé
+    if a == 0 {
         f |= Flags::Z;
     }
     if carry {
@@ -527,32 +538,20 @@ fn ld_mem_r16(cpu: &mut CPU, mmu: &mut MMU, idx: u8, to_mem: bool) -> u32 {
     8
 }
 
-/// LD HL,(a16) (12 T-cycles) : lit l'adresse a16 à `cpu.pc`, puis charge HL depuis cette adresse.
-fn ld_hl_a16(cpu: &mut CPU, mmu: &mut MMU) -> u32 {
-    let addr = read_a16(mmu, cpu.pc);
-    set_reg16(
-        cpu,
-        2,
-        u16::from_le_bytes([mmu.read(addr), mmu.read(addr.wrapping_add(1))]),
-    );
-    cpu.pc = cpu.pc.wrapping_add(2); // passe l'immédiat a16
-    12
+/// LD (HL±), A (8 T-cycles) : écrit A dans [HL], puis HL += delta. Pas de drapeaux.
+fn ld_hl_delta_a(cpu: &mut CPU, mmu: &mut MMU, delta: i16) -> u32 {
+    let hl = cpu.hl();
+    mmu.write(hl, cpu.a);
+    set_reg16(cpu, 2, (hl as i16).wrapping_add(delta) as u16);
+    8
 }
 
-/// LD (a16),A (16 T-cycles) : écrit A à l'adresse a16 lue à `cpu.pc`.
-fn ld_a16_a(cpu: &mut CPU, mmu: &mut MMU) -> u32 {
-    let addr = read_a16(mmu, cpu.pc);
-    mmu.write(addr, cpu.a);
-    cpu.pc = cpu.pc.wrapping_add(2); // passe l'immédiat a16
-    16
-}
-
-/// LD A,(a16) (16 T-cycles) : lit le byte à l'adresse a16 lue à `cpu.pc` dans A.
-fn ld_a_a16(cpu: &mut CPU, mmu: &mut MMU) -> u32 {
-    let addr = read_a16(mmu, cpu.pc);
-    cpu.a = mmu.read(addr);
-    cpu.pc = cpu.pc.wrapping_add(2); // passe l'immédiat a16
-    16
+/// LD A,(HL±) (8 T-cycles) : lit [HL] dans A, puis HL += delta. Pas de drapeaux.
+fn ld_a_hl_delta(cpu: &mut CPU, mmu: &mut MMU, delta: i16) -> u32 {
+    let hl = cpu.hl();
+    cpu.a = mmu.read(hl);
+    set_reg16(cpu, 2, (hl as i16).wrapping_add(delta) as u16);
+    8
 }
 
 /// LDH [n8],A (8 T-cycles) : écrit A dans le port $FF00+n8. L'immédiat est à `cpu.pc`.
@@ -697,7 +696,7 @@ pub fn execute(cpu: &mut CPU, mmu: &mut MMU, opcode: u8) -> u32 {
             jr(cpu, e8, cond_met(cpu, 0))
         } // JR NZ,e8 (12/4)
         0x21 => ld_r16_imm(cpu, mmu, 2),   // LD HL, n16 (12)
-        0x22 => ldh_a8(cpu, mmu),             // LDH [n8],A (8) : écrit A dans le port $FF00+n8
+        0x22 => ld_hl_delta_a(cpu, mmu, 1), // LD (HL+),A (8) : écrit A dans [HL], HL+=1
         0x23 => inc_dec16(cpu, 2, 1),      // INC HL (8)
         0x24 => inc8(cpu, mmu, 4),         // INC H (4) : Z N H C
         0x25 => dec8(cpu, mmu, 4),         // DEC H (4) : Z N=1 H C
@@ -714,7 +713,7 @@ pub fn execute(cpu: &mut CPU, mmu: &mut MMU, opcode: u8) -> u32 {
             // ADD HL,HL (16 T-cycles on DMG) : N=0 H C, Z inchangé.
             add_hl(cpu, cpu.hl()) + 8
         }
-        0x2A => ld_hl_a16(cpu, mmu),          // LD HL,(a16) (12)
+        0x2A => ld_a_hl_delta(cpu, mmu, 1), // LD A,(HL+) (8) : lit [HL] dans A, HL+=1
         0x2B => inc_dec16(cpu, 2, -1),     // DEC HL (8)
         0x2C => inc8(cpu, mmu, 5),         // INC L (4) : Z N H C
         0x2D => dec8(cpu, mmu, 5),         // DEC L (4) : Z N=1 H C
@@ -726,7 +725,7 @@ pub fn execute(cpu: &mut CPU, mmu: &mut MMU, opcode: u8) -> u32 {
             jr(cpu, e8, cond_met(cpu, 2))
         } // JR NC,e8 (12/4)
         0x31 => ld_r16_imm(cpu, mmu, 3),    // LD SP, n16 (12)
-        0x32 => ld_a16_a(cpu, mmu),           // LD (a16),A (16)
+        0x32 => ld_hl_delta_a(cpu, mmu, -1), // LD (HL-),A (8) : écrit A dans [HL], HL-=1
         0x33 => inc_dec16(cpu, 3, 1),       // INC SP (8)
         0x34 => inc8(cpu, mmu, 6),          // INC (HL) (12) : Z N H C
         0x35 => dec8(cpu, mmu, 6),          // DEC (HL) (12) : Z N=1 H C
@@ -743,7 +742,7 @@ pub fn execute(cpu: &mut CPU, mmu: &mut MMU, opcode: u8) -> u32 {
             // ADD HL,SP (16 T-cycles on DMG) : N=0 H C, Z inchangé.
             add_hl(cpu, cpu.sp) + 8
         }
-        0x3A => ld_a_a16(cpu, mmu),           // LD A,(a16) (16)
+        0x3A => ld_a_hl_delta(cpu, mmu, -1), // LD A,(HL-) (8) : lit [HL] dans A, HL-=1
         0x3B => inc_dec16(cpu, 3, -1),      // DEC SP (8)
         0x3C => inc8(cpu, mmu, 7),          // INC A (4) : Z N H C
         0x3D => dec8(cpu, mmu, 7),          // DEC A (4) : Z N=1 H C
@@ -1221,17 +1220,11 @@ pub fn disasm(cpu: &CPU, mmu: &MMU) -> String {
         0x12 => "ld (de), a".to_string(),
         0x1A => "ld a, (de)".to_string(),
 
-        // LDH [n8],A / LD HL,(a16) / LD (a16),A / LD A,(a16)
-        0x22 => format!("ldh [${:02X}], a", mmu.read(cpu.pc.wrapping_add(1))),
-        0x2A => format!(
-            "ld hl, (${ :04X})",
-            read_a16(mmu, cpu.pc.wrapping_add(1))
-        ),
-        0x32 => format!("ld (${ :04X}), a", read_a16(mmu, cpu.pc.wrapping_add(1))),
-        0x3A => format!(
-            "ld a, (${ :04X})",
-            read_a16(mmu, cpu.pc.wrapping_add(1))
-        ),
+        // LD (HL±), A / LD A, (HL±)
+        0x22 => "ld (hl+), a".to_string(),
+        0x2A => "ld a, (hl+)".to_string(),
+        0x32 => "ld (hl-), a".to_string(),
+        0x3A => "ld a, (hl-)".to_string(),
 
         // INC/DEC r16
         0x03 | 0x13 | 0x23 | 0x33 => format!("inc {}", reg16_name(opcode >> 4)),
