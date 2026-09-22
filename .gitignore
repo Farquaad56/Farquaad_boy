@@ -1,2 +1,5 @@
 /target
 target_test_*.txt
+
+# Boot ROMs (fichiers binaires propriétaires)
+rom/*.gb
