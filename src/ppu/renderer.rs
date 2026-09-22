@@ -1,11 +1,7 @@
 //! Rendu des couches Background et Fenêtre (Pan Docs « Background »/« Window ») : la scanline est dessinée
 //! à la fin du mode Drawing, puis les sprites recouvrant la ligne sont composés par `sprites`.
 
-use crate::ppu::constants::{
-    BG_MAP_9800, BG_MAP_9C00, LCDC_BG, LCDC_BG_MAP_9C00, LCDC_LCD_ON, LCDC_OBJ_SIZE_16,
-    LCDC_SPRITE_ON, LCDC_TILE_SET_8800, LCDC_WINDOW, LCDC_WIN_MAP_9800, SCREEN_HEIGHT,
-    SCREEN_WIDTH, TILE_SET_9000,
-};
+use crate::ppu::constants::{BG_MAP_9800, BG_MAP_9C00, DMG_WHITE, LCDC_BG, LCDC_BG_MAP_9C00, LCDC_LCD_ON, LCDC_OBJ_SIZE_16, LCDC_SPRITE_ON, LCDC_TILE_SET_8800, LCDC_WINDOW, LCDC_WIN_MAP_9800, SCREEN_HEIGHT, SCREEN_WIDTH, TILE_SET_9000};
 
 use super::PPU;
 
@@ -17,7 +13,7 @@ impl PPU {
     #[allow(dead_code)] // le rendu normal est incrémental via `step` ; cette méthode sert surtout aux tests
     pub fn render_frame(&mut self, vram: &[u8; 0x2000], oam: &[u8; 0xA0]) {
         if self.lcdc & LCDC_LCD_ON == 0 {
-            self.framebuffer.fill(0xFF00_0000); // LCD éteint : écran noir
+            self.framebuffer.fill(DMG_WHITE); // LCD éteint : écran blanc (Pan Docs)
             return;
         }
 
@@ -49,7 +45,7 @@ impl PPU {
 
         // Sélection des sprites recouvrant cette ligne : au plus 10, les premiers dans l'ordre OAM (Pan Docs « Sprite »).
         // Les objets sont rendus only when the couche d'objets est activée (bit 1 du LCDC) ; sans fond ni fenêtre,
-        // ils apparaissent sur la base noire.
+        // ils apparaissent sur la base blanche.
         let mut selected = [false; 40];
         if self.lcdc & LCDC_SPRITE_ON != 0 {
             let objects_16px = self.lcdc & LCDC_OBJ_SIZE_16 != 0; // bit 2 du LCDC : objets 8×16 (Pan Docs « OAM »)
@@ -89,8 +85,8 @@ impl PPU {
                 self.framebuffer[row_start + x as usize] = Self::shade(self.bgp >> (pixel * 2));
             }
         } else {
-            // Couche Background éteinte : base noire.
-            self.framebuffer[row_start..row_start + SCREEN_WIDTH].fill(0xFF00_0000);
+            // Couche Background éteinte : base blanche (Pan Docs « LCDC.0 »).
+            self.framebuffer[row_start..row_start + SCREEN_WIDTH].fill(DMG_WHITE);
         }
 
         // Fenêtre : pas de défilement ; elle apparaît à partir of the ligne WY et of the colonne WX+1 (Pan Docs « Window »).

@@ -86,13 +86,15 @@ impl PPU {
 
     /// Valeur (0..3) du pixel `col` de la ligne `row` d'une tuile 8×8 (Pan Docs « Tile »/GBCTR) : le premier octet de la
     /// ligne contient les bits de poids fort (MSB) des pixels, le second les bits de poids faible (LSB), bit 7 = pixel le plus à gauche.
-    pub(crate) fn tile_pixel(vram: &[u8], tile_addr: usize, row: u32, col: u32) -> u8 {
-        let byte1 = vram[tile_addr + 2 * row as usize]; // MSB des pixels de la ligne
-        let byte2 = vram[tile_addr + 2 * row as usize + 1]; // LSB des pixels de la ligne
-        let bit_index = 7 - col; // le pixel 0 est à gauche (bit 7)
+    ///
 
-        let msb = (byte1 >> bit_index) & 1;
-        let lsb = (byte2 >> bit_index) & 1;
+    pub(crate) fn tile_pixel(vram: &[u8], tile_addr: usize, row: u32, col: u32) -> u8 {
+        let byte_lsb = vram[tile_addr + 2 * row as usize];       // 1er octet = LSB
+        let byte_msb = vram[tile_addr + 2 * row as usize + 1];   // 2e octet = MSB
+        let bit_index = 7 - col; // bit 7 = pixel le plus à gauche
+
+        let lsb = (byte_lsb >> bit_index) & 1;
+        let msb = (byte_msb >> bit_index) & 1;
 
         (msb << 1) | lsb // valeur du pixel : 0, 1, 2 ou 3
     }

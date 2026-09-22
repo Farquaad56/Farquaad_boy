@@ -486,7 +486,9 @@ fn jp_cond(cpu: &mut CPU, a16: u16, taken: bool) -> u32 {
 /// RST n8 (16 T-cycles) : pousse le PC puis saute à n8 << 3.
 /// RST n8 (16 T-cycles) : saut inconditionnel au vecteur `n7 * 8` — contrairement à CALL,
 /// aucune adresse de retour n'est poussée sur la pile (Pan Docs « CPU Instruction Set »).
-fn rst(cpu: &mut CPU, n7: u8) -> u32 {
+fn rst(cpu: &mut CPU, mmu: &mut MMU, n7: u8) -> u32 {
+    let pc = cpu.pc;           // adresse de la prochaine instruction (déjà avancée par le fetch)
+    push16(cpu, mmu, pc);      // pousse l'adresse de retour, comme un CALL
     cpu.pc = (n7 as u16) << 3;
     16
 }
@@ -587,7 +589,7 @@ fn ldh_c(cpu: &mut CPU, mmu: &mut MMU, to_mem: bool) -> u32 {
     } else {
         cpu.a = mmu.read(addr);
     }
-    12
+    8
 }
 
 /// PUSH r16stk (16 T-cycles) ; pas de drapeaux. idx 3 = AF.
@@ -792,7 +794,7 @@ pub fn execute(cpu: &mut CPU, mmu: &mut MMU, opcode: u8) -> u32 {
             8
         } // ADD A,n8 (8)
         0xC7 | 0xCF | 0xD7 | 0xDF | 0xE7 | 0xEF | 0xF7 | 0xFF => {
-            rst(cpu, (opcode & 0x38) >> 3)
+            rst(cpu, mmu, (opcode & 0x38) >> 3)
         } // RST n8 (16)
         0xC8 => ret_cond(cpu, mmu, cond_met(cpu, 1)), // RET Z (20/8)
         0xC9 => {
@@ -863,7 +865,7 @@ pub fn execute(cpu: &mut CPU, mmu: &mut MMU, opcode: u8) -> u32 {
 
         0xE0 => out_n_a(cpu, mmu),             // OUT (n8),A (12) : écrit A dans le port $FF00+n8
         0xE1 => pop_r16(cpu, mmu, 2),          // POP HL (12)
-        0xE2 => ldh_c(cpu, mmu, false),        // LDH A, [C] (12)
+        0xE2 => ldh_c(cpu, mmu, true),  // LD [C],A : écrit A dans $FF00+C
         0xE3 | 0xE4 | 0xEB | 0xEC | 0xED => 4, // opcodes invalides (hard-lock sur le matériel)
         0xE5 => push_r16(cpu, mmu, 2),         // PUSH HL (16)
         0xE6 => {
@@ -896,7 +898,7 @@ pub fn execute(cpu: &mut CPU, mmu: &mut MMU, opcode: u8) -> u32 {
 
         0xF0 => ldh_a_n(cpu, mmu),       // LDH A,(n8) (8) : lit le port $FF00+n8 dans A, sans drapeaux
         0xF1 => pop_r16(cpu, mmu, 3),    // POP AF (12)
-        0xF2 => ldh_a8(cpu, mmu),        // LDH [n8],A (8) : écrit A dans le port $FF00+n8
+        0xF2 => ldh_c(cpu, mmu, false), // LD A,[C] : lit $FF00+C dans A
         0xF3 => {
             cpu.ime = false;
             cpu.ei_delay = 0;

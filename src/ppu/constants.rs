@@ -80,6 +80,10 @@ pub(crate) const TILE_SET_8800: usize = 0x8800 - 0x8000;
 /// les octets 1-127 vers $9010-$97F0, and the octets 128-255 (interprétés comme -128..-1) vers $8800-$8FF0 — index relatif à $8000.
 pub(crate) const TILE_SET_9000: usize = 0x9000 - 0x8000; // 0x1000
 
+/// Couleur « blanc DMG » utilisée quand le LCD est éteint (bit 7 du LCDC) ou que la couche Background
+/// est désactivée (bit 0 du LCDC) — Pan Docs : le fond devient alors la teinte la plus claire, pas noir.
+pub const DMG_WHITE: u32 = 0xFFFFFFFF;
+
 /// Les 4 teintes DMG classiques (Pan Docs « Graphics ») : [R, G, B].
 pub const DMG_SHADES: [[u8; 3]; 4] = [
     [0x9B, 0xBC, 0x0F], // Teinte 0 : Vert clair (#9BBC0F)

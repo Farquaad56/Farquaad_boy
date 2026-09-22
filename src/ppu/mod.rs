@@ -172,7 +172,7 @@ impl PPU {
         self.mode = 0; // HBlank : la PPU est gelée au début de la ligne 0 (Gekkio PDF §9)
         self.mode_clock = 0;
         self.update_stat_mode();
-        self.framebuffer.fill(0xFF00_0000); // écran noir
+        self.framebuffer.fill(DMG_WHITE); // écran blanc (Pan Docs)
     }
 
     /// Renvoie les requêtes d'interruption PPU en attente and les efface (Pan Docs « Interrupt Sources ») :

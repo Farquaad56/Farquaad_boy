@@ -1006,7 +1006,7 @@ impl FarquaadGBApp {
                         });
                         ui.scope(|ui| {
                             ui.set_min_width(48.0);
-                            ui.monospace(format!("{:02X}", io[offset as usize]));
+                            ui.monospace(format!("{:02X}", self.emulator.mmu.read_debug(addr)));
                         });
                     });
                 }
