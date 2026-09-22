@@ -355,7 +355,8 @@ impl MMU {
             0xFF00 => self.joypad.write(value),
             // Registre Interrupt Flag ($FF0F) : write-1-to-clear for bits 0–4 (Pan Docs « Interrupt Sources ») —
             // c'est au jeu, dans its ISR, d'acknowledge an interrupt by writing a 1 in the bit corresponding to $FF0F.
-            0xFF0F => self.io[0x0F] &= !(value & 0x1F),
+            // Correction bug test EI Interrupt 0xFF0F => self.io[0x0F] &= !(value & 0x1F),
+            0xFF0F => self.io[0x0F] = value & 0x1F,
             // Autres registres I/O.
             0xFF00..=0xFF7F => self.io[(addr - 0xFF00) as usize] = value,
             // High RAM.
