@@ -76,6 +76,12 @@ fn read_a16(mmu: &MMU, at: u16) -> u16 {
     u16::from_le_bytes([mmu.read(at), mmu.read(at + 1)])
 }
 
+/// Version debug de [`read_a16`] pour le listing de désassemblage : lecture via `read_debug` afin que les
+/// accès déclenchés par la GUI ne polluent pas le suivi « dernier accès CPU » du MMU.
+fn read_a16_debug(mmu: &MMU, at: u16) -> u16 {
+    u16::from_le_bytes([mmu.read_debug(at), mmu.read_debug(at + 1)])
+}
+
 /// PUSH d'une valeur 16 bits (octet haut à SP-1, octet bas à SP-2).
 fn push16(cpu: &mut CPU, mmu: &mut MMU, value: u16) {
     let sp = cpu.sp.wrapping_sub(1);
@@ -158,7 +164,8 @@ impl Alu8 {
                     ((a & 0x0F) as i16 - (operand & 0x0F) as i16 - cin as i16) < 0,
                 )
             }
-            Self::And => (a & operand, false, false),
+            // AND met TOUJOURS H=1 et C=0 sur le matériel (GBCTR §6.4, Pan Docs) — d'où h=true ici.
+            Self::And => (a & operand, false, true),
             Self::Xor => (a ^ operand, false, false),
             Self::Or => (a | operand, false, false),
             Self::Cp => {
@@ -169,7 +176,8 @@ impl Alu8 {
     }
 
     /// Exécute `op r8` (l'opérande est déjà chargé) : met à jour A (sauf pour CP)
-    /// et les drapeaux Z N H C (N=1 pour SUB/SBC/CP, H/C selon l'arithmétique).
+    /// et les drapeaux Z N H C (N=1 pour SUB/SBC/CP, H/C selon l'arithmétique ;
+    /// AND met TOUJOURS H=1 et C=0 — GBCTR §6.4, Pan Docs).
     fn apply(&self, cpu: &mut CPU, operand: u8) {
         // Le drapeau C doit être lu AVANT de le réécrire (ADC/SBC).
         let carry_in = cpu.flags().contains(Flags::C);
@@ -184,10 +192,12 @@ impl Alu8 {
         if self.is_sub() {
             f |= Flags::N;
         }
-        if h {
+        // 🚨 CORRECTION : AND met TOUJOURS H=1 et C=0 (GBCTR §6.4, Pan Docs).
+        if h || matches!(self, Self::And) {
             f |= Flags::H;
         }
-        if c {
+        if c && !matches!(self, Self::And) {
+            // Pour And, compute() renvoie déjà c=false — on s'assure que C reste 0.
             f |= Flags::C;
         }
         cpu.set_flags(f);
@@ -1019,7 +1029,7 @@ fn sra_reg(cpu: &mut CPU, mmu: &mut MMU, idx: u8) -> u32 {
 /// SWAP r8 (8 T-cycles, 16 si (HL)) : échange des deux nibbles ; Z=(v==0), N=0, H=0, C=0.
 fn swap_reg(cpu: &mut CPU, mmu: &mut MMU, idx: u8) -> u32 {
     let value = get_reg8(cpu, mmu, idx);
-    let result = value.swap_bytes();
+    let result = (value >> 4) | (value << 4);
     set_reg8(cpu, mmu, idx, result);
     cb_flags(cpu, result, false);
     if idx == 6 { 16 } else { 8 }
@@ -1036,7 +1046,7 @@ fn srl_reg(cpu: &mut CPU, mmu: &mut MMU, idx: u8) -> u32 {
 /// BIT b,r8 (8 T-cycles, 12 si (HL)) : Z=(bit==0), N=0, H=1 ; C inchangé.
 fn bit_reg(cpu: &mut CPU, mmu: &mut MMU, bit: u8, idx: u8) -> u32 {
     let value = get_reg8(cpu, mmu, idx);
-    let mut f = Flags::N | Flags::H;
+    let mut f = Flags::H;
     if ((value >> bit) & 1) == 0 {
         f |= Flags::Z;
     }
@@ -1200,20 +1210,21 @@ fn cb_mnemonic(sub: u8) -> String {
     }
 }
 
-/// Désassemble l'instruction située à `CPU.pc` en mnémonique.
-#[allow(dead_code)] // Réserve : le widget « CPU Debug » de la GUI a été retiré ; conserver pour un futur réemploi.
-pub fn disasm(cpu: &CPU, mmu: &MMU) -> String {
-    let opcode = mmu.read(cpu.pc);
+/// Désassemble l'instruction située à `addr` en mnémonique (panneau « CPU Debug » de la GUI).
+/// Les opérandes sont lus via `read_debug` : le listing ne pollue pas le suivi « dernier accès CPU » du MMU.
+pub fn disasm_at(addr: u16, mmu: &MMU) -> String {
+    let pc = addr; // PC virtuel du listing : les opérandes sont lus à partir de cette adresse.
+    let opcode = mmu.read_debug(pc);
     match opcode {
         0x00 => "nop".to_string(),
         0x76 => "halt".to_string(),
-        0x10 => format!("stop ${:02X}", mmu.read(cpu.pc.wrapping_add(1))),
+        0x10 => format!("stop ${:02X}", mmu.read_debug(pc.wrapping_add(1))),
 
         // LD r16, n16 (l'immédiat est à pc+1)
         0x01 | 0x11 | 0x21 | 0x31 => format!(
             "ld {}, ${:04X}",
             reg16_name(opcode >> 4),
-            read_a16(mmu, cpu.pc.wrapping_add(1))
+            read_a16_debug(mmu, pc.wrapping_add(1))
         ),
 
         // LD (r16), A / LD A, (r16)
@@ -1239,7 +1250,7 @@ pub fn disasm(cpu: &CPU, mmu: &MMU) -> String {
             match opcode & 0x07 {
                 4 => format!("inc {}", r8),
                 5 => format!("dec {}", r8),
-                _ => format!("ld {}, ${:02X}", r8, mmu.read(cpu.pc.wrapping_add(1))),
+                _ => format!("ld {}, ${:02X}", r8, mmu.read_debug(pc.wrapping_add(1))),
             }
         }
 
@@ -1254,7 +1265,7 @@ pub fn disasm(cpu: &CPU, mmu: &MMU) -> String {
         0x3F => "ccf".to_string(),
 
         // LD (a16), SP / ADD HL, r16
-        0x08 => format!("ld (${ :04X}), sp", read_a16(mmu, cpu.pc.wrapping_add(1))),
+        0x08 => format!("ld (${ :04X}), sp", read_a16_debug(mmu, pc.wrapping_add(1))),
         0x09 | 0x19 | 0x29 | 0x39 => format!(
             "add hl, {}",
             reg16_name(if opcode == 0x29 { 2 } else { opcode >> 4 })
@@ -1271,8 +1282,8 @@ pub fn disasm(cpu: &CPU, mmu: &MMU) -> String {
             format!(
                 "jr {}${:04X}",
                 cond,
-                (cpu.pc.wrapping_add(1) as i16)
-                    .wrapping_add((mmu.read(cpu.pc.wrapping_add(1)) as i8) as i16)
+                (pc.wrapping_add(1) as i16)
+                    .wrapping_add((mmu.read_debug(pc.wrapping_add(1)) as i8) as i16)
                     as u16
             )
         }
@@ -1293,7 +1304,7 @@ pub fn disasm(cpu: &CPU, mmu: &MMU) -> String {
         0xC6 | 0xCE | 0xD6 | 0xDE | 0xE6 | 0xEE | 0xF6 | 0xFE => format!(
             "{} a, ${:02X}",
             alu_name((opcode & 0x38) >> 3),
-            mmu.read(cpu.pc.wrapping_add(1))
+            mmu.read_debug(pc.wrapping_add(1))
         ),
 
         // RET / RET cond / RETI
@@ -1307,20 +1318,20 @@ pub fn disasm(cpu: &CPU, mmu: &MMU) -> String {
         }
 
         // JP a16 / JP cond,a16 / JP HL
-        0xC3 => format!("jp ${:04X}", read_a16(mmu, cpu.pc.wrapping_add(1))),
+        0xC3 => format!("jp ${:04X}", read_a16_debug(mmu, pc.wrapping_add(1))),
         0xE9 => "jp hl".to_string(),
         0xC2 | 0xCA | 0xD2 | 0xDA => format!(
             "jp {}, ${:04X}",
             ["nz", "z", "nc", "c"][(opcode - 0xC2) as usize / 8],
-            read_a16(mmu, cpu.pc.wrapping_add(1))
+            read_a16_debug(mmu, pc.wrapping_add(1))
         ),
 
         // CALL a16 / CALL cond,a16
-        0xCD => format!("call ${:04X}", read_a16(mmu, cpu.pc.wrapping_add(1))),
+        0xCD => format!("call ${:04X}", read_a16_debug(mmu, pc.wrapping_add(1))),
         0xC4 | 0xCC | 0xD4 | 0xDC => format!(
             "call {}, ${:04X}",
             ["nz", "z", "nc", "c"][(opcode - 0xC4) as usize / 8],
-            read_a16(mmu, cpu.pc.wrapping_add(1))
+            read_a16_debug(mmu, pc.wrapping_add(1))
         ),
 
         // RST n8
@@ -1343,23 +1354,39 @@ pub fn disasm(cpu: &CPU, mmu: &MMU) -> String {
         }
 
         // Préfixe CB (sous-opcode à pc+1)
-        0xCB => format!("cb {}", cb_mnemonic(mmu.read(cpu.pc.wrapping_add(1)))),
+        0xCB => format!("cb {}", cb_mnemonic(mmu.read_debug(pc.wrapping_add(1)))),
 
         // OUT / LDH / LD a16 / ADD SP / DI / EI
-        0xE0 => format!("out (${:02X}), a", mmu.read(cpu.pc.wrapping_add(1))),
-        0xF0 => format!("ldh a,(${:02X})", mmu.read(cpu.pc.wrapping_add(1))),
+        0xE0 => format!("out (${:02X}), a", mmu.read_debug(pc.wrapping_add(1))),
+        0xF0 => format!("ldh a,(${:02X})", mmu.read_debug(pc.wrapping_add(1))),
         0xE2 => "ldh a,(c)".to_string(),
-        0xF2 => format!("ldh [${:02X}], a", mmu.read(cpu.pc.wrapping_add(1))),
-        0xEA => format!("ld (${ :04X}), a", read_a16(mmu, cpu.pc.wrapping_add(1))),
-        0xFA => format!("ld a, (${ :04X})", read_a16(mmu, cpu.pc.wrapping_add(1))),
-        0xE8 => format!("add sp, ${:02X}", mmu.read(cpu.pc.wrapping_add(1))),
-        0xF8 => format!("ld hl, sp+${:02X}", mmu.read(cpu.pc.wrapping_add(1))),
+        0xF2 => format!("ldh [${:02X}], a", mmu.read_debug(pc.wrapping_add(1))),
+        0xEA => format!("ld (${ :04X}), a", read_a16_debug(mmu, pc.wrapping_add(1))),
+        0xFA => format!("ld a, (${ :04X})", read_a16_debug(mmu, pc.wrapping_add(1))),
+        0xE8 => format!("add sp, ${:02X}", mmu.read_debug(pc.wrapping_add(1))),
+        0xF8 => format!("ld hl, sp+${:02X}", mmu.read_debug(pc.wrapping_add(1))),
         0xF9 => "ld sp, hl".to_string(),
         0xF3 => "di".to_string(),
         0xFB => "ei".to_string(),
 
         // Opcodes invalides (hard-lock sur le matériel) et inconnus
         _ => format!("db ${:02X}", opcode),
+    }
+}
+
+/// Taille en octets de l'instruction dont l'opcode est `opcode` (1, 2 ou 3).
+///
+/// Utilisée par le listing prospectif du panneau « CPU Debug » pour avancer le PC virtuel de la taille
+/// réelle de chaque instruction et garder les instructions suivantes alignées sur leurs vrais opcodes.
+pub fn instruction_len(opcode: u8) -> usize {
+    match opcode {
+        // 3 octets : LD r16,n16 / LD (a16),SP / JP [cc,]a16 / CALL [cc,]a16 / LD (a16),A / LD A,(a16).
+        0x01 | 0x08 | 0x11 | 0x21 | 0x31 | 0xC2 | 0xCA | 0xC3 | 0xC4 | 0xCC | 0xCD | 0xD2 | 0xDA
+        | 0xD4 | 0xDC | 0xEA | 0xFA => 3,
+        // 2 octets : LD r8,n8 / STOP n8 / JR [cc,]e8 / ALU A,n8 / CB préfixe / OUT/LDH n8 / ADD SP,e8 / LD HL,SP+e8.
+        0x06 | 0x0E | 0x10 | 0x16 | 0x18 | 0x20 | 0x26 | 0x28 | 0x30 | 0x36 | 0x38 | 0x3E | 0xC6
+        | 0xCB | 0xCE | 0xD6 | 0xDE | 0xE0 | 0xE6 | 0xE8 | 0xEE | 0xF0 | 0xF2 | 0xF6 | 0xF8 | 0xFE => 2,
+        _ => 1,
     }
 }
 
@@ -1392,6 +1419,49 @@ mod tests {
         assert_eq!(cpu.pc, 0x0100); // cible du vecteur de reset
         assert!(!cpu.ime);
         assert!(!cpu.halted);
+    }
+
+    /// AND A,B ($A0) : met TOUJOURS H=1 et C=0 sur le matériel (GBCTR §6.4, Pan Docs),
+    /// même si C était posé avant l'instruction ; Z=(A&B)==0, N=0.
+    #[test]
+    fn and_always_sets_half_carry_and_clears_carry() {
+        let mut mmu = rom_with(&[0xA0]); // $0100 : AND A,B (pas d'opérande mémoire)
+        let mut cpu = CPU::new();
+        cpu.pc = 0x0101;
+        cpu.a = 0b1010_1010;
+        cpu.b = 0b0110_0110;
+        cpu.set_flags(Flags::C); // C posé avant l'instruction : AND doit le effacer
+        assert_eq!(execute(&mut cpu, &mut mmu, 0xA0), 4);
+        assert_eq!(cpu.a, 0b0010_0010);
+        let f = cpu.flags();
+        assert!(!f.contains(Flags::Z)); // résultat non nul
+        assert!(!f.contains(Flags::N));
+        assert!(f.contains(Flags::H)); // 🚨 H=1 TOUJOURS pour AND
+        assert!(!f.contains(Flags::C)); // C=0 TOUJOURS pour AND
+    }
+
+    /// XOR A,B ($A8) garde H=0 et C=0 (seul AND force H=1), et le carry d'ADD A,n8 est conservé.
+    #[test]
+    fn alu_flags_xor_keeps_h_c_zero_and_add_carry_preserved() {
+        let mut mmu = rom_with(&[0xA8, 0x2A]); // $0100 : XOR A,B ; $0101 : immédiat pour ADD A,n8
+        let mut cpu = CPU::new();
+        cpu.pc = 0x0101;
+        cpu.a = 0b1010_1010;
+        cpu.b = 0b0110_0110;
+        assert_eq!(execute(&mut cpu, &mut mmu, 0xA8), 4); // XOR A,B → $CC
+        let f = cpu.flags();
+        assert!(!f.contains(Flags::Z));
+        assert!(!f.contains(Flags::N));
+        assert!(!f.contains(Flags::H)); // XOR ne force pas H (seul AND le fait)
+        assert!(!f.contains(Flags::C));
+
+        cpu.a = 0xF5;
+        assert_eq!(execute(&mut cpu, &mut mmu, 0xC6), 8); // ADD A,$2A → $1F avec carry
+        let f = cpu.flags();
+        assert!(!f.contains(Flags::Z));
+        assert!(!f.contains(Flags::N));
+        assert!(!f.contains(Flags::H)); // 0x5 + 0xA = 0xF : pas de half-carry
+        assert!(f.contains(Flags::C)); // le carry d'addition est conservé (pas écrasé par la correction AND)
     }
 
     /// OUT (n8),A ($E0) : écrit A dans le port $FF00+n8 — c'est l'instruction dont la boot ROM DMG
@@ -2137,6 +2207,37 @@ mod tests {
                 "opcode ${:02X} doit consommer 1 octet",
                 opcode
             );
+        }
+    }
+
+    /// Taille des instructions : 3 octets pour les opcodes à a16, 2 octets pour n8/CB, 1 octet sinon.
+    #[test]
+    fn instruction_len_matches_the_sm83_encoding() {
+        for &opcode in &[
+            0x01u8, 0x08, 0x11, 0x21, 0x31, // LD r16,n16 / LD (a16),SP
+            0xC2, 0xCA, 0xC3, 0xC4, 0xCC, 0xCD, 0xD2, 0xDA, 0xD4, 0xDC, // JP/CALL [cc,]a16
+            0xEA, 0xFA, // LD (a16),A / LD A,(a16)
+        ] {
+            assert_eq!(instruction_len(opcode), 3, "opcode ${:02X} doit faire 3 octets", opcode);
+        }
+        for &opcode in &[
+            0x06u8, 0x0E, 0x16, 0x1E, 0x26, 0x2E, 0x36, 0x3E, // LD r8,n8
+            0xC6, 0xCE, 0xD6, 0xDE, 0xE6, 0xEE, 0xF6, 0xFE, // ALU A,n8
+            0x10, // STOP n8
+            0x18, 0x20, 0x28, 0x30, 0x38, // JR [cc,]e8
+            0xCB, // préfixe CB (sous-opcode)
+            0xE0, 0xF0, 0xF2, // OUT/LDH n8
+            0xE8, 0xF8, // ADD SP,e8 / LD HL,SP+e8
+        ] {
+            assert_eq!(instruction_len(opcode), 2, "opcode ${:02X} doit faire 2 octets", opcode);
+        }
+        for &opcode in &[
+            0x00u8, 0x76, // nop / halt
+            0x09, 0x19, 0x29, 0x39, // ADD HL,r16
+            0xC9, 0xD9, 0xE9, 0xF9, // RET / RETI / JP HL / LD SP,HL
+            0xF3, 0xFB, // DI / EI
+        ] {
+            assert_eq!(instruction_len(opcode), 1, "opcode ${:02X} doit faire 1 octet", opcode);
         }
     }
 }

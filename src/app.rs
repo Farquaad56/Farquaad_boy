@@ -10,6 +10,7 @@
 
 use crate::cartridge::is_nintendo_logo_valid;
 use crate::cpu::flags::Flags;
+use crate::cpu::opcodes::{disasm_at, instruction_len};
 use crate::emulator::Emulator;
 use crate::joypad::{KEY_A, KEY_B, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_SELECT, KEY_START, KEY_UP};
 use crate::ppu::{self, SCREEN_HEIGHT, SCREEN_WIDTH};
@@ -287,6 +288,17 @@ impl MemoryRegion {
             Self::Hiram => (0xFF80, 0x7F),   // $FF80-$FFFE
         }
     }
+
+    /// Région contenant l'adresse (saut de l'éditeur mémoire depuis le panneau « CPU Debug »).
+    fn from_address(addr: u16) -> Self {
+        for region in Self::ALL {
+            let (base, size) = region.range();
+            if addr >= base && addr < base.wrapping_add(size as u16) {
+                return region;
+            }
+        }
+        Self::Rom0 // $0100-$3FFF et au-delà : ROM0 par défaut.
+    }
 }
 
 /// Nom du registre IO à l'adresse $FF00-$FF7F (nomenclature PanDocs, alignée sur les modules
@@ -403,7 +415,28 @@ pub struct FarquaadGBApp {
     mem_edit_addr: String,
     /// Memory editor: hex value field for writing a byte (e.g. "FF").
     mem_edit_value: String,
+    /// Snapshot de l'état processeur au redraw précédent : surlignage des valeurs modifiées du panneau « CPU Debug ».
+    prev_cpu_snapshot: Option<CpuSnapshot>,
+    /// Adresse vers laquelle l'éditeur mémoire doit défiler (clic sur SP/PC dans le panneau « CPU Debug »).
+    mem_jump_addr: Option<u16>,
 }
+
+/// Snapshot de l'état processeur pour le surlignage des changements du panneau « CPU Debug » : les valeurs
+/// modifiées depuis le redraw précédent sont affichées en jaune (comme Mesen/BGB).
+#[derive(Clone, Copy)]
+struct CpuSnapshot {
+    af: u16,
+    bc: u16,
+    de: u16,
+    hl: u16,
+    sp: u16,
+    pc: u16,
+    /// Bits d'état : IME (bit 0), HALT (bit 1), halt bug (bit 2).
+    state: u16,
+    ei_delay: u8,
+    t_cycles: u64,
+}
+
 impl FarquaadGBApp {
     /// Crée l'application et configure le contexte egui (thème sombre, fond #1a1a1a).
     /// Si `initial_rom` est fourni (argument de ligne de commande), la ROM est chargée au démarrage.
@@ -445,6 +478,8 @@ impl FarquaadGBApp {
             show_tile_grid: true,
             mem_edit_addr: String::from("8000"),
             mem_edit_value: String::from("FF"),
+            prev_cpu_snapshot: None,
+            mem_jump_addr: None,
         };
 
         // Chargement automatique depuis la ligne de commande (ex. `cargo run -- assets/cpu_instrs.gb`).
@@ -852,15 +887,15 @@ impl FarquaadGBApp {
             });
     }
 
-    /// Zone centrale, haut gauche : processeur (drapeaux, PC/SP, registres A/F B/C D/E H/L + combinaisons 16 bits,
-    /// IME/HALT/EI delay, compteurs instructions/T-cycles, BOOTROM).
-    fn show_processor_panel(&self, ui: &mut egui::Ui) {
-        // Le contenu (cadre des registres, titre « 🧠 Processor » inclus) défile si la zone est trop petite ;
-        // le scroll horizontal évite que le tableau des registres soit écrêté/déformé quand la zone est étroite.
+    /// Zone centrale : CPU debugger en 6 panneaux — registres principaux (AF/A/F/BC/DE/HL/SP/PC), drapeaux Z N H C,
+    /// état processeur spécial (IME/HALT/halt bug/EI delay + compteurs), listing de désassemblage autour du PC,
+    /// contexte mémoire (derniers accès CPU + dumps pile/code) et contrôles pas-à-pas (instruction / frame).
+    fn show_processor_panel(&mut self, ui: &mut egui::Ui) {
+        // Le contenu défile verticalement si la zone est trop petite ; le scroll horizontal évite que les panneaux soient écrêtés.
         egui::ScrollArea::both()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                self.show_cpu_info(ui);
+                self.show_cpu_debugger(ui);
             });
     }
     /// Zone centrale, haut droit : informations de l'en-tête cartouche (titre, type MBC, tailles,
@@ -1081,44 +1116,138 @@ impl FarquaadGBApp {
                     .color(Color32::YELLOW),
             );
         }
-        let mut dump = String::with_capacity((size / 16 + 1) * 48);
-        for offset in (0..size).step_by(16) {
-            let row_base = base.wrapping_add(offset as u16);
-            let mut line = format!("${row_base:04X} | ");
-            for i in 0..16u16 {
-                if offset + (i as usize) < size {
-                    let byte = self.emulator.mmu.read_debug(row_base.wrapping_add(i));
-                    line.push_str(&format!("{byte:02X} "));
-                } else {
-                    line.push_str(".. "); // padding for the last incomplete row (HIRAM)
-                }
-            }
-            if boot_rom_mapped && row_base < 0x100 {
-                line.push_str("← BOOT ROM");
-            }
-            dump.push_str(line.trim_end());
-            dump.push('\n');
-        }
+        // Jump request from the CPU debugger (SP/PC click): scroll to the row containing that address.
+        let jump_row = self.mem_jump_addr.take().and_then(|addr| {
+            let rel = addr.wrapping_sub(base);
+            (rel < size as u16).then(|| rel / 16)
+        });
 
+        // One widget per line : stable content, and `scroll_to_me` can center the target row.
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.monospace(dump);
+                for (row_idx, offset) in (0..size).step_by(16).enumerate() {
+                    let row_base = base.wrapping_add(offset as u16);
+                    let mut line = format!("${row_base:04X} | ");
+                    for i in 0..16u16 {
+                        if offset + (i as usize) < size {
+                            let byte = self.emulator.mmu.read_debug(row_base.wrapping_add(i));
+                            line.push_str(&format!("{byte:02X} "));
+                        } else {
+                            line.push_str(".. "); // padding for the last incomplete row (HIRAM)
+                        }
+                    }
+                    if boot_rom_mapped && row_base < 0x100 {
+                        line.push_str("← BOOT ROM");
+                    }
+                    let is_target = jump_row.is_some_and(|r| (r as usize) == row_idx);
+                    if is_target {
+                        // Target row : highlighted in yellow and centered by the scroll area.
+                        ui.label(egui::RichText::new(line.trim_end()).monospace().color(Color32::YELLOW))
+                            .scroll_to_me(Some(egui::Align::Center));
+                    } else {
+                        ui.monospace(line.trim_end());
+                    }
+                }
             });
     }
 
-    /// Informations CPU en style « table » : titre « 🧠 Processor », section drapeaux Z N H C (+ registre F),
-    /// tableau complet des registres (PC|SP, paires de bytes A|B F|C D|E H|L, combinaisons 16 bits BC|DE HL|AF)
-    /// en hexadécimal + expansion binaire, état IME/HALT/EI delay, compteurs instructions/T-cycles et indicateur
-    /// BOOTROM. Les tableaux sont construits avec `egui_extras::TableBuilder` (colonnes auto-dimensionnées sur le
-    /// contenu monospace) : l'alignement est conservé quelle que soit la largeur du panneau — plus aucune
-    /// déformation quand la zone centrale redimensionne ou qu'un autre widget de débogage est activé à côté.
-    fn show_cpu_info(&self, ui: &mut egui::Ui) {
-        use egui_extras::{Column, TableBuilder};
+    /// Zone centrale : CPU debugger en 6 panneaux — registres principaux (AF/A/F, BC/DE/HL, SP/PC), drapeaux Z N H C,
+    /// état processeur spécial (IME/HALT/halt bug/EI delay + compteurs instructions/T-cycles/frame et indicateur BOOTROM),
+    /// listing de désassemblage autour du PC (longueurs réelles des opcodes), contexte mémoire (derniers accès CPU +
+    /// dumps pile/code) et contrôles pas-à-pas (instruction / frame). Les valeurs modifiées depuis le redraw précédent
+    /// sont surlignées en jaune (style Mesen/BGB) ; SP/PC sautent vers l'éditeur mémoire.
+    fn show_cpu_debugger(&mut self, ui: &mut egui::Ui) {
+        // ---- Valeurs en lecture seule calculées d'avance : les boutons ci-dessous peuvent alors muter `self` librement. ----
+        let (af, a, f_raw, bc, de, hl, sp, pc, flags_set, ime, halted, halt_bug, ei_delay) = {
+            let cpu = &self.emulator.cpu;
+            (
+                cpu.af(),
+                (cpu.af() >> 8) as u8,
+                cpu.f & 0xF0,
+                ((cpu.b as u16) << 8) | cpu.c as u16,
+                ((cpu.d as u16) << 8) | cpu.e as u16,
+                cpu.hl(),
+                cpu.sp,
+                cpu.pc,
+                cpu.flags(),
+                cpu.ime,
+                cpu.halted,
+                cpu.halt_bug,
+                cpu.ei_delay,
+            )
+        };
+        let instructions = self.emulator.instructions;
+        let t_cycles = self.emulator.t_cycles;
+        let last_instr_cycles = self.emulator.last_instr_cycles;
+        let frames_elapsed = t_cycles / crate::emulator::FRAME_TCYCLES;
+        let dot_in_frame = t_cycles % crate::emulator::FRAME_TCYCLES;
+        let in_bootrom = !self.emulator.mmu.boot_rom_finished;
 
-        let cpu = &self.emulator.cpu;
+        // Derniers accès CPU (suivi MMU) : `(adresse << 8) | valeur`.
+        let last_read = self.emulator.mmu.last_read.get();
+        let last_write = self.emulator.mmu.last_write.get();
 
-        // Le cadre est centré dans le panneau avec une largeur minimale : le tableau ne peut plus être écrêté.
+        // Détection des changements par rapport à l'instantané précédent.
+        let prev = self.prev_cpu_snapshot;
+        let ch_af = prev.is_some_and(|p| p.af != af);
+        let ch_a = prev.is_some_and(|p| (p.af >> 8) as u8 != a);
+        let ch_f = prev.is_some_and(|p| (p.af & 0xFF) as u8 != f_raw);
+        let ch_bc = prev.is_some_and(|p| p.bc != bc);
+        let ch_de = prev.is_some_and(|p| p.de != de);
+        let ch_hl = prev.is_some_and(|p| p.hl != hl);
+        let ch_sp = prev.is_some_and(|p| p.sp != sp);
+        let ch_pc = prev.is_some_and(|p| p.pc != pc);
+        // Bits d'état (IME bit 0, HALT bit 1, halt bug bit 2) + détection des changements état/EI delay/T-cycles.
+        let state_bits = ((if ime { 1 } else { 0 }) | (if halted { 2 } else { 0 }) | (if halt_bug { 4 } else { 0 })) as u16;
+        let ch_state = prev.is_some_and(|p| p.state != state_bits);
+        let ch_ei = prev.is_some_and(|p| p.ei_delay != ei_delay);
+        let ch_tcyc = prev.is_some_and(|p| p.t_cycles != t_cycles);
+
+        // Listing de désassemblage autour du PC : on remonte au plus 8 octets en arrière pour trouver le début
+        // d'instruction dont le flux atterrit exactement sur le PC, puis on liste ~18 instructions vers l'avant.
+        let listing = {
+            let mmu = &self.emulator.mmu;
+            let mut start = pc;
+            for back in 1..=8u16 {
+                let cand = pc.wrapping_sub(back);
+                let mut addr = cand;
+                let mut hits_pc = false;
+                for _ in 0..12 {
+                    if addr == pc {
+                        hits_pc = true;
+                        break;
+                    }
+                    addr = addr.wrapping_add(instruction_len(mmu.read_debug(addr)) as u16);
+                }
+                if hits_pc {
+                    start = cand;
+                    break;
+                }
+            }
+            let mut lines: Vec<(u16, String, String)> = Vec::with_capacity(18);
+            let mut addr = start;
+            for _ in 0..18 {
+                let opcode = mmu.read_debug(addr);
+                let len = instruction_len(opcode) as u16;
+                let bytes: Vec<String> = (0..len).map(|i| format!("{:02X}", mmu.read_debug(addr.wrapping_add(i)))).collect();
+                lines.push((addr, bytes.join(" "), disasm_at(addr, mmu)));
+                addr = addr.wrapping_add(len);
+            }
+            lines
+        };
+
+        // Dumps mémoire : 16 octets autour de SP (SP-8..SP+7) et 16 octets de code à partir du PC.
+        let stack_bytes: Vec<u8> = {
+            let mmu = &self.emulator.mmu;
+            (0..16).map(|i| mmu.read_debug(sp.wrapping_sub(8).wrapping_add(i))).collect()
+        };
+        let code_bytes: Vec<u8> = {
+            let mmu = &self.emulator.mmu;
+            (0..16).map(|i| mmu.read_debug(pc.wrapping_add(i))).collect()
+        };
+
+        // Le cadre est centré dans le panneau avec une largeur minimale : les panneaux ne peuvent plus être écrêtés.
         ui.vertical_centered(|ui| {
             egui::Frame::default()
                 .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(96, 96, 96)))
@@ -1126,20 +1255,58 @@ impl FarquaadGBApp {
                 .show(ui, |ui| {
                     // egui 0.31 : `Frame` n'a pas de methode `min_size` ; la largeur minimale est
                     // imposee sur le ui interne (le cadre s'adapte a `content_ui.min_rect()`).
-                    ui.set_min_size(egui::vec2(470.0, 0.0));
+                    ui.set_min_size(egui::vec2(560.0, 0.0));
                     // Titre du panneau (centré).
                     ui.vertical_centered(|ui| {
-                        ui.label(egui::RichText::new("🧠 Processor").strong());
+                        ui.label(egui::RichText::new("🧠 CPU Debugger").strong());
                     });
 
                     ui.separator();
 
-                    // Section drapeaux Z N H C : étiquettes orange, valeur allumée si levée + registre F.
-                    ui.vertical_centered(|ui| {
-                        ui.label(egui::RichText::new("🚦 Flags CPU"));
-                    });
-                    ui.add_space(4.0);
-                    let f = cpu.flags();
+                    // ---- Panneau 1 : registres principaux AF/A/F, BC/DE/HL, SP/PC (SP et PC cliquables). ----
+                    Self::show_panel_title(ui, "📟 Registers");
+                    egui::Grid::new("cpu_debugger_registers")
+                        .striped(false)
+                        .min_col_width(84.0)
+                        .spacing(egui::vec2(24.0, 6.0))
+                        .show(ui, |ui| {
+                            Self::show_register_cell(ui, "AF", format!("${af:04X}"), ch_af);
+                            Self::show_register_cell(ui, "A", format!("${a:02X}"), ch_a);
+                            Self::show_register_cell(ui, "F", format!("=${f_raw:02X}"), ch_f);
+                            ui.end_row();
+
+                            Self::show_register_cell(ui, "BC", format!("${bc:04X}"), ch_bc);
+                            Self::show_register_cell(ui, "DE", format!("${de:04X}"), ch_de);
+                            Self::show_register_cell(ui, "HL", format!("${hl:04X}"), ch_hl);
+                            ui.end_row();
+
+                            // SP et PC : cliquables → saut vers l'éditeur mémoire (region + scroll).
+                            let sp_btn = ui.button(
+                                egui::RichText::new(format!("SP ${sp:04X}"))
+                                    .monospace()
+                                    .color(if ch_sp { Color32::YELLOW } else { Color32::from_rgb(190, 190, 190) }),
+                            );
+                            if sp_btn.clicked() {
+                                self.debug_tab = DebugTab::Memory;
+                                self.memory_region = MemoryRegion::from_address(sp);
+                                self.mem_jump_addr = Some(sp);
+                            }
+                            let pc_btn = ui.button(
+                                egui::RichText::new(format!("PC ${pc:04X}"))
+                                    .monospace()
+                                    .color(if ch_pc { Color32::YELLOW } else { Color32::from_rgb(190, 190, 190) }),
+                            );
+                            if pc_btn.clicked() {
+                                self.debug_tab = DebugTab::Memory;
+                                self.memory_region = MemoryRegion::from_address(pc);
+                                self.mem_jump_addr = Some(pc);
+                            }
+                        });
+
+                    ui.separator();
+
+                    // ---- Panneau 2 : drapeaux Z N H C + registre F brut. ----
+                    Self::show_panel_title(ui, "🚦 Flags");
                     ui.horizontal(|ui| {
                         for (name, flag) in [
                             ('Z', Flags::Z),
@@ -1147,189 +1314,160 @@ impl FarquaadGBApp {
                             ('H', Flags::H),
                             ('C', Flags::C),
                         ] {
-                            Self::show_flag(ui, name, f.contains(flag));
+                            Self::show_flag(ui, name, flags_set.contains(flag));
                         }
                         ui.add_space(16.0);
                         ui.label(egui::RichText::new("F").color(Color32::ORANGE));
-                        ui.monospace(format!("=${:02X}", cpu.f & 0xF0));
+                        ui.label(
+                            egui::RichText::new(format!("=${f_raw:02X}"))
+                                .monospace()
+                                .color(if ch_f { Color32::YELLOW } else { Color32::from_rgb(190, 190, 190) }),
+                        );
                     });
 
                     ui.separator();
 
-                    // Tableau complet des registres : PC|SP, puis paires de bytes A|B F|C D|E H|L,
-                    // puis combinaisons 16 bits BC|DE HL|AF. Valeur hexadécimale + expansion binaire gris foncé.
-                    let table = TableBuilder::new(ui)
+                    // ---- Panneau 3 : état processeur spécial (IME/HALT/halt bug/EI delay) + compteurs. ----
+                    Self::show_panel_title(ui, "⚙️ Processor State");
+                    egui::Grid::new("cpu_debugger_state")
                         .striped(false)
-                        .cell_layout(egui::Layout::left_to_right(egui::Align::TOP))
-                        .column(Column::auto()) // Registre (moitié gauche)
-                        .column(Column::auto()) // Valeur hexadécimale (gauche)
-                        .column(Column::auto()) // Expansion binaire (gauche)
-                        .column(Column::exact(18.0)) // Séparation entre les deux moitiés
-                        .column(Column::auto()) // Registre (moitié droite)
-                        .column(Column::auto()) // Valeur hexadécimale (droite)
-                        .column(Column::auto()); // Expansion binaire (droite)
-
-                    let rows16: [(&str, u16, &str, u16); 3] = [
-                        ("PC", cpu.pc, "SP", cpu.sp),
-                        (
-                            "BC",
-                            ((cpu.b as u16) << 8) | cpu.c as u16,
-                            "DE",
-                            ((cpu.d as u16) << 8) | cpu.e as u16,
-                        ),
-                        ("HL", cpu.hl(), "AF", cpu.af()),
-                    ];
-
-                    // Toutes les lignes sont ajoutées dans le corps de la table : en egui_extras 0.31,
-                    // `row()` vit sur `TableBody` (obtenu via `TableBuilder::body`).
-                    table.body(|mut body| {
-                        // Ligne PC|SP (pointeurs 16 bits).
-                        let (n1, v1, n2, v2) = rows16[0];
-                        body.row(20.0, |mut row| {
-                            Self::show_register_half(
-                                &mut row,
-                                n1,
-                                format!("${v1:04X}"),
-                                format!("{:08b} {:08b}", (v1 >> 8) as u8, v1 as u8),
-                            );
-                            row.col(|_| {}); // Séparation entre les deux moitiés.
-                            Self::show_register_half(
-                                &mut row,
-                                n2,
-                                format!("${v2:04X}"),
-                                format!("{:08b} {:08b}", (v2 >> 8) as u8, v2 as u8),
-                            );
-                        });
-
-                        // Ligne d'espacement.
-                        body.row(6.0, |mut row| {
-                            row.col(|_| {});
-                        });
-
-                        // Paires de bytes A|B F|C D|E H|L.
-                        let pairs8: [(&str, u8, &str, u8); 4] = [
-                            ("A", cpu.a, "B", cpu.b),
-                            ("F", cpu.f, "C", cpu.c),
-                            ("D", cpu.d, "E", cpu.e),
-                            ("H", cpu.h, "L", cpu.l),
-                        ];
-                        for (n1, v1, n2, v2) in pairs8 {
-                            body.row(20.0, |mut row| {
-                                Self::show_register_half(
-                                    &mut row,
-                                    n1,
-                                    format!("${v1:02X}"),
-                                    format!("{:04b} {:04b}", v1 >> 4, v1 & 0x0F),
-                                );
-                                row.col(|_| {}); // Séparation entre les deux moitiés.
-                                Self::show_register_half(
-                                    &mut row,
-                                    n2,
-                                    format!("${v2:02X}"),
-                                    format!("{:04b} {:04b}", v2 >> 4, v2 & 0x0F),
-                                );
-                            });
-                        }
-
-                        // Ligne d'espacement.
-                        body.row(6.0, |mut row| {
-                            row.col(|_| {});
-                        });
-
-                        // Combinaisons 16 bits BC|DE HL|AF (les deux dernières lignes de `rows16`).
-                        for &(n1, v1, n2, v2) in &rows16[1..] {
-                            body.row(20.0, |mut row| {
-                                Self::show_register_half(
-                                    &mut row,
-                                    n1,
-                                    format!("${v1:04X}"),
-                                    format!("{:08b} {:08b}", (v1 >> 8) as u8, v1 as u8),
-                                );
-                                row.col(|_| {}); // Séparation entre les deux moitiés.
-                                Self::show_register_half(
-                                    &mut row,
-                                    n2,
-                                    format!("${v2:04X}"),
-                                    format!("{:08b} {:08b}", (v2 >> 8) as u8, v2 as u8),
-                                );
-                            });
-                        }
-                    });
-
-                    ui.separator();
-
-                    // État du processeur : IME / HALT / EI delay + compteurs instructions et T-cycles.
-                    let status = TableBuilder::new(ui)
-                        .striped(false)
-                        .cell_layout(egui::Layout::left_to_right(egui::Align::TOP))
-                        .column(Column::auto()) // Étiquette (groupe 1)
-                        .column(Column::auto()) // Valeur (groupe 1)
-                        .column(Column::exact(18.0))
-                        .column(Column::auto()) // Étiquette (groupe 2)
-                        .column(Column::auto()) // Valeur (groupe 2)
-                        .column(Column::exact(18.0))
-                        .column(Column::auto()) // Étiquette (groupe 3)
-                        .column(Column::auto()); // Valeur (groupe 3)
-
-                    let t_cycles = self.emulator.t_cycles;
-                    let frames_elapsed = t_cycles / crate::emulator::FRAME_TCYCLES;
-                    let dot_in_frame = t_cycles % crate::emulator::FRAME_TCYCLES;
-
-                    status.body(|mut body| {
-                        body.row(20.0, |mut row| {
+                        .min_col_width(84.0)
+                        .spacing(egui::vec2(24.0, 6.0))
+                        .show(ui, |ui| {
                             Self::show_state_cell(
-                                &mut row,
+                                ui,
                                 "IME",
-                                if cpu.ime { "ON" } else { "OFF" }.to_owned(),
-                                if cpu.ime { Color32::GREEN } else { Self::DIM_GRAY },
+                                if ime { "ON" } else { "OFF" },
+                                if ch_state { Color32::YELLOW } else if ime { Color32::GREEN } else { Self::DIM_GRAY },
                             );
-                            row.col(|_| {});
                             Self::show_state_cell(
-                                &mut row,
+                                ui,
                                 "HALT",
-                                if cpu.halted { "ACTIVE" } else { "—" }.to_owned(),
-                                if cpu.halted { Color32::YELLOW } else { Self::DIM_GRAY },
+                                if halted { "ACTIVE" } else { "—" },
+                                if ch_state || halted { Color32::YELLOW } else { Self::DIM_GRAY },
                             );
-                            row.col(|_| {});
                             Self::show_state_cell(
-                                &mut row,
-                                "EI delay",
-                                cpu.ei_delay.to_string(),
-                                if cpu.ei_delay != 0 { Color32::GREEN } else { Self::DIM_GRAY },
+                                ui,
+                                "halt bug",
+                                if halt_bug { "YES" } else { "no" },
+                                if ch_state && halt_bug { Color32::RED } else if halt_bug { Color32::YELLOW } else { Self::DIM_GRAY },
                             );
-                        });
+                            ui.end_row();
 
-                        body.row(20.0, |mut row| {
                             Self::show_state_cell(
-                                &mut row,
-                                "Instr",
-                                format!("#{}", self.emulator.instructions),
+                                ui,
+                                "EI delay",
+                                ei_delay.to_string(),
+                                if ch_ei { Color32::YELLOW } else if ei_delay != 0 { Color32::GREEN } else { Self::DIM_GRAY },
+                            );
+                            Self::show_state_cell(ui, "Instr", format!("#{instructions}"), Color32::from_rgb(190, 190, 190));
+                            Self::show_state_cell(
+                                ui,
+                                "Last instr",
+                                format!("{last_instr_cycles} T-cyc"),
                                 Color32::from_rgb(190, 190, 190),
                             );
-                            row.col(|_| {});
+                            ui.end_row();
+
                             Self::show_state_cell(
-                                &mut row,
+                                ui,
                                 "TCyc",
                                 format!(
                                     "#{t_cycles} · frame {frames_elapsed} · dot {dot_in_frame}/{}",
                                     crate::emulator::FRAME_TCYCLES
                                 ),
-                                Color32::from_rgb(190, 190, 190),
+                                if ch_tcyc { Color32::YELLOW } else { Color32::from_rgb(190, 190, 190) },
                             );
-                            row.col(|_| {}); // Groupe 3 vide (structure de colonnes conservée).
                         });
-                    });
 
                     ui.separator();
 
-                    // BOOTROM : allumé tant que la boot ROM DMG est encore mappée (séquence de démarrage en cours).
-                    let in_bootrom = !self.emulator.mmu.boot_rom_finished;
-                    ui.vertical_centered(|ui| {
-                        ui.label(egui::RichText::new("BOOTROM").color(if in_bootrom {
-                            Color32::GREEN
-                        } else {
-                            Self::DIM_GRAY
-                        }));
+                    // ---- Panneau 4 : désassemblage autour du PC (longueurs réelles des opcodes). ----
+                    Self::show_panel_title(ui, "📜 Disassembly");
+                    egui::Grid::new("cpu_debugger_disasm")
+                        .striped(false)
+                        .min_col_width(84.0)
+                        .spacing(egui::vec2(16.0, 3.0))
+                        .show(ui, |ui| {
+                            for (addr, bytes, text) in &listing {
+                                let is_pc = *addr == pc;
+                                ui.label(
+                                    egui::RichText::new(format!("${addr:04X}"))
+                                        .monospace()
+                                        .color(if is_pc { Color32::YELLOW } else { Self::DIM_GRAY }),
+                                );
+                                ui.label(egui::RichText::new(bytes.as_str()).monospace().color(Color32::CYAN));
+                                ui.label(
+                                    egui::RichText::new(text.as_str())
+                                        .monospace()
+                                        .color(if is_pc { Color32::YELLOW } else { Color32::from_rgb(190, 190, 190) }),
+                                );
+                            }
+                        });
+
+                    ui.separator();
+
+                    // ---- Panneau 5 : contexte mémoire — derniers accès CPU + dumps pile/code. ----
+                    Self::show_panel_title(ui, "💾 Memory Context");
+                    egui::Grid::new("cpu_debugger_memory")
+                        .striped(false)
+                        .min_col_width(84.0)
+                        .spacing(egui::vec2(16.0, 3.0))
+                        .show(ui, |ui| {
+                            let (addr_r, val_r) = last_read.map(|v| ((v >> 8) as u16, v as u8)).unwrap_or((0x0000, 0));
+                            let (addr_w, val_w) = last_write.map(|v| ((v >> 8) as u16, v as u8)).unwrap_or((0x0000, 0));
+                            ui.label(egui::RichText::new("Last read").monospace().color(Color32::ORANGE));
+                            ui.label(
+                                egui::RichText::new(format!("${addr_r:04X} = ${val_r:02X}"))
+                                    .monospace()
+                                    .color(if last_read.is_some() { Color32::from_rgb(190, 190, 190) } else { Self::DIM_GRAY }),
+                            );
+                            ui.label(egui::RichText::new("Last write").monospace().color(Color32::ORANGE));
+                            ui.label(
+                                egui::RichText::new(format!("${addr_w:04X} = ${val_w:02X}"))
+                                    .monospace()
+                                    .color(if last_write.is_some() { Color32::from_rgb(190, 190, 190) } else { Self::DIM_GRAY }),
+                            );
+
+                            ui.end_row();
+
+                            let stack_str: Vec<String> = stack_bytes.iter().map(|b| format!("{b:02X}")).collect();
+                            let code_str: Vec<String> = code_bytes.iter().map(|b| format!("{b:02X}")).collect();
+                            ui.label(egui::RichText::new(format!("SP-8 ${:04X}", sp.wrapping_sub(8))).monospace().color(Color32::ORANGE));
+                            ui.label(egui::RichText::new(stack_str.join(" ")).monospace().color(Color32::from_rgb(190, 190, 190)));
+                            ui.end_row();
+
+                            ui.label(egui::RichText::new(format!("PC ${pc:04X}")).monospace().color(Color32::ORANGE));
+                            ui.label(egui::RichText::new(code_str.join(" ")).monospace().color(Color32::from_rgb(190, 190, 190)));
+                        });
+
+                    ui.separator();
+
+                    // ---- Panneau 6 : contrôles pas-à-pas (instruction / frame) + indicateur BOOTROM. ----
+                    Self::show_panel_title(ui, "⏯ Step");
+                    ui.horizontal(|ui| {
+                        if ui.button("▶ Step instruction").clicked() {
+                            self.emulator.step();
+                        }
+                        if ui.button("⏭ Step frame").clicked() {
+                            self.emulator.run_frame();
+                        }
+                        // BOOTROM : allumé tant que la boot ROM DMG est encore mappée (séquence de démarrage en cours).
+                        ui.add_space(16.0);
+                        ui.label(egui::RichText::new("BOOTROM").color(if in_bootrom { Color32::GREEN } else { Self::DIM_GRAY }));
+                    });
+
+                    // ---- Instantané pour la détection des changements au redraw suivant (style Mesen/BGB). ----
+                    self.prev_cpu_snapshot = Some(CpuSnapshot {
+                        af,
+                        bc,
+                        de,
+                        hl,
+                        sp,
+                        pc,
+                        state: state_bits,
+                        ei_delay,
+                        t_cycles,
                     });
                 });
         });
@@ -1358,28 +1496,41 @@ impl FarquaadGBApp {
         });
     }
 
-    /// Moitié d'une ligne du tableau des registres : nom monospace cyan + valeur hexadécimale, puis expansion
-    /// binaire gris foncé. Les colonnes auto-dimensionnées de `TableBuilder` gardent l'alignement quel que soit
-    /// le contenu (largeurs fixes en police monospace).
-    fn show_register_half(row: &mut egui_extras::TableRow, name: &str, hex: String, bin: String) {
-        row.col(|ui| {
-            ui.label(egui::RichText::new(name).monospace().color(Color32::CYAN));
-        });
-        row.col(|ui| {
-            ui.monospace(hex);
-        });
-        row.col(|ui| {
-            ui.label(egui::RichText::new(bin).monospace().color(Self::DIM_GRAY));
+    /// Titre de section du panneau « CPU Debug » (gras, centré au-dessus de la grille).
+    fn show_panel_title(ui: &mut egui::Ui, title: &str) {
+        ui.vertical_centered(|ui| {
+            ui.label(egui::RichText::new(title).strong());
         });
     }
 
-    /// Cellule d'état (étiquette monospace jaune + valeur colorée) pour la section IME/HALT/EI delay/compteurs.
-    fn show_state_cell(row: &mut egui_extras::TableRow, name: &str, value: String, color: Color32) {
-        row.col(|ui| {
-            ui.label(egui::RichText::new(name).monospace().color(Color32::YELLOW));
+    /// Cellule du tableau des registres : nom monospace cyan + valeur hexadécimale (jaune si modifiée depuis le
+    /// redraw précédent, gris sinon) — style Mesen/BGB.
+    fn show_register_cell(ui: &mut egui::Ui, name: &str, value: impl Into<String>, changed: bool) {
+        let value = value.into();
+        ui.scope(|ui| {
+            ui.set_min_width(84.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(name).monospace().color(Color32::CYAN));
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(value)
+                        .monospace()
+                        .color(if changed { Color32::YELLOW } else { Color32::from_rgb(190, 190, 190) }),
+                );
+            });
         });
-        row.col(|ui| {
-            ui.label(egui::RichText::new(value).monospace().color(color));
+    }
+
+    /// Cellule d'état (étiquette monospace orange + valeur colorée) pour la section IME/HALT/halt bug/EI delay/compteurs.
+    fn show_state_cell(ui: &mut egui::Ui, name: &str, value: impl Into<String>, color: Color32) {
+        let value = value.into();
+        ui.scope(|ui| {
+            ui.set_min_width(84.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(name).monospace().color(Color32::ORANGE));
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(value).monospace().color(color));
+            });
         });
     }
     /// Noms des huit boutons du joypad, dans the order of the indices (`crate::joypad::KEY_A`…`crate::joypad::KEY_DOWN`).

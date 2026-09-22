@@ -87,6 +87,12 @@ pub struct MMU {
     /// Dernière valeur loguée pour une lecture de $FF44 : le diagnostic n'est émis que quand la valeur
     /// renvoyée change (une boucle de polling peut lire ce registre des milliers de fois par frame).
     last_ly_read_log: Cell<Option<u8>>,
+
+    // --- Derniers accès CPU (panneau « Memory Context » du debugger) ---
+    /// Dernière lecture CPU effective : `(adresse << 8) | valeur` (None avant tout accès).
+    pub last_read: Cell<Option<u32>>,
+    /// Dernière écriture CPU effective : `(adresse << 8) | valeur` (None avant tout accès).
+    pub last_write: Cell<Option<u32>>,
 }
 
 impl MMU {
@@ -194,6 +200,8 @@ impl MMU {
             );
             self.last_ly_read_log.set(Some(value));
         }
+        // Dernier accès CPU (panneau « Memory Context » du debugger) : `(adresse << 8) | valeur`.
+        self.last_read.set(Some(((addr as u32) << 8) | value as u32));
         value
     }
 
@@ -355,6 +363,8 @@ impl MMU {
             // Registre Interrupt Enable.
             0xFFFF => self.ie = value,
         }
+        // Dernier accès CPU effectif (panneau « Memory Context » du debugger) : `(adresse << 8) | valeur`.
+        self.last_write.set(Some(((addr as u32) << 8) | value as u32));
     }
 
     /// Indique si un transfert DMA OAM est en cours (Pan Docs « OAM DMA Transfer »).
@@ -437,6 +447,9 @@ impl Default for MMU {
             dma_just_started: false,
 
             last_ly_read_log: Cell::new(None), // aucune lecture de $FF44 loguée encore.
+
+            last_read: Cell::new(None),   // aucun accès CPU effectué encore (panneau « Memory Context »).
+            last_write: Cell::new(None),
         };
         mmu.reset_memory(); // valeurs au power-on (PanDocs « Power Up Sequence ») : VRAM/OAM/HRAM = $FF, WRAM banque 0 = $11 / banque 1 = $FF.
         mmu

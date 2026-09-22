@@ -31,6 +31,8 @@ pub struct Emulator {
     pub t_cycles: u64,
     /// Instructions exécutées depuis le boot (compteur debug).
     pub instructions: u64,
+    /// T-cycles consommés par la dernière instruction exécutée (panneau « CPU Debug » ; 4 pendant HALT).
+    pub last_instr_cycles: u32,
 }
 
 impl Emulator {
@@ -41,6 +43,7 @@ impl Emulator {
             mmu: MMU::new(),
             t_cycles: 0,
             instructions: 0,
+            last_instr_cycles: 0,
         };
         emu.power_on(); // état post-boot ROM : CPU + registres I/O matériels (PanDocs « Power Up Sequence »)
         emu
@@ -162,6 +165,7 @@ impl Emulator {
         let cycles = self.cpu.step(&mut self.mmu);
         self.instructions += 1;
         self.t_cycles += cycles as u64;
+        self.last_instr_cycles = cycles; // T-cycles de la dernière instruction (panneau « CPU Debug »).
         self.cpu.t_cycles = self.t_cycles; // garde le compteur du CPU synchronisé (throttle des logs par frame)
         self.mmu.cpu_halted = self.cpu.halted; // bit 5 en lecture seule du registre IF ($FF0F)
 
@@ -649,10 +653,9 @@ mod tests {
         let code: &[u8] = &[
             0x31, 0xFF, 0xDF, // LD SP,$DFFF
             0x3E, 0x20, // LD A,$20
-            0xF2,
-            0x41, // LDH [$FF41],A → STAT = $20 : bit 5 posé (interruption VBlank activée)
+            0xE0, 0x41, // LDH [$FF41],A → STAT = $20 : bit 5 posé (interruption VBlank activée)
             0x3E, 0x01, // LD A,$01
-            0xF2, 0xFF, // LDH [$FFFF],A → IE = $01 : VBlank uniquement
+            0xE0, 0xFF, // LDH [$FFFF],A → IE = $01 : VBlank uniquement
             0xFB, // EI (IME effectif après l'instruction suivante)
             0x76, // HALT
         ];
@@ -678,7 +681,7 @@ mod tests {
         let code: &[u8] = &[
             0x31, 0xFF, 0xDF, // LD SP,$DFFF
             0x3E, 0x01, // LD A,$01
-            0xF2, 0xFF, // LDH [$FFFF],A → IE = $01 : VBlank uniquement
+            0xE0, 0xFF, // LDH [$FFFF],A → IE = $01 : VBlank uniquement
             0xFB, // EI (IME effectif after the next instruction)
             0x76, // HALT
         ];
@@ -704,11 +707,11 @@ mod tests {
         let code: &[u8] = &[
             0x31, 0xFF, 0xDF, // LD SP,$DFFF
             0x3E, 0xFC, // LD A,$FC
-            0xF2, 0x07, // LDH [$FF07],A → TAC = $FC : timer activé (bit 2), sélection 00
+            0xE0, 0x07, // LDH [$FF07],A → TAC = $FC : timer activé (bit 2), sélection 00
             0x3E, 0xFF, // LD A,$FF
-            0xF2, 0x05, // LDH [$FF05],A → TIMA = $FF : débordement au prochain tick
+            0xE0, 0x05, // LDH [$FF05],A → TIMA = $FF : débordement au prochain tick
             0x3E, 0x04, // LD A,$04
-            0xF2, 0xFF, // LDH [$FFFF],A → IE = $04 : Timer uniquement
+            0xE0, 0xFF, // LDH [$FFFF],A → IE = $04 : Timer uniquement
             0xFB, // EI (IME effectif après l'instruction suivante)
             0x76, // HALT
         ];
@@ -736,11 +739,11 @@ mod tests {
         let code: &[u8] = &[
             0x31, 0xFF, 0xDF, // LD SP,$DFFF
             0x3E, 0xFC, // LD A,$FC
-            0xF2, 0x07, // LDH [$FF07],A → TAC = $FC : timer activé (bit 2), sélection 00
+            0xE0, 0x07, // LDH [$FF07],A → TAC = $FC : timer activé (bit 2), sélection 00
             0x3E, 0xFF, // LD A,$FF
-            0xF2, 0x05, // LDH [$FF05],A → TIMA = $FF : débordement au prochain tick
+            0xE0, 0x05, // LDH [$FF05],A → TIMA = $FF : débordement au prochain tick
             0x3E, 0x04, // LD A,$04
-            0xF2, 0xFF, // LDH [$FFFF],A → IE = $04 : Timer uniquement
+            0xE0, 0xFF, // LDH [$FFFF],A → IE = $04 : Timer uniquement
             0xFB, // EI (IME effectif after the next instruction)
             0x76, // HALT ($0110)
             0x76, // HALT ($0111) : ré-entrée en HALT après le RETI du handler
@@ -770,11 +773,11 @@ mod tests {
         let code: &[u8] = &[
             0x31, 0xFF, 0xDF, // LD SP,$DFFF
             0x3E, 0xFC, // LD A,$FC
-            0xF2, 0x07, // LDH [$FF07],A → TAC = $FC : timer activé (bit 2), sélection 00
+            0xE0, 0x07, // LDH [$FF07],A → TAC = $FC : timer activé (bit 2), sélection 00
             0x3E, 0xFF, // LD A,$FF
-            0xF2, 0x05, // LDH [$FF05],A → TIMA = $FF : débordement au prochain tick
+            0xE0, 0x05, // LDH [$FF05],A → TIMA = $FF : débordement au prochain tick
             0x3E, 0x04, // LD A,$04
-            0xF2, 0xFF, // LDH [$FFFF],A → IE = $04 : Timer uniquement
+            0xE0, 0xFF, // LDH [$FFFF],A → IE = $04 : Timer uniquement
             0xFB, // EI (IME effectif after the next instruction)
             0x76, // HALT ($0110)
             0x76, // HALT ($0111) : ré-entrée en HALT après le RETI du handler
@@ -804,10 +807,9 @@ mod tests {
         let code: &[u8] = &[
             0x31, 0xFF, 0xDF, // LD SP,$DFFF
             0x3E, 0x20, // LD A,$20
-            0xF2,
-            0x41, // LDH [$FF41],A → STAT = $20 : bit 5 posé (interruption VBlank activée)
+            0xE0, 0x41, // LDH [$FF41],A → STAT = $20 : bit 5 posé (interruption VBlank activée)
             0x3E, 0x01, // LD A,$01
-            0xF2, 0xFF, // LDH [$FFFF],A → IE = $01 : VBlank uniquement
+            0xE0, 0xFF, // LDH [$FFFF],A → IE = $01 : VBlank uniquement
             0xFB, // EI (IME effectif après l'instruction suivante)
             0x76, // HALT ($010C)
             0x76, // HALT ($010D) : ré-entrée en HALT après le RETI du handler

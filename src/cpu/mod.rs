@@ -105,14 +105,6 @@ impl CPU {
     /// Le retard d'EI est décrémenté après chaque instruction exécutée : IME n'est
     /// réactivé qu'une fois l'instruction EI suivante exécutée (Pan Docs).
     pub fn step(&mut self, mmu: &mut MMU) -> u32 {
-        // FIX EI + HALT : Si le délai EI est à 1 et que la prochaine instruction est HALT (0x76),
-        // on active IME immédiatement. Cela permet à handle_interrupts de voir IME=true,
-        // de servir linterruption sans déclencher le HALT bug (conforme Pan Docs / Blargg 02-interrupts).
-        if self.ei_delay == 1 && mmu.read(self.pc) == 0x76 {
-            self.ime = true;
-            self.ei_delay = 0;
-        }
-
         // Check for interrupts before fetching the next opcode (also exits HALT — see handle_interrupts).
         if let Some(cycles) = opcodes::handle_interrupts(self, mmu) {
             return cycles; // un halt_bug posé par la sortie de HALT persiste jusqu'au fetch suivant
