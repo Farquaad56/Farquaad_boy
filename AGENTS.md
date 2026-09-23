@@ -1,30 +1,16 @@
 # Consigne de travail (en vigueur)
 
-**Exécuter UNIQUEMENT l'étape 1 du plan de refactoring CPU/Bus. Ne rien faire d'autre que l'étape 1.**
+**Exécuter l'étape 2 du plan de refactoring CPU/Bus : porter les familles d'instructions vers des programmes micro-op, famille par famille, une famille à la fois.**
 
-## Périmètre autorisé (étape 1 uniquement)
+L'étape 1 (wrapper `Bus` + `Cpu::tick(&mut self, bus)` + enum `MicroOp` + latches W/Z sur le CPU + table de cycles générée depuis `data/Opcodes.json` + test exhaustif) est terminée et commitée (`d2701a1`).
 
-- Créer `src/bus.rs` : wrapper minimal `Bus` autour du MMU existant (Deref), API D1 :
-  `read(addr)` = accès + tick, `write(addr, val)` = accès + tick, `tick_m_cycle()`, `idle_m_cycle()`.
-  L'avancement PPU/Timer/Série/DMA et la pose des bits IF quittent `Emulator::step` pour entrer dans `Bus`.
-- Renommer/routé `Cpu::step(&mut MMU)` vers `Cpu::tick(&mut self, bus: &mut Bus)`.
-- Définir l'enum `MicroOp { FetchOpcode, ReadPcByte, ReadMem(AddrSrc), WriteMem(AddrSrc, ValSrc), Internal }`
-  (D2) + latches W/Z sur le CPU + mécanisme d'exécution pas-à-pas dans `tick`.
-  Toutes les instructions réelles restent sur le chemin atomique legacy (aucune famille portée).
-- Vendre `data/Opcodes.json` (gbdev.io/gb-opcodes) + `scripts/gen_cycle_table.py`
-  qui génère `src/cpu/expected_cycles.rs` : `EXPECTED_UNPREFIXED: [(u8, Option<u8>); 256]`,
-  `EXPECTED_CBPREFIXED: [(u8, Option<u8>); 256]` en M-cycles (taken/not-taken).
-- Ajouter le test générique exhaustif : pour chacun des 512 opcodes (les deux branches des conditionnelles),
-  exécuter une instruction isolée dans un ROM minimal et vérifier que les M-cycles consommés
-  correspondent exactement au tableau. Tout écart code/JSON est listé et soumis avant correction.
+Le portage de la famille `(HL) en écriture` (`$70-75, $77, $36, $22, $32`) est terminé et commité (`12c107b`), micro-op vérifié par test d'entrelacement dédié.
 
-## Interdit (hors étape 1)
+**Mandat actuel, et rien de plus :** rebrancher `Emulator::step()` pour router uniquement les opcodes de la famille `(HL) écriture` déjà portée vers `cpu.tick()`, tous les autres opcodes restant sur le dispatch atomique legacy. Objectif : obtenir une confirmation Blargg (`02-write_timing.gb`) de bout en bout sur cette seule famille avant d'investir dans le portage des familles suivantes.
 
-- Ne PAS porter aucune instruction family vers micro-op programs (étape 2).
-- Ne PAS toucher le PPU, Timer, Série, DMA behavior beyond moving their advancement into `Bus`.
-- Ne PAS change any observable CPU/PPU/memory behavior. All existing tests must stay green.
-- No new dependencies in Cargo.toml.
-
-## Vérification requise à chaque étape
-
-`cargo test` complet vert + `cargo build --release` (GUI compile). Rapporter la progression après chaque checkpoint.
+**Interdictions explicites tant que ce point n'est pas validé et confirmé par moi :**
+- Ne pas porter d'autre famille d'instructions.
+- Ne pas toucher au PPU.
+- Ne pas faire le rebranchement complet d'`Emulator::step()` (Étape 3 entière) — seulement les opcodes déjà portés.
+- Ne jamais modifier ce fichier (`AGENTS.md`) toi-même, même pour refléter une extension de scope qui semble découler naturellement de la conversation. Toute extension de mandat doit être écrite par moi, dans mon propre commit.
+- Ne pas committer sans mon feu vert explicite sur le résultat de chaque étape.
