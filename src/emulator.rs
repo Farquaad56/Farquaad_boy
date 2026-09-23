@@ -162,13 +162,24 @@ impl Emulator {
     /// quand elle writes an odd value to rBANK ($FF50), the MMU dé-mappe her, and le hand-off vers the code cartouche à $0100 happens naturally (the last instruction of the boot ROM wraps PC).
     pub fn step(&mut self) -> u32 {
         let boot_was_mapped = !self.mmu.boot_rom_finished;
-        // Exécution normale : une instruction CPU (la boot ROM DMG incluse tant qu'elle est mappée à $0000-$00FF).
-        // Le CPU pilote le bus et avance le matériel lui-même (par M-cycle pour les instructions portées, en bloc sinon) ;
-        // `tick` renvoie les T-cycles consommés ainsi que true si la frontière de frame a été franchie.
-        let (cycles, frame_done) = {
+        // Exécution normale : une instruction CPU complète (la boot ROM DMG incluse tant qu'elle est mappée à $0000-$00FF).
+        // Le CPU pilote le bus et avance le matériel lui-même ; `tick` renvoie les T-cycles consommés ainsi que true si la
+        // frontière de frame a été franchie. Une instruction portée s'exécute pas-à-pas (un M-cycle par appel) : on relance
+        // `tick` tant qu'elle est en cours (`in_progress`) pour l'achever dans ce même pas, au lieu de la laisser inachevée sur
+        // le pas suivant. Les opcodes non portés restent sur le chemin atomique legacy (un seul appel).
+        let mut cycles: u32 = 0;
+        let mut frame_done = false;
+        {
             let mut bus = Bus::new(&mut self.mmu);
-            self.cpu.tick(&mut bus)
-        };
+            loop {
+                let (c, fd) = self.cpu.tick(&mut bus);
+                cycles += c;
+                frame_done |= fd;
+                if self.cpu.in_progress.is_none() {
+                    break;
+                }
+            }
+        }
         self.instructions += 1;
         self.t_cycles += cycles as u64;
         self.last_instr_cycles = cycles; // T-cycles de la dernière instruction (panneau « CPU Debug »).
@@ -1036,6 +1047,82 @@ mod tests {
         );
     }
 
+    // TEMPORARY diagnostic (removed before commit): dumps the raw serial transcript of blargg's individual
+    // mem_timing write-timing ROM so the (HL)-write porting can be confirmed end-to-end. Run with:
+    //   cargo test blargg_02_write_timing_serial_dump -- --nocapture
+    #[test]
+    fn blargg_02_write_timing_serial_dump() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("rom")
+            .join("gb-test-roms-master")
+            .join("mem_timing")
+            .join("individual")
+            .join("02-write_timing.gb");
+        let rom = std::fs::read(&path)
+            .unwrap_or_else(|err| panic!("impossible de lire {} : {err}", path.display()));
+
+        let mut emu = Emulator::new();
+        emu.load_rom(rom);
+
+        // Run frame-by-frame, collecting the serial transcript. Stop early once a terminal marker
+        // ("Passed" / "Failed" / "Done") appears; also sample PC/SP/TIMA periodically to reveal where
+        // (if anywhere) the CPU is looping when no terminal marker ever shows up.
+        const MAX_FRAMES: u32 = 2_000;
+        let mut out: Vec<u8> = Vec::new();
+        let text_of = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+        let mut finished_at_frame: Option<u32> = None;
+        let mut samples: Vec<(u32, u16, u16, u8)> = Vec::new(); // (frame, pc, sp, tima)
+        let mut pc_freq: std::collections::HashMap<u16, u32> = std::collections::HashMap::new();
+        let mut tima_nonzero: u32 = 0;
+        for frame in 0..MAX_FRAMES {
+            emu.run_tcycles(FRAME_TCYCLES);
+            out.extend(emu.mmu.serial.take_transcript());
+            if finished_at_frame.is_none() && !out.is_empty() {
+                let t = text_of(&out);
+                if t.contains("Passed") || t.contains("Failed") || t.contains("Done") {
+                    finished_at_frame = Some(frame + 1);
+                }
+            }
+            if frame % 100 == 0 {
+                samples.push((frame, emu.cpu.pc, emu.cpu.sp, emu.mmu.io[0x05])); // $FF05 = TIMA
+                *pc_freq.entry(emu.cpu.pc).or_insert(0) += 1;
+                if emu.mmu.io[0x05] != 0 {
+                    tima_nonzero += 1;
+                }
+            }
+        }
+
+        let text = text_of(&out);
+        println!(
+            "02-write_timing.gb : finished_at_frame={:?} final PC=${:04X} SP=${:04X}, IF=${:02X} IE=${:02X} IME={} halted={}",
+            finished_at_frame,
+            emu.cpu.pc,
+            emu.cpu.sp,
+            emu.mmu.io[0x0F],
+            emu.mmu.ie,
+            if emu.cpu.ime { "ON" } else { "OFF" },
+            emu.cpu.halted,
+        );
+        println!("    serial text           : {:?}", text);
+        let distinct: std::collections::HashSet<u16> = samples.iter().map(|s| s.1).collect();
+        println!(
+            "    {} PC samples over {} frames ; {} distinct PCs ; TIMA nonzero in {}/{} samples",
+            samples.len(),
+            MAX_FRAMES,
+            distinct.len(),
+            tima_nonzero,
+            samples.len()
+        );
+        let mut top: Vec<(u16, u32)> = pc_freq.iter().map(|(p, c)| (*p, *c)).collect();
+        top.sort_by_key(|x| std::cmp::Reverse(x.1));
+        for (pc, count) in &top {
+            println!("      PC=${:04X} seen {} times", pc, count);
+        }
+        for (frame, pc, sp, tima) in &samples {
+            println!("      frame {:>5} : PC=${:04X} SP=${:04X} TIMA={:02X}", frame, pc, sp, tima);
+        }
+    }
+
     /// Smoke test visuel headless : charge la ROM réelle Tetris.GB (NROM 32 KiB) et vérifie que le rendu du
     /// Background produit un écran varié — VRAM initialisée par le jeu, palette BGP modifiée depuis sa valeur
     /// post-boot, framebuffer multi-teintes. Chaque point de contrôle est imprimé en art ASCII pour inspection
@@ -1324,7 +1411,7 @@ mod tests {
                 rom[pos as usize] = val;
                 let mut emu = Emulator::new();
                 emu.load_rom_with_boot(rom);
-                for frame in 0..80 {
+                for _frame in 0..80 {
                     emu.run_tcycles(FRAME_TCYCLES);
                     if emu.mmu.boot_rom_finished {
                         found.push((pos, val));
