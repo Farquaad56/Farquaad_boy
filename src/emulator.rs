@@ -163,8 +163,9 @@ impl Emulator {
     pub fn step(&mut self) -> u32 {
         let boot_was_mapped = !self.mmu.boot_rom_finished;
         // Exécution normale : une instruction CPU (la boot ROM DMG incluse tant qu'elle est mappée à $0000-$00FF).
-        // Le CPU n'accède à la mémoire que par le bus ; l'avancement du matériel est fait en bloc juste après.
-        let cycles = {
+        // Le CPU pilote le bus et avance le matériel lui-même (par M-cycle pour les instructions portées, en bloc sinon) ;
+        // `tick` renvoie les T-cycles consommés ainsi que true si la frontière de frame a été franchie.
+        let (cycles, frame_done) = {
             let mut bus = Bus::new(&mut self.mmu);
             self.cpu.tick(&mut bus)
         };
@@ -201,13 +202,10 @@ impl Emulator {
         }
 
         // La PPU / Série / DMA OAM / Timer avancent du même nombre de T-cycles et posent les bits IF correspondants —
-        // l'avancement a quitté `Emulator::step` pour entrer dans le Bus (étape 1). Le rendu est donc incrémental,
-        // plus par frame : le framebuffer est toujours à jour après ce pas ; app.rs le présente tel quel. La transition
-        // LCD on→off noircit l'écran via `on_lcd_off` (la PPU reste gelée tant que bit 7 du LCDC est à 0).
-        let frame_done = {
-            let mut bus = Bus::new(&mut self.mmu);
-            bus.advance(cycles) // renvoie true quand la frontière de frame est franchie (LY > 153 → 0)
-        };
+        // l'avancement a quitté `Emulator::step` pour entrer dans le Bus (étape 1) : c'est désormais `CPU::tick` qui pilote
+        // ces avancements (par M-cycle pour les instructions portées, en bloc sinon) et renvoie la frontière de frame. Le
+        // rendu est donc incrémental, plus par frame : le framebuffer est toujours à jour après ce pas ; app.rs le présente
+        // tel quel. La transition LCD on→off noircit l'écran via `on_lcd_off` (la PPU reste gelée tant que bit 7 du LCDC est à 0).
         if frame_done {
             log::debug!("[PPU] Frame boundary crossed at t_cycles={}", self.t_cycles);
 

@@ -1012,8 +1012,11 @@ mod tests {
         let mut mmu = MMU::new();
         mmu.load_rom(rom);
         let mut cpu = CPU::new();
-        for _ in 0..4 { // exactement les 4 instructions (LD SP, LD BC, PUSH, POP)
-            cpu.step(&mut mmu);
+        {
+            let mut bus = crate::bus::Bus::new(&mut mmu);
+            for _ in 0..4 { // exactement les 4 instructions (LD SP, LD BC, PUSH, POP)
+                cpu.tick(&mut bus);
+            }
         }
 
         assert_eq!(cpu.sp, 0xFFFE); // la pile est de retour à $FFFE après le POP

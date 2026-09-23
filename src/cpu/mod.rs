@@ -3,8 +3,11 @@
 //! Partie 6 : jeu d'instructions complet (0x00-0xFF + préfixe 0xCB), interruptions
 //! (IME, IF, IE), HALT bug, et `step()` renvoyant les T-cycles.
 
+pub mod expected_cycles;
 pub mod flags;
 pub mod opcodes;
+
+use std::collections::VecDeque;
 
 use crate::bus::Bus;
 use crate::emulator::FRAME_TCYCLES;
@@ -86,7 +89,10 @@ impl ValSrc {
 }
 
 /// Micro-opération : un pas d'exécution d'une instruction (D2). Chaque micro-op consomme exactement un M-cycle.
-#[allow(dead_code)] // Étape 1 : infrastructure D2 — aucune famille n'est encore portée (étape 2).
+/// Les instructions portées en micro-ops sont exécutées pas-à-pas : [`CPU::tick`] consomme un micro-op de
+/// [`InProgress::steps`] par appel, jusqu'à épuisement. Étape 2 : seules les familles portées produisent des
+/// séquences ; toutes les autres instructions restent sur le chemin atomique legacy.
+#[allow(dead_code)] // Étape 1 : `FetchOpcode` / `ReadMem` / `Internal` ne sont pas encore construits (étape 2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MicroOp {
     /// Lit l'opcode à PC → latch Z ; le PC avance d'un octet.
@@ -99,6 +105,15 @@ pub enum MicroOp {
     WriteMem(AddrSrc, ValSrc),
     /// Pas interne (aucun accès bus) — ex. calcul de drapeaux ; le matériel avance quand même d'un M-cycle.
     Internal,
+}
+
+/// Instruction portée en cours d'exécution pas-à-pas (D2) : les micro-ops restants à exécuter. Le fetch
+/// (phase 0) est déjà consommé au décodage ; chaque appel à [`CPU::tick`] consomme un micro-op de `steps`. Quand
+/// `steps` s'épuise, l'instruction est achevée et le champ est remis à `None`.
+#[derive(Debug, Clone)]
+pub struct InProgress {
+    /// Micro-ops restants à exécuter (un par appel à [`CPU::tick`]).
+    pub steps: VecDeque<MicroOp>,
 }
 
 /// Registres du CPU Sharp LR35902.
@@ -139,8 +154,8 @@ pub struct CPU {
     pub w: u8,
     /// Latch de lecture Z : octet lu / résultat intermédiaire d'un micro-op (D2).
     pub z: u8,
-    /// Micro-op en cours d'exécution pas-à-pas ; `None` = chemin atomique legacy (étape 1 — aucune famille portée).
-    pub micro_op: Option<MicroOp>,
+    /// Instruction portée en cours d'exécution pas-à-pas ; `None` = chemin atomique legacy.
+    pub in_progress: Option<InProgress>,
 }
 
 impl CPU {
@@ -165,7 +180,7 @@ impl CPU {
             isr_log_frame: u32::MAX,
             w: 0,
             z: 0,
-            micro_op: None,
+            in_progress: None,
         };
         log::info!(
             "[CPU] Initial state: SP=${:04X}, PC=${:04X}",
@@ -195,7 +210,9 @@ impl CPU {
         self.f = (self.f & 0x0F) | f.bits();
     }
 
-    /// Exécute une instruction et renvoie le nombre de T-cycles consommés.
+    /// Exécute un pas et renvoie le nombre de T-cycles consommés ainsi que true si la frontière de frame est
+    /// franchie. Le CPU pilote le bus : l'avancement du matériel (PPU / Timer / Série / DMA + bits IF) se fait ici —
+    /// par M-cycle pour les instructions portées en micro-ops, et en bloc à la fin d'une instruction legacy.
     ///
     /// Bug HALT DMG : si le CPU est en HALT and any bit of IF ($FF0F) is set — even if IME is faux or the flag
     /// n'est pas activé dans IE — l'état HALT is annulé (le « HALT bug ») and la prochaine instruction fetchée is exécutée
@@ -204,23 +221,23 @@ impl CPU {
     ///
     /// Le retard d'EI est décrémenté après chaque instruction exécutée : IME n'est
     /// réactivé qu'une fois l'instruction EI suivante exécutée (Pan Docs).
-    pub fn tick(&mut self, bus: &mut Bus) -> u32 {
-        // Mécanisme D2 : si un micro-op est en cours d'exécution pas-à-pas, l'exécuter (un M-cycle).
-        if let Some(op) = self.micro_op.take() {
-            return self.step_micro_op(bus, op);
+    pub fn tick(&mut self, bus: &mut Bus) -> (u32, bool) {
+        // Mécanisme D2 : si une instruction portée est en cours d'exécution pas-à-pas, l'avancer d'un M-cycle.
+        if let Some(prog) = self.in_progress.take() {
+            return self.advance_ported_step(bus, prog);
         }
 
-        // Chemin atomique legacy : toutes les instructions réelles restent ici (étape 1 — aucune famille portée).
-        // L'accès au MMU est brut (pas de tick par accès) ; l'avancement du matériel est fait en bloc par `Emulator`.
-        let mmu = &mut *bus;
         // Check for interrupts before fetching the next opcode (also exits HALT — see handle_interrupts).
-        if let Some(cycles) = opcodes::handle_interrupts(self, mmu) {
-            return cycles; // un halt_bug posé par la sortie de HALT persiste jusqu'au fetch suivant
+        // Accès brut au MMU via le champ public du bus (pas de tick par accès) ; l'avancement est fait en bloc.
+        let int_cycles = opcodes::handle_interrupts(self, bus.mmu);
+        if let Some(cycles) = int_cycles {
+            return (cycles, bus.advance(cycles)); // un halt_bug posé par la sortie de HALT persiste jusqu'au fetch suivant
         }
 
         // If halted and no interrupt is pending, consume 4 T-cycles (HALT loop).
         if self.halted {
-            return 4;
+            let frame_done = bus.tick_m_cycle();
+            return (4, frame_done);
         }
 
         // Bug HALT DMG : quand le CPU vient de sortir de l'état HALT à cause d'une interruption pendante, la
@@ -230,8 +247,7 @@ impl CPU {
             self.halt_bug = false;
         }
 
-        let mut cycles = 0u32;
-        let opcode = mmu.read(self.pc);
+        let opcode = bus.mmu.read(self.pc); // accès brut (pas de tick) — décodage uniquement
 
         // 🚨 DÉTECTEUR DE CRASH : Si le PC entre in HRAM, on le loggue immediately — cela nous dira how the CPU got there.
         if self.pc >= 0xFF00 && self.pc <= 0xFFFE {
@@ -260,7 +276,16 @@ impl CPU {
         }
 
         self.pc = self.pc.wrapping_add(1);
-        cycles += opcodes::execute(self, mmu, opcode);
+
+        // Instruction portée ? Le fetch a consommé un M-cycle ; les M-cycles suivants sont exécutés pas-à-pas.
+        if let Some(steps) = ported_steps(opcode) {
+            self.in_progress = Some(InProgress { steps });
+            let frame_done = bus.tick_m_cycle(); // le fetch (lu brutalement ci-dessus) a consommé un M-cycle
+            return (4, frame_done);
+        }
+
+        // Chemin atomique legacy : exécute l'instruction en bloc (accès bruts au MMU) puis avance le matériel d'un seul tenant.
+        let cycles = opcodes::execute(self, bus.mmu, opcode);
         // EI : IME devient effectif après l'instruction EI suivante (2 étapes : la fin de
         // l'instruction EI elle-même, puis celle qui suit).
         if self.ei_delay > 0 {
@@ -269,44 +294,271 @@ impl CPU {
                 self.ime = true;
             }
         }
-        cycles
+        let frame_done = bus.advance(cycles);
+        (cycles, frame_done)
     }
 
-    /// Exécute un micro-op pas-à-pas (mécanisme D2) : consomme exactement un M-cycle (4 T-cycles).
-    /// Chaque accès mémoire passe par le bus (`read`/`write` = accès + tick) ; un `Internal` pas n'accède
-    /// à rien mais avance quand même le matériel d'un M-cycle. Étape 1 : aucune famille n'est encore portée,
-    /// donc ce chemin n'est jamais pris (le champ `micro_op` reste `None`).
-    fn step_micro_op(&mut self, bus: &mut Bus, op: MicroOp) -> u32 {
-        match op {
+    /// Exécute un M-cycle d'une instruction portée en cours d'exécution pas-à-pas (mécanisme D2). Consomme
+    /// exactement un M-cycle (4 T-cycles) : chaque accès mémoire passe par le bus (`read`/`write` = accès + tick),
+    /// et renvoie true si ce M-cycle a franchi la frontière de frame. Quand les phases s'épuisent, l'instruction
+    /// est achevée et `in_progress` est remis à `None`.
+    fn advance_ported_step(&mut self, bus: &mut Bus, mut prog: InProgress) -> (u32, bool) {
+        let op = prog.steps.pop_front().expect("une instruction portée en cours a au moins un micro-op");
+        let frame_done = match op {
             MicroOp::FetchOpcode => {
-                let opcode = bus.read(self.pc); // accès + tick (D1)
+                let (opcode, fd) = bus.read(self.pc); // accès + tick (D1)
                 self.z = opcode;
                 self.pc = self.pc.wrapping_add(1);
+                fd
             }
             MicroOp::ReadPcByte => {
-                let byte = bus.read(self.pc); // accès + tick (D1)
+                let (byte, fd) = bus.read(self.pc); // accès + tick (D1)
                 self.z = byte;
                 self.pc = self.pc.wrapping_add(1);
+                fd
             }
             MicroOp::ReadMem(addr_src) => {
                 let addr = addr_src.address(self);
-                self.z = bus.read(addr); // accès + tick (D1)
+                let (value, fd) = bus.read(addr); // accès + tick (D1)
+                self.z = value;
+                fd
             }
             MicroOp::WriteMem(addr_src, val_src) => {
                 let addr = addr_src.address(self);
                 let value = val_src.value(self);
-                bus.write(addr, value); // accès + tick (D1)
+                bus.write(addr, value) // accès + tick (D1)
             }
             MicroOp::Internal => {
-                bus.idle_m_cycle(); // pas interne : aucun accès bus, mais le matériel avance d'un M-cycle
+                bus.idle_m_cycle() // pas interne : aucun accès bus, mais le matériel avance d'un M-cycle
             }
+        };
+
+        if prog.steps.is_empty() {
+            self.in_progress = None; // instruction achevée
+        } else {
+            self.in_progress = Some(prog); // les phases restantes sont exécutées sur les ticks suivants
         }
-        4 // un M-cycle consommé
+        (4, frame_done)
     }
+}
+
+/// Les M-cycles restants (après le fetch) d'une instruction non préfixée portée en micro-ops (D2). Étape 1 :
+/// infrastructure only — AUCUNE famille n'est encore portée, so this returns `None` for every opcode and all real
+/// instructions stay on the chemin atomique legacy. Stage 2 will populate this match with the first instruction family.
+#[allow(dead_code)] // dormant in stage 1 (no family ported yet) ; populated by stage 2
+fn ported_steps(_opcode: u8) -> Option<VecDeque<MicroOp>> {
+    None
 }
 
 impl Default for CPU {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mmu::MMU;
+    use expected_cycles::{expected_cb_m_cycles, expected_unprefixed_m_cycles};
+
+    /// Exécute une instruction isolée dans un ROM minimal (rempli de NOP) et renvoie le total de T-cycles
+    /// consommés. `bytes` : les octets de l'instruction (opcode + opérandes) placés à $0100 ; les opérandes
+    /// absents sont lus comme 0x00 depuis le ROM. `flags` : la valeur du registre F avant exécution (Z=bit7, C=bit4).
+    fn run_isolated_t_cycles(bytes: &[u8], flags: u8) -> u32 {
+        let mut rom = vec![0x00u8; 0x4000]; // ROM minimal : NOP partout
+        for (i, b) in bytes.iter().enumerate() {
+            rom[0x0100 + i] = *b;
+        }
+        let mut mmu = MMU::new();
+        mmu.load_rom(rom);
+        let mut cpu = CPU::new();
+        cpu.pc = 0x0100;
+        cpu.sp = 0xFFFE; // pile valide (WRAM) pour RET / CALL conditionnels
+        cpu.f = flags;
+        let mut bus = Bus::new(&mut mmu);
+
+        // Une instruction non portée s'achève en un tick ; une portée s'achève quand ses micro-ops sont épuisés.
+        let mut total = 0u32;
+        loop {
+            let (cycles, _) = cpu.tick(&mut bus);
+            total += cycles;
+            if cpu.in_progress.is_none() {
+                break;
+            }
+        }
+        total
+    }
+
+    /// Valeur du registre F qui force la branche `taken` pour l'opcode conditionnel donné (None si non conditionnel).
+    fn flags_for_branch(opcode: u8, taken: bool) -> Option<u8> {
+        // (contrôlé par C ? , pris quand le drapeau est posé ?)
+        let (is_c, set_means_taken) = match opcode {
+            0x20 | 0xC0 | 0xC2 | 0xC4 => (false, false), // NZ : pris si Z=0
+            0x28 | 0xC8 | 0xCA | 0xCC => (false, true),  // Z  : pris si Z=1
+            0x30 | 0xD0 | 0xD2 | 0xD4 => (true, false),  // NC : pris si C=0
+            0x38 | 0xD8 | 0xDA | 0xDC => (true, true),   // C  : pris si C=1
+            _ => return None,
+        };
+        let want_set = taken == set_means_taken;
+        let mut f = 0u8;
+        if is_c {
+            if want_set {
+                f |= Flags::C.bits(); // bit 4
+            }
+        } else if want_set {
+            f |= Flags::Z.bits(); // bit 7
+        }
+        Some(f)
+    }
+
+    /// Le mécanisme pas-à-pas (D2) avance exactement un M-cycle par tick et pose les latches W/Z — sans qu'aucune
+    /// famille réelle ne soit portée (étape 1) : le programme d'instruction en cours est construit à la main.
+    #[test]
+    fn advance_ported_step_consumes_one_m_cycle_and_latches() {
+        let mut mmu = MMU::new();
+        let mut rom = vec![0x00u8; 0x4000]; // ROM minimal : NOP partout, opérande à $0100
+        rom[0x0100] = 0x42; // opérande n8 lu par ReadPcByte à PC=$0100
+        mmu.load_rom(rom);
+
+        let mut cpu = CPU::new();
+        cpu.pc = 0x0100;
+        cpu.h = 0xC0; // HL = $C050 (WRAM, toujours écritable)
+        cpu.l = 0x50;
+        // Programme d'instruction porté construit à la main : ReadPcByte → WriteMem(HL, Z).
+        let mut steps: VecDeque<MicroOp> = VecDeque::new();
+        steps.push_back(MicroOp::ReadPcByte);
+        steps.push_back(MicroOp::WriteMem(AddrSrc::Hl, ValSrc::Z));
+        cpu.in_progress = Some(InProgress { steps });
+
+        let mut bus = Bus::new(&mut mmu);
+
+        // Tick 1 : ReadPcByte → Z = ROM[PC] = $42, PC → $0101. Un M-cycle (4 T-cycles).
+        let (t, _) = cpu.tick(&mut bus);
+        assert_eq!(t, 4);
+        assert_eq!(cpu.z, 0x42);
+        assert_eq!(cpu.pc, 0x0101);
+
+        // Tick 2 : WriteMem(HL, Z) → [HL] = $42. Un M-cycle ; l'instruction est achevée.
+        let (t, _) = cpu.tick(&mut bus);
+        assert_eq!(t, 4);
+        assert!(cpu.in_progress.is_none());
+
+        drop(bus);
+        assert_eq!(mmu.read(0xC050), 0x42);
+    }
+
+    /// Test exhaustif générique (étape 1) : pour chacun des opcodes non préfixés — les deux branches des
+    /// conditionnelles incluses — l'instruction est exécutée isolée dans un ROM minimal et le nombre de M-cycles
+    /// consommés est comparé à la table générée depuis `data/Opcodes.json`.
+    ///
+    /// Étape 1 : AUCUNE instruction n'est corrigée (corriger changerait le comportement observable, interdit en
+    /// étape 1). Les écarts code/JSON connus sont donc listés ci-dessous comme référence de base (« baseline ») ; ce
+    /// test passe tant que l'ensemble des écarts correspond EXACTEMENT à cette liste. Toute divergence nouvelle — ou
+    /// un écart corrigé plus tard — fait échouer le test et impose de mettre à jour la liste avant correction.
+    #[test]
+    fn all_unprefixed_opcodes_match_expected_m_cycles() {
+        let mut discrepancies = Vec::new();
+        for opcode in 0u8..=0xFF {
+            let (_, not_taken_c) = expected_cycles::EXPECTED_UNPREFIXED[opcode as usize];
+            if not_taken_c.is_none() {
+                // Non conditionnelle : un seul tirage.
+                let m = run_isolated_t_cycles(&[opcode], 0) / 4;
+                let expected = expected_unprefixed_m_cycles(opcode, false);
+                if m != expected as u32 {
+                    discrepancies.push(format!(
+                        "$${:02X} (non-cond): got {} M-cycle(s), expected {}",
+                        opcode, m, expected
+                    ));
+                }
+            } else {
+                // Conditionnelle : les deux branches.
+                for &taken in &[true, false] {
+                    let flags = flags_for_branch(opcode, taken).expect("opcode conditionnel");
+                    let m = run_isolated_t_cycles(&[opcode], flags) / 4;
+                    let expected = expected_unprefixed_m_cycles(opcode, taken);
+                    if m != expected as u32 {
+                        discrepancies.push(format!(
+                            "$${:02X} ({}): got {} M-cycle(s), expected {}",
+                            opcode,
+                            if taken { "taken" } else { "not-taken" },
+                            m,
+                            expected
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Écarts code/JSON connus (étape 1) — listés et soumis avant correction. Chaque entrée : cause.
+        let mut known_gaps: Vec<String> = vec![
+            // Rotations / STOP : le code consomme 2 M-cycles, la référence dit 1 (4 T-cycles).
+            "$$07 (non-cond): got 2 M-cycle(s), expected 1".into(), // RLCA
+            "$$0F (non-cond): got 2 M-cycle(s), expected 1".into(), // RRCA
+            "$$10 (non-cond): got 2 M-cycle(s), expected 1".into(), // STOP n8
+            "$$17 (non-cond): got 2 M-cycle(s), expected 1".into(), // RLA
+            "$$1F (non-cond): got 2 M-cycle(s), expected 1".into(), // RRA
+            // LD (HL),n8 : le code consomme 2 M-cycles, la référence dit 3 (12 T-cycles).
+            "$$36 (non-cond): got 2 M-cycle(s), expected 3".into(), // LD (HL),n8
+            // ADD HL,HL / ADD HL,SP : le code consomme 4 M-cycles (« DMG »), la référence dit 2.
+            "$$29 (non-cond): got 4 M-cycle(s), expected 2".into(), // ADD HL,HL
+            "$$39 (non-cond): got 4 M-cycle(s), expected 2".into(), // ADD HL,SP
+            // LD r8,(HL) : le code consomme 1 M-cycle, la référence dit 2.
+            "$$46 (non-cond): got 1 M-cycle(s), expected 2".into(), // LD B,(HL)
+            "$$4E (non-cond): got 1 M-cycle(s), expected 2".into(), // LD C,(HL)
+            "$$56 (non-cond): got 1 M-cycle(s), expected 2".into(), // LD D,(HL)
+            "$$5E (non-cond): got 1 M-cycle(s), expected 2".into(), // LD E,(HL)
+            "$$66 (non-cond): got 1 M-cycle(s), expected 2".into(), // LD H,(HL)
+            "$$6E (non-cond): got 1 M-cycle(s), expected 2".into(), // LD L,(HL)
+            "$$7E (non-cond): got 1 M-cycle(s), expected 2".into(), // LD A,(HL)
+            // ALU A,(HL) : le code consomme 1 M-cycle, la référence dit 2.
+            "$$86 (non-cond): got 1 M-cycle(s), expected 2".into(), // ADD A,(HL)
+            "$$8E (non-cond): got 1 M-cycle(s), expected 2".into(), // ADC A,(HL)
+            "$$96 (non-cond): got 1 M-cycle(s), expected 2".into(), // SUB (HL)
+            "$$9E (non-cond): got 1 M-cycle(s), expected 2".into(), // SBC A,(HL)
+            "$$A6 (non-cond): got 1 M-cycle(s), expected 2".into(), // AND (HL)
+            "$$AE (non-cond): got 1 M-cycle(s), expected 2".into(), // XOR (HL)
+            "$$B6 (non-cond): got 1 M-cycle(s), expected 2".into(), // OR (HL)
+            "$$BE (non-cond): got 1 M-cycle(s), expected 2".into(), // CP (HL)
+            // $CB : octet de préfixe seul — exécuté isolément, il consomme le sous-opcode suivant ($00 = BIT 0,B).
+            "$$CB (non-cond): got 2 M-cycle(s), expected 1".into(), // CB prefix byte
+            // JP HL : le code consomme 4 M-cycles, la référence dit 1.
+            "$$E9 (non-cond): got 4 M-cycle(s), expected 1".into(), // JP HL
+            // LDH A,(a8) : le code consomme 2 M-cycles, la référence dit 3.
+            "$$F0 (non-cond): got 2 M-cycle(s), expected 3".into(), // LDH A,(a8)
+            // JR cc non-taken : le code consomme 1 M-cycle (4 T-cycles, conforme au HW) ; la référence dit 2.
+            "$$20 (not-taken): got 1 M-cycle(s), expected 2".into(), // JR NZ
+            "$$28 (not-taken): got 1 M-cycle(s), expected 2".into(), // JR Z
+            "$$30 (not-taken): got 1 M-cycle(s), expected 2".into(), // JR NC
+            "$$38 (not-taken): got 1 M-cycle(s), expected 2".into(), // JR C
+        ];
+
+        discrepancies.sort();
+        known_gaps.sort();
+        assert_eq!(
+            discrepancies,
+            known_gaps,
+            "l'ensemble des écarts code/JSON a changé — mettre à jour la liste d'écarts connus avant correction"
+        );
+    }
+
+    /// Test exhaustif générique (étape 1) : pour chacun des opcodes préfixés CB ($CB xx), l'instruction est exécutée
+    /// isolée dans un ROM minimal et le nombre de M-cycles consommés doit correspondre exactement à la table.
+    #[test]
+    fn all_cb_opcodes_match_expected_m_cycles() {
+        let mut discrepancies = Vec::new();
+        for cb in 0u8..=0xFF {
+            let m = run_isolated_t_cycles(&[0xCB, cb], 0) / 4;
+            let expected = expected_cb_m_cycles(cb);
+            if m != expected as u32 {
+                discrepancies.push(format!("$CB ${:02X}: got {} M-cycle(s), expected {}", cb, m, expected));
+            }
+        }
+        assert!(
+            discrepancies.is_empty(),
+            "écart code/JSON ({}):\n{}",
+            discrepancies.len(),
+            discrepancies.join("\n")
+        );
     }
 }

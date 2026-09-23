@@ -2055,7 +2055,8 @@ mod tests {
         cpu.b = 0;
         cpu.a = 0x77;
 
-        let cycles = cpu.step(&mut mmu);
+        let mut bus = crate::bus::Bus::new(&mut mmu);
+        let cycles = cpu.tick(&mut bus).0;
         assert!(!cpu.halted);
         // Bug HALT DMG (GBCTR Chapitre 6.8) : la prochaine instruction est fetchée avec un décalage d'un octet — l'octet à $0150 is sauté, and INC B at $0151 becomes the new opcode (exécutée ONCE, not twice).
         assert_eq!(cpu.b, 1); // INC B exécutée une seule fois (depuis $0151)
@@ -2079,7 +2080,8 @@ mod tests {
         cpu.c = 0;
         cpu.l = 0xAB;
 
-        let cycles = cpu.step(&mut mmu);
+        let mut bus = crate::bus::Bus::new(&mut mmu);
+        let cycles = cpu.tick(&mut bus).0;
         assert!(!cpu.halted);
         // Bug HALT DMG (GBCTR Chapitre 6.8) : l'octet à $0200 is sauté, and the byte at $0201 (0x4D = LD C,L) becomes the new opcode — it's réinterprété, NOT exécutée deux fois avec son opérande d'origine.
         assert_eq!(cpu.c, 0xAB); // LD C,L : C prend la valeur de L
@@ -2140,14 +2142,15 @@ mod tests {
         let mut mmu = rom_with(&[0xFB, 0x00]); // EI puis NOP à $0100
         let mut cpu = CPU::new();
         cpu.pc = 0x0100;
+        let mut bus = crate::bus::Bus::new(&mut mmu);
 
         // Pas 1 : EI — IME pas encore effectif (retard en cours).
-        assert_eq!(cpu.step(&mut mmu), 4);
+        assert_eq!(cpu.tick(&mut bus).0, 4);
         assert!(!cpu.ime);
         assert_eq!(cpu.ei_delay, 1);
 
         // Pas 2 : l'instruction EI suivante s'exécute avec IME toujours off…
-        assert_eq!(cpu.step(&mut mmu), 4); // NOP
+        assert_eq!(cpu.tick(&mut bus).0, 4); // NOP
         assert!(cpu.ime); // …IME devient effectif après son exécution (Pan Docs).
         assert_eq!(cpu.ei_delay, 0);
 
@@ -2155,12 +2158,13 @@ mod tests {
         let mut mmu = rom_with(&[0xFB, 0xF3, 0x00]); // EI puis DI puis NOP
         let mut cpu = CPU::new();
         cpu.pc = 0x0100;
-        assert_eq!(cpu.step(&mut mmu), 4); // EI → ei_delay=2
+        let mut bus = crate::bus::Bus::new(&mut mmu);
+        assert_eq!(cpu.tick(&mut bus).0, 4); // EI → ei_delay=2
         assert!(!cpu.ime);
-        assert_eq!(cpu.step(&mut mmu), 4); // DI → ime=false, retard annulé
+        assert_eq!(cpu.tick(&mut bus).0, 4); // DI → ime=false, retard annulé
         assert!(!cpu.ime);
         assert_eq!(cpu.ei_delay, 0);
-        assert_eq!(cpu.step(&mut mmu), 4); // instruction suivante : IME toujours off
+        assert_eq!(cpu.tick(&mut bus).0, 4); // instruction suivante : IME toujours off
         assert!(!cpu.ime);
     }
 

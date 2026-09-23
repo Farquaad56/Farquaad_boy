@@ -30,30 +30,30 @@ impl<'a> Bus<'a> {
     }
 
     /// D1 : lecture CPU sur le bus — accès mémoire + avancement d'un M-cycle (4 T-cycles).
-    #[allow(dead_code)] // API de l'étape 2 : les familles portées en micro-ops utiliseront ce chemin.
-    pub fn read(&mut self, addr: u16) -> u8 {
+    /// Renvoie la valeur lue et true si cet M-cycle a franchi la frontière de frame.
+    pub fn read(&mut self, addr: u16) -> (u8, bool) {
         let value = self.mmu.read(addr);
-        self.tick_m_cycle();
-        value
+        let frame_done = self.tick_m_cycle();
+        (value, frame_done)
     }
 
     /// D1 : écriture CPU sur le bus — accès mémoire + avancement d'un M-cycle (4 T-cycles).
-    #[allow(dead_code)] // API de l'étape 2 : les familles portées en micro-ops utiliseront ce chemin.
-    pub fn write(&mut self, addr: u16, val: u8) {
+    /// Renvoie true si cet M-cycle a franchi la frontière de frame.
+    pub fn write(&mut self, addr: u16, val: u8) -> bool {
         self.mmu.write(addr, val);
-        self.tick_m_cycle();
+        self.tick_m_cycle()
     }
 
     /// Avance tout le matériel d'un M-cycle (4 T-cycles) : PPU, Série, DMA OAM, Timer + bits IF.
-    #[allow(dead_code)] // API de l'étape 2 : un micro-op ReadMem/WriteMem/FetchOpcode consomme ce pas.
-    pub fn tick_m_cycle(&mut self) {
-        self.advance(4);
+    /// Renvoie true si ce M-cycle a franchi la frontière de frame.
+    pub fn tick_m_cycle(&mut self) -> bool {
+        self.advance(4)
     }
 
     /// M-cycle « idle » : aucun accès bus, mais le matériel avance quand même d'un M-cycle (4 T-cycles).
-    #[allow(dead_code)] // API de l'étape 2 : un micro-op Internal consomme ce pas.
-    pub fn idle_m_cycle(&mut self) {
-        self.advance(4);
+    /// Renvoie true si ce M-cycle a franchi la frontière de frame.
+    pub fn idle_m_cycle(&mut self) -> bool {
+        self.advance(4)
     }
 
     /// Avance tout le matériel de `t_cycles` T-cycles (en bloc) et pose les bits IF correspondants —
