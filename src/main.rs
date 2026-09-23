@@ -6,6 +6,7 @@
 mod app;
 mod apu;
 mod bootrom;
+mod bus;
 mod cartridge;
 mod cpu;
 mod emulator;

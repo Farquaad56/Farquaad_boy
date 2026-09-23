@@ -6,9 +6,100 @@
 pub mod flags;
 pub mod opcodes;
 
+use crate::bus::Bus;
 use crate::emulator::FRAME_TCYCLES;
-use crate::mmu::MMU;
 use flags::Flags;
+
+// --- Mécanisme d'exécution pas-à-pas en micro-ops (D2) — étape 1 : infrastructure seulement. ---
+// Toutes les instructions réelles restent sur le chemin atomique legacy ; aucune famille n'est encore
+// portée en micro-ops (étape 2). Ces types et les latches W/Z du CPU préparent ce portage.
+
+/// Source d'adresse pour un accès mémoire en micro-op (D2) : la paire de registres ou le pointeur visé.
+// Étape 1 : infrastructure seulement — aucune famille n'est encore portée, donc les variantes ne sont pas construites.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddrSrc {
+    /// Registre HL.
+    Hl,
+    /// Registre BC.
+    Bc,
+    /// Registre DE.
+    De,
+    /// Pointeur de pile SP.
+    Sp,
+    /// Compteur programme PC (fetch).
+    Pc,
+}
+
+impl AddrSrc {
+    /// Résout l'adresse 16 bits visée depuis l'état courant du CPU.
+    fn address(&self, cpu: &CPU) -> u16 {
+        match self {
+            AddrSrc::Hl => cpu.hl(),
+            AddrSrc::Bc => ((cpu.b as u16) << 8) | cpu.c as u16,
+            AddrSrc::De => ((cpu.d as u16) << 8) | cpu.e as u16,
+            AddrSrc::Sp => cpu.sp,
+            AddrSrc::Pc => cpu.pc,
+        }
+    }
+}
+
+/// Source de valeur pour une écriture mémoire en micro-op (D2) : le registre ou le latch mis de côté.
+#[allow(dead_code)] // Étape 1 : infrastructure D2 — aucune famille n'est encore portée (étape 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValSrc {
+    /// Registre A.
+    A,
+    /// Registre B.
+    B,
+    /// Registre C.
+    C,
+    /// Registre D.
+    D,
+    /// Registre E.
+    E,
+    /// Registre H.
+    H,
+    /// Registre L.
+    L,
+    /// Latch d'écriture W (valeur mise de côté pour une écriture mémoire différée).
+    W,
+    /// Latch de lecture Z (octet lu / résultat intermédiaire).
+    Z,
+}
+
+impl ValSrc {
+    /// Résout la valeur 8 bits à écrire depuis l'état courant du CPU.
+    fn value(&self, cpu: &CPU) -> u8 {
+        match self {
+            ValSrc::A => cpu.a,
+            ValSrc::B => cpu.b,
+            ValSrc::C => cpu.c,
+            ValSrc::D => cpu.d,
+            ValSrc::E => cpu.e,
+            ValSrc::H => cpu.h,
+            ValSrc::L => cpu.l,
+            ValSrc::W => cpu.w,
+            ValSrc::Z => cpu.z,
+        }
+    }
+}
+
+/// Micro-opération : un pas d'exécution d'une instruction (D2). Chaque micro-op consomme exactement un M-cycle.
+#[allow(dead_code)] // Étape 1 : infrastructure D2 — aucune famille n'est encore portée (étape 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MicroOp {
+    /// Lit l'opcode à PC → latch Z ; le PC avance d'un octet.
+    FetchOpcode,
+    /// Lit l'octet d'opérande à PC → latch Z ; le PC avance d'un octet.
+    ReadPcByte,
+    /// Lit la mémoire pointée par `addr` → latch Z.
+    ReadMem(AddrSrc),
+    /// Écrit la valeur `val` dans la mémoire pointée par `addr`.
+    WriteMem(AddrSrc, ValSrc),
+    /// Pas interne (aucun accès bus) — ex. calcul de drapeaux ; le matériel avance quand même d'un M-cycle.
+    Internal,
+}
 
 /// Registres du CPU Sharp LR35902.
 #[allow(clippy::upper_case_acronyms)]
@@ -44,6 +135,12 @@ pub struct CPU {
     pub t_cycles: u64,
     /// Index de la dernière frame où un log ISR a été émis (throttle 1/frame ; MAX = jamais émis).
     pub isr_log_frame: u32,
+    /// Latch d'écriture W : valeur mise de côté pour une écriture mémoire différée en micro-op (D2).
+    pub w: u8,
+    /// Latch de lecture Z : octet lu / résultat intermédiaire d'un micro-op (D2).
+    pub z: u8,
+    /// Micro-op en cours d'exécution pas-à-pas ; `None` = chemin atomique legacy (étape 1 — aucune famille portée).
+    pub micro_op: Option<MicroOp>,
 }
 
 impl CPU {
@@ -66,6 +163,9 @@ impl CPU {
             ei_delay: 0,
             t_cycles: 0,
             isr_log_frame: u32::MAX,
+            w: 0,
+            z: 0,
+            micro_op: None,
         };
         log::info!(
             "[CPU] Initial state: SP=${:04X}, PC=${:04X}",
@@ -104,7 +204,15 @@ impl CPU {
     ///
     /// Le retard d'EI est décrémenté après chaque instruction exécutée : IME n'est
     /// réactivé qu'une fois l'instruction EI suivante exécutée (Pan Docs).
-    pub fn step(&mut self, mmu: &mut MMU) -> u32 {
+    pub fn tick(&mut self, bus: &mut Bus) -> u32 {
+        // Mécanisme D2 : si un micro-op est en cours d'exécution pas-à-pas, l'exécuter (un M-cycle).
+        if let Some(op) = self.micro_op.take() {
+            return self.step_micro_op(bus, op);
+        }
+
+        // Chemin atomique legacy : toutes les instructions réelles restent ici (étape 1 — aucune famille portée).
+        // L'accès au MMU est brut (pas de tick par accès) ; l'avancement du matériel est fait en bloc par `Emulator`.
+        let mmu = &mut *bus;
         // Check for interrupts before fetching the next opcode (also exits HALT — see handle_interrupts).
         if let Some(cycles) = opcodes::handle_interrupts(self, mmu) {
             return cycles; // un halt_bug posé par la sortie de HALT persiste jusqu'au fetch suivant
@@ -162,6 +270,38 @@ impl CPU {
             }
         }
         cycles
+    }
+
+    /// Exécute un micro-op pas-à-pas (mécanisme D2) : consomme exactement un M-cycle (4 T-cycles).
+    /// Chaque accès mémoire passe par le bus (`read`/`write` = accès + tick) ; un `Internal` pas n'accède
+    /// à rien mais avance quand même le matériel d'un M-cycle. Étape 1 : aucune famille n'est encore portée,
+    /// donc ce chemin n'est jamais pris (le champ `micro_op` reste `None`).
+    fn step_micro_op(&mut self, bus: &mut Bus, op: MicroOp) -> u32 {
+        match op {
+            MicroOp::FetchOpcode => {
+                let opcode = bus.read(self.pc); // accès + tick (D1)
+                self.z = opcode;
+                self.pc = self.pc.wrapping_add(1);
+            }
+            MicroOp::ReadPcByte => {
+                let byte = bus.read(self.pc); // accès + tick (D1)
+                self.z = byte;
+                self.pc = self.pc.wrapping_add(1);
+            }
+            MicroOp::ReadMem(addr_src) => {
+                let addr = addr_src.address(self);
+                self.z = bus.read(addr); // accès + tick (D1)
+            }
+            MicroOp::WriteMem(addr_src, val_src) => {
+                let addr = addr_src.address(self);
+                let value = val_src.value(self);
+                bus.write(addr, value); // accès + tick (D1)
+            }
+            MicroOp::Internal => {
+                bus.idle_m_cycle(); // pas interne : aucun accès bus, mais le matériel avance d'un M-cycle
+            }
+        }
+        4 // un M-cycle consommé
     }
 }
 

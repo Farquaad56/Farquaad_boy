@@ -13,9 +13,10 @@
 //! est posé car la boot ROM entre en VBlank sans jamais l'effacer. Le drapeau VBlank est de plus levé inconditionnellement à
 //! chaque entrée en VBlank, donc un jeu qui ne configure jamais STAT se réveille quand même au premier VBlank après EI.
 
+use crate::bus::Bus;
 use crate::cpu::CPU;
 use crate::mmu::MMU;
-use crate::ppu::{IRQ_STAT, IRQ_VBLANK, PPU};
+use crate::ppu::PPU;
 use crate::serial::Serial;
 use crate::timer::Timer;
 
@@ -162,7 +163,11 @@ impl Emulator {
     pub fn step(&mut self) -> u32 {
         let boot_was_mapped = !self.mmu.boot_rom_finished;
         // Exécution normale : une instruction CPU (la boot ROM DMG incluse tant qu'elle est mappée à $0000-$00FF).
-        let cycles = self.cpu.step(&mut self.mmu);
+        // Le CPU n'accède à la mémoire que par le bus ; l'avancement du matériel est fait en bloc juste après.
+        let cycles = {
+            let mut bus = Bus::new(&mut self.mmu);
+            self.cpu.tick(&mut bus)
+        };
         self.instructions += 1;
         self.t_cycles += cycles as u64;
         self.last_instr_cycles = cycles; // T-cycles de la dernière instruction (panneau « CPU Debug »).
@@ -195,15 +200,13 @@ impl Emulator {
             );
         }
 
-        // La PPU avance du même nombre de T-cycles (timing LY/mode, Pan Docs « Rendering ») et dessine
-        // chaque scanline à la fin du mode Drawing : le rendu est donc incrémental, plus par frame. Le
-        // framebuffer est toujours à jour après ce pas ; app.rs le présente tel quel. La transition LCD
-        // on→off noircit l'écran via `on_lcd_off` (la PPU reste gelée tant que bit 7 du LCDC est à 0).
+        // La PPU / Série / DMA OAM / Timer avancent du même nombre de T-cycles et posent les bits IF correspondants —
+        // l'avancement a quitté `Emulator::step` pour entrer dans le Bus (étape 1). Le rendu est donc incrémental,
+        // plus par frame : le framebuffer est toujours à jour après ce pas ; app.rs le présente tel quel. La transition
+        // LCD on→off noircit l'écran via `on_lcd_off` (la PPU reste gelée tant que bit 7 du LCDC est à 0).
         let frame_done = {
-            let ppu = &mut self.mmu.ppu;
-            let vram = &self.mmu.vram;
-            let oam = &self.mmu.oam;
-            ppu.step(cycles, vram, oam) // renvoie true quand la frontière de frame est franchie (LY > 153 → 0)
+            let mut bus = Bus::new(&mut self.mmu);
+            bus.advance(cycles) // renvoie true quand la frontière de frame est franchie (LY > 153 → 0)
         };
         if frame_done {
             log::debug!("[PPU] Frame boundary crossed at t_cycles={}", self.t_cycles);
@@ -233,37 +236,6 @@ impl Emulator {
                 self.mmu.read(0xFF0F), // registre IF ($FF0F) : bits 0-4 drapeaux + bit 5 halted (read-only)
                 self.mmu.read(0xFFFF), // registre IE ($FFFF) : sources d'interruption activées
             );
-        }
-        // Les requêtes d'interruption PPU en attente lèvent les bits correspondants de IF ($FF0F).
-        let ppu_irq = self.mmu.ppu.take_interrupts();
-
-        if ppu_irq != 0 {
-            log::debug!(
-                "[PPU] IRQ raised: ${:02X}, IF before: ${:02X}, LY={}, mode={}",
-                ppu_irq,
-                self.mmu.io[0x0F],
-                self.mmu.ppu.ly,
-                self.mmu.ppu.mode,
-            );
-        }
-
-        if ppu_irq & IRQ_VBLANK != 0 {
-            self.mmu.io[0x0F] |= 0x01; // bit 0 de IF : interruption VBlank demandée (vecteur $40)
-            log::debug!("[VBlank] IF bit 0 set, new IF=${:02X}", self.mmu.io[0x0F]);
-        }
-        if ppu_irq & IRQ_STAT != 0 {
-            self.mmu.io[0x0F] |= 0x02; // bit 1 de IF : interruption STAT/LCD demandée (vecteur $48)
-        }
-        // La SCC avance du même nombre de T-cycles ; un transfert achevé lève le drapeau IF série.
-        if self.mmu.serial.tick(cycles) {
-            self.mmu.io[0x0F] |= 0x08; // bit 3 de IF ($FF0F) : interruption série demandée (Pan Docs « Interrupt Sources »)
-        }
-        // Le DMA OAM avance du même nombre de T-cycles : l'écriture de $FF46 démarre un transfert de
-        // 160 M-cycles pendant lequel le CPU n'accède plus qu'à la HRAM ($FF80-$FFFE) (Pan Docs « OAM DMA Transfer »).
-        self.mmu.advance_dma(cycles);
-        // Le Timer avance du même nombre de T-cycles ; un débordement de TIMA lève le drapeau IF Timer.
-        if self.mmu.timer.tick(cycles) {
-            self.mmu.io[0x0F] |= 0x04; // bit 2 de IF ($FF0F) : interruption Timer demandée (Pan Docs « Interrupt Sources »)
         }
         cycles
     }
