@@ -32,6 +32,12 @@ pub enum AddrSrc {
     Sp,
     /// Compteur programme PC (fetch).
     Pc,
+    /// Port haute banque $FF00+n8 : l'octet n8 est dans le latch Z (ex LDH A,(n8)).
+    HBankZ,
+    /// Port haute banque $FF00+C : l'adresse est formée du registre C (ex LD A,[C]).
+    HBankC,
+    /// Adresse 16 bits formée des latches W (msb) et Z (lsb) — ex LD A,(a16).
+    Wz,
 }
 
 impl AddrSrc {
@@ -43,6 +49,9 @@ impl AddrSrc {
             AddrSrc::De => ((cpu.d as u16) << 8) | cpu.e as u16,
             AddrSrc::Sp => cpu.sp,
             AddrSrc::Pc => cpu.pc,
+            AddrSrc::HBankZ => 0xFF00 | cpu.z as u16,
+            AddrSrc::HBankC => 0xFF00 | cpu.c as u16,
+            AddrSrc::Wz => ((cpu.w as u16) << 8) | cpu.z as u16,
         }
     }
 }
@@ -86,27 +95,48 @@ impl ValSrc {
             ValSrc::Z => cpu.z,
         }
     }
+
+    /// Charge `value` dans le registre cible (côté écriture de [`MicroOp::LoadReg`] : l'octet lu est mis dans ce
+    /// registre). Les latches W/Z ne sont pas des registres cibles valides — ils sont ignorés.
+    fn store(&self, cpu: &mut CPU, value: u8) {
+        match self {
+            ValSrc::A => cpu.a = value,
+            ValSrc::B => cpu.b = value,
+            ValSrc::C => cpu.c = value,
+            ValSrc::D => cpu.d = value,
+            ValSrc::E => cpu.e = value,
+            ValSrc::H => cpu.h = value,
+            ValSrc::L => cpu.l = value,
+            ValSrc::W | ValSrc::Z => {} // pas un registre cible valide pour LoadReg
+        }
+    }
 }
 
 /// Micro-opération : un pas d'exécution d'une instruction (D2). Chaque micro-op consomme exactement un M-cycle.
 /// Les instructions portées en micro-ops sont exécutées pas-à-pas : [`CPU::tick`] consomme un micro-op de
 /// [`InProgress::steps`] par appel, jusqu'à épuisement. Étape 2 : seules les familles portées produisent des
 /// séquences ; toutes les autres instructions restent sur le chemin atomique legacy.
-#[allow(dead_code)] // Étape 2 : `FetchOpcode` / `ReadPcByte` / `ReadMem` / `Internal` ne sont pas encore construits par une famille portée ; portés plus tard.
+#[allow(dead_code)] // Étape 2 : `FetchOpcode` / `ReadMem` / `StorePcByte` / `Internal` ne sont pas encore construits par une famille portée ; portés plus tard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MicroOp {
     /// Lit l'opcode à PC → latch Z ; le PC avance d'un octet.
     FetchOpcode,
     /// Lit l'octet d'opérande à PC → latch Z ; le PC avance d'un octet.
     ReadPcByte,
+    /// Lit l'octet d'opérande à PC → latch W (msb) ; le PC avance d'un octet (ex LD A,(a16)).
+    ReadPcByteW,
     /// Lit la mémoire pointée par `addr` → latch Z.
     ReadMem(AddrSrc),
+    /// Lit la mémoire pointée par `addr` → latch Z puis charge le résultat dans le registre `reg`, le tout dans un seul M-cycle (ex LD r,(HL)).
+    LoadReg(ValSrc, AddrSrc),
     /// Écrit la valeur `val` dans la mémoire pointée par `addr`.
     WriteMem(AddrSrc, ValSrc),
     /// Lit l'octet à PC (→ latch Z, PC+=1) puis écrit Z dans la mémoire pointée par `addr`, le tout dans un seul M-cycle.
     StorePcByte(AddrSrc),
     /// Écrit la valeur `val` en [HL] puis ajuste HL de `delta`, le tout dans un seul M-cycle (ex LD (HL±),A).
     StoreHlDelta(ValSrc, i8),
+    /// Lit la mémoire pointée par [HL] → latch Z puis pose les drapeaux BIT depuis le bit `bit` (Z=(bit==0), N=0, H=1, C conservé), le tout dans un seul M-cycle (ex CB BIT b,(HL)).
+    BitTest(u8),
     /// Pas interne (aucun accès bus) — ex. calcul de drapeaux ; le matériel avance quand même d'un M-cycle.
     Internal,
 }
@@ -282,7 +312,10 @@ impl CPU {
         self.pc = self.pc.wrapping_add(1);
 
         // Instruction portée ? Le fetch a consommé un M-cycle ; les M-cycles suivants sont exécutés pas-à-pas.
-        if let Some(steps) = ported_steps(opcode) {
+        // Pour le préfixe CB, l'octet sous-opcode est lu brutalement (décodage) afin de construire le programme ; il est
+        // re-lu par ReadPcByte au M-cycle suivant (M2), qui consomme ce M-cycle et avance le PC.
+        let cb_sub = if opcode == 0xCB { Some(bus.mmu.read(self.pc)) } else { None };
+        if let Some(steps) = ported_steps(opcode, cb_sub) {
             self.in_progress = Some(InProgress { steps });
             let frame_done = bus.tick_m_cycle(); // le fetch (lu brutalement ci-dessus) a consommé un M-cycle
             return (4, frame_done);
@@ -321,10 +354,39 @@ impl CPU {
                 self.pc = self.pc.wrapping_add(1);
                 fd
             }
+            MicroOp::ReadPcByteW => {
+                let (byte, fd) = bus.read(self.pc); // accès + tick (D1) : msb d'un a16 → latch W
+                self.w = byte;
+                self.pc = self.pc.wrapping_add(1);
+                fd
+            }
             MicroOp::ReadMem(addr_src) => {
                 let addr = addr_src.address(self);
                 let (value, fd) = bus.read(addr); // accès + tick (D1)
                 self.z = value;
+                fd
+            }
+            MicroOp::LoadReg(reg, addr_src) => {
+                // M-cycle combiné : lit [addr] → Z puis charge le résultat dans the register `reg` — un seul accès + tick.
+                let addr = addr_src.address(self);
+                let (value, fd) = bus.read(addr); // accès + tick (D1)
+                self.z = value;
+                reg.store(self, value);           // registre ← Z
+                fd
+            }
+            MicroOp::BitTest(bit) => {
+                // M-cycle combiné : lit [HL] → Z puis pose les drapeaux BIT — un seul accès + tick.
+                let addr = self.hl();
+                let (value, fd) = bus.read(addr); // accès + tick (D1)
+                self.z = value;
+                let mut f = Flags::H;             // N effacé, H posé
+                if ((value >> bit) & 1) == 0 {
+                    f |= Flags::Z;               // Z posé si le bit testé vaut 0
+                }
+                if self.flags().contains(Flags::C) {
+                    f |= Flags::C;              // C conservé
+                }
+                self.set_flags(f);
                 fd
             }
             MicroOp::WriteMem(addr_src, val_src) => {
@@ -377,7 +439,7 @@ impl CPU {
 /// le chemin atomique legacy. Le fetch a déjà consommé un M-cycle dans [`CPU::tick`] ; chaque micro-op ci-dessous en
 /// consomme un supplémentaire, donc le total = 1 + steps.len() doit égaler le nombre de M-cycles du chemin legacy
 /// (vérifié contre `expected_cycles`).
-fn ported_steps(opcode: u8) -> Option<VecDeque<MicroOp>> {
+fn ported_steps(opcode: u8, cb_sub: Option<u8>) -> Option<VecDeque<MicroOp>> {
     let mut steps = VecDeque::new();
     match opcode {
         // --- Famille (HL) write ---
@@ -401,6 +463,53 @@ fn ported_steps(opcode: u8) -> Option<VecDeque<MicroOp>> {
         0x22 => steps.push_back(MicroOp::StoreHlDelta(ValSrc::A, 1)),
         // LD (HL-),A : écrit A dans [HL] puis HL-=1 ; 2 M-cycles (fetch + StoreHlDelta). Pas de drapeaux.
         0x32 => steps.push_back(MicroOp::StoreHlDelta(ValSrc::A, -1)),
+
+        // --- Famille (HL) read : LD r,(HL) ---
+        // Lit [HL] → Z puis charge le résultat dans le registre `r` ; 2 M-cycles (fetch + LoadReg). Pas de drapeaux.
+        // GBCTR chapitre 6 : la lecture mémoire et la mise en registre sont le même M-cycle (le dernier).
+        0x46 => steps.push_back(MicroOp::LoadReg(ValSrc::B, AddrSrc::Hl)),
+        0x4E => steps.push_back(MicroOp::LoadReg(ValSrc::C, AddrSrc::Hl)),
+        0x56 => steps.push_back(MicroOp::LoadReg(ValSrc::D, AddrSrc::Hl)),
+        0x5E => steps.push_back(MicroOp::LoadReg(ValSrc::E, AddrSrc::Hl)),
+        0x66 => steps.push_back(MicroOp::LoadReg(ValSrc::H, AddrSrc::Hl)),
+        0x6E => steps.push_back(MicroOp::LoadReg(ValSrc::L, AddrSrc::Hl)),
+        0x7E => steps.push_back(MicroOp::LoadReg(ValSrc::A, AddrSrc::Hl)),
+
+        // --- LD A,(BC) / LD A,(DE) : lit [BC]/[DE] → A ; 2 M-cycles (fetch + LoadReg). Pas de drapeaux. ---
+        0x0A => steps.push_back(MicroOp::LoadReg(ValSrc::A, AddrSrc::Bc)),
+        0x1A => steps.push_back(MicroOp::LoadReg(ValSrc::A, AddrSrc::De)),
+
+        // --- LDH A,(n8) : lit n8 → Z puis [FF00+Z] → A ; 3 M-cycles (fetch + ReadPcByte + LoadReg). Pas de drapeaux. ---
+        0xF0 => {
+            steps.push_back(MicroOp::ReadPcByte); // n8 → Z
+            steps.push_back(MicroOp::LoadReg(ValSrc::A, AddrSrc::HBankZ)); // [FF00+Z] → A
+        }
+
+        // --- LD A,[C] : lit [FF00+C] → A ; 2 M-cycles (fetch + LoadReg). Pas de drapeaux. ---
+        0xF2 => steps.push_back(MicroOp::LoadReg(ValSrc::A, AddrSrc::HBankC)),
+
+        // --- LD A,(a16) : lit lsb → Z, msb → W, puis [(W<<8)|Z] → A ; 4 M-cycles (fetch + ReadPcByte + ReadPcByteW + LoadReg).
+        // Pas de drapeaux. GBCTR chapitre 6 : la lecture mémoire est le dernier M-cycle. ---
+        0xFA => {
+            steps.push_back(MicroOp::ReadPcByte);    // lsb → Z
+            steps.push_back(MicroOp::ReadPcByteW);   // msb → W
+            steps.push_back(MicroOp::LoadReg(ValSrc::A, AddrSrc::Wz)); // [(W<<8)|Z] → A
+        }
+
+        // --- CB BIT b,(HL) : lit le sous-opcode → Z puis [HL] → Z et pose les drapeaux ; 3 M-cycles (fetch $CB + ReadPcByte + BitTest).
+        // Seules les formes BIT b,(HL) sont portées (sous-opcode ∈ {46,4E,56,5E,66,6E,76,7E}) ; les autres restent sur le chemin legacy. ---
+        0xCB => {
+            let sub = match cb_sub {
+                Some(s) => s,
+                None => return None, // pas de sous-opcode : non porté
+            };
+            if (sub & 0xC7) != 0x46 {
+                return None; // pas BIT b,(HL) — reste sur le chemin legacy
+            }
+            steps.push_back(MicroOp::ReadPcByte);          // M2 : sous-opcode → Z, PC+=1
+            steps.push_back(MicroOp::BitTest((sub >> 3) & 7)); // M3 : [HL] → Z + drapeaux BIT
+        }
+
         _ => return None,
     }
     Some(steps)
@@ -748,6 +857,347 @@ mod tests {
         );
     }
 
+    /// Étape 2 : la famille (HL) read portée en micro-ops produit les mêmes effets d'observation que le chemin legacy —
+    /// registres, mémoire et nombre de T-cycles — for LD r,(HL) / LD A,(BC/DE) / LDH A,(n8) / LD A,[C] / LD A,(a16).
+    #[test]
+    fn ported_hl_read_family_matches_legacy_side_effects() {
+        // Exécute l'instruction placée à $0100 until its completion and returns the total T-cycles consumed.
+        fn tick_until_done(cpu: &mut CPU, bus: &mut Bus) -> u32 {
+            let mut total = 0u32;
+            loop {
+                let (cycles, _) = cpu.tick(bus);
+                total += cycles;
+                if cpu.in_progress.is_none() {
+                    break;
+                }
+            }
+            total
+        }
+
+        // LD r,(HL) : [HL]→r ; pas de drapeaux ; 8 T-cycles — for r in B,C,D,E,H,L,A ($46/$4E/$56/$5E/$66/$6E/$7E).
+        let hl_read_cases = [0x46u8, 0x4E, 0x56, 0x5E, 0x66, 0x6E, 0x7E];
+        for opcode in hl_read_cases {
+            let mut mmu = MMU::new();
+            let mut rom = vec![0x00u8; 0x4000];
+            rom[0x0100] = opcode;
+            mmu.load_rom(rom);
+            let mut cpu = CPU::new();
+            cpu.pc = 0x0100;
+            // Registres distincts pour identifier la cible ; [HL]=0xAB (WRAM, toujours lisible).
+            cpu.a = 0xAA;
+            cpu.b = 0xBB;
+            cpu.c = 0xCC;
+            cpu.d = 0xDD;
+            cpu.e = 0xEE;
+            cpu.h = 0xC0; // HL=$C050 (WRAM)
+            cpu.l = 0x50;
+            mmu.write(0xC050, 0xAB);
+            let f_before = cpu.f;
+            {
+                let mut bus = Bus::new(&mut mmu);
+                assert_eq!(tick_until_done(&mut cpu, &mut bus), 8);
+            }
+            match opcode {
+                0x46 => assert_eq!(cpu.b, 0xAB), // B←[HL]
+                0x4E => assert_eq!(cpu.c, 0xAB), // C←[HL]
+                0x56 => assert_eq!(cpu.d, 0xAB), // D←[HL]
+                0x5E => assert_eq!(cpu.e, 0xAB), // E←[HL]
+                0x66 => assert_eq!(cpu.h, 0xAB), // H←[HL]
+                0x6E => assert_eq!(cpu.l, 0xAB), // L←[HL]
+                0x7E => assert_eq!(cpu.a, 0xAB), // A←[HL]
+                _ => unreachable!(),
+            }
+            let expected_hl = match opcode {
+                0x66 => 0xAB50, // H←[HL] modifie HL
+                0x6E => 0xC0AB, // L←[HL] modifie HL
+                _ => 0xC050,     // HL inchangé
+            };
+            assert_eq!(cpu.hl(), expected_hl);
+            assert_eq!(cpu.f, f_before); // pas de drapeaux
+        }
+
+        // LD A,(BC) : [BC]→A ; pas de drapeaux ; 8 T-cycles.
+        {
+            let mut mmu = MMU::new();
+            let mut rom = vec![0x00u8; 0x4000];
+            rom[0x0100] = 0x0A;
+            mmu.load_rom(rom);
+            let mut cpu = CPU::new();
+            cpu.pc = 0x0100;
+            cpu.a = 0xAA;
+            cpu.b = 0xC0; // BC=$C050 (WRAM)
+            cpu.c = 0x50;
+            mmu.write(0xC050, 0xAB);
+            let f_before = cpu.f;
+            {
+                let mut bus = Bus::new(&mut mmu);
+                assert_eq!(tick_until_done(&mut cpu, &mut bus), 8);
+            }
+            assert_eq!(cpu.a, 0xAB); // A←[BC]
+            assert_eq!(cpu.f, f_before); // pas de drapeaux
+        }
+
+        // LD A,(DE) : [DE]→A ; pas de drapeaux ; 8 T-cycles.
+        {
+            let mut mmu = MMU::new();
+            let mut rom = vec![0x00u8; 0x4000];
+            rom[0x0100] = 0x1A;
+            mmu.load_rom(rom);
+            let mut cpu = CPU::new();
+            cpu.pc = 0x0100;
+            cpu.a = 0xAA;
+            cpu.d = 0xC0; // DE=$C050 (WRAM)
+            cpu.e = 0x50;
+            mmu.write(0xC050, 0xAB);
+            let f_before = cpu.f;
+            {
+                let mut bus = Bus::new(&mut mmu);
+                assert_eq!(tick_until_done(&mut cpu, &mut bus), 8);
+            }
+            assert_eq!(cpu.a, 0xAB); // A←[DE]
+            assert_eq!(cpu.f, f_before); // pas de drapeaux
+        }
+
+        // LDH A,(n8) : [FF00+n8]→A ; pas de drapeaux ; 12 T-cycles (3 M-cycles). PC passe l'opérande n8.
+        {
+            let mut mmu = MMU::new();
+            let mut rom = vec![0x00u8; 0x4000];
+            rom[0x0100] = 0xF0;
+            rom[0x0101] = 0xC0; // n8 → port $FFC0 (HRAM)
+            mmu.load_rom(rom);
+            let mut cpu = CPU::new();
+            cpu.pc = 0x0100;
+            cpu.a = 0xAA;
+            mmu.write(0xFFC0, 0xCD);
+            let f_before = cpu.f;
+            {
+                let mut bus = Bus::new(&mut mmu);
+                assert_eq!(tick_until_done(&mut cpu, &mut bus), 12);
+            }
+            assert_eq!(cpu.a, 0xCD); // A←[FFC0]
+            assert_eq!(cpu.pc, 0x0102); // PC passe l'opérande n8
+            assert_eq!(cpu.f, f_before); // pas de drapeaux
+        }
+
+        // LD A,[C] : [FF00+C]→A ; pas de drapeaux ; 8 T-cycles.
+        {
+            let mut mmu = MMU::new();
+            let mut rom = vec![0x00u8; 0x4000];
+            rom[0x0100] = 0xF2;
+            mmu.load_rom(rom);
+            let mut cpu = CPU::new();
+            cpu.pc = 0x0100;
+            cpu.a = 0xAA;
+            cpu.c = 0xC0; // port $FFC0 (HRAM)
+            mmu.write(0xFFC0, 0xAB);
+            let f_before = cpu.f;
+            {
+                let mut bus = Bus::new(&mut mmu);
+                assert_eq!(tick_until_done(&mut cpu, &mut bus), 8);
+            }
+            assert_eq!(cpu.a, 0xAB); // A←[FFC0]
+            assert_eq!(cpu.f, f_before); // pas de drapeaux
+        }
+
+        // LD A,(a16) : [a16]→A ; pas de drapeaux ; 16 T-cycles (4 M-cycles). PC passe l'opérande a16.
+        {
+            let mut mmu = MMU::new();
+            let mut rom = vec![0x00u8; 0x4000];
+            rom[0x0100] = 0xFA;
+            rom[0x0101] = 0x50; // a16 lsb → $C050 (WRAM)
+            rom[0x0102] = 0xC0; // a16 msb
+            mmu.load_rom(rom);
+            let mut cpu = CPU::new();
+            cpu.pc = 0x0100;
+            cpu.a = 0xAA;
+            mmu.write(0xC050, 0xAB);
+            let f_before = cpu.f;
+            {
+                let mut bus = Bus::new(&mut mmu);
+                assert_eq!(tick_until_done(&mut cpu, &mut bus), 16);
+            }
+            assert_eq!(cpu.a, 0xAB); // A←[$C050]
+            assert_eq!(cpu.pc, 0x0103); // PC passe l'opérande a16
+            assert_eq!(cpu.f, f_before); // pas de drapeaux
+        }
+
+        // CB BIT b,(HL) : [HL]→Z + drapeaux (Z=(bit==0), N=0, H=1, C conservé) ; 12 T-cycles (3 M-cycles).
+        {
+            let mut mmu = MMU::new();
+            let mut rom = vec![0x00u8; 0x4000];
+            rom[0x0100] = 0xCB;
+            rom[0x0101] = 0x7E; // BIT 7,(HL)
+            mmu.load_rom(rom);
+            let mut cpu = CPU::new();
+            cpu.pc = 0x0100;
+            cpu.h = 0xC0; // HL=$C050 (WRAM)
+            cpu.l = 0x50;
+            mmu.write(0xC050, 0x80); // bit 7 posé → Z=0
+            let c_before = cpu.flags().contains(Flags::C);
+            {
+                let mut bus = Bus::new(&mut mmu);
+                assert_eq!(tick_until_done(&mut cpu, &mut bus), 12);
+            }
+            let f = cpu.flags(); // BIT 7,(HL) avec [HL]=0x80 : bit 7 posé → Z=0 ; N=0, H=1.
+            assert!(!f.contains(Flags::Z));
+            assert!(!f.contains(Flags::N));
+            assert!(f.contains(Flags::H));
+            assert_eq!(f.contains(Flags::C), c_before); // C conservé
+        }
+    }
+
+    /// Étape 2 : prouve que la famille (HL) read portée s'exécute VRAIMENT pas-à-pas — and non « N T consommés au
+    /// total, peu importe how ». Chaque M-cycle is an appel distinct de [`CPU::tick`] qui avance le matériel d'exactement
+    /// un M-cycle (4 T), et the lecture bus a lieu au dernier M-cycle, pas avant. On observe l'état intermédiaire entre
+    /// les M-cycles (le registre cible encore non chargé after the fetch) ainsi qu'une horloge matérielle indépendante
+    /// (the Timer) qui ne peut avancer que si each `tick_m_cycle` a bien fait progresser le matériel.
+    #[test]
+    fn ported_hl_read_family_interleaves_m_cycles() {
+        // LD r,(HL) : 2 M-cycles distincts — fetch → [HL]→r (the registre cible is loaded au 2ᵉ M-cycle, pas avant).
+        let cases = [0x46u8, 0x4E, 0x56, 0x5E, 0x66, 0x6E, 0x7E];
+        for opcode in cases {
+            let mut mmu = MMU::new();
+            let mut rom = vec![0x00u8; 0x4000];
+            rom[0x0100] = opcode;
+            mmu.load_rom(rom);
+            let mut cpu = CPU::new();
+            cpu.pc = 0x0100;
+            // Valeurs initiales distinctes : the registre cible doit rester intact pendant the fetch.
+            cpu.a = 0xAA;
+            cpu.b = 0xBB;
+            cpu.c = 0xCC;
+            cpu.d = 0xDD;
+            cpu.e = 0xEE;
+            cpu.h = 0xC0; // HL=$C050 (WRAM)
+            cpu.l = 0x50;
+            mmu.write(0xC050, 0xAB);
+
+            let mut bus = Bus::new(&mut mmu);
+            // M-cycle #1 (the fetch) : un seul appel tick avance the matériel d'un M-cycle ; the registre cible is NOT yet loaded.
+            let (c1, _) = cpu.tick(&mut bus);
+            assert_eq!(c1, 4, "${:02X} : the fetch doit consommer exactement un M-cycle (4 T)", opcode);
+            assert!(cpu.in_progress.is_some(), "l'instruction doit être en cours after the fetch");
+            match opcode {
+                0x46 => assert_eq!(cpu.b, 0xBB), // B encore non chargé pendant the fetch
+                0x4E => assert_eq!(cpu.c, 0xCC),
+                0x56 => assert_eq!(cpu.d, 0xDD),
+                0x5E => assert_eq!(cpu.e, 0xEE),
+                0x66 => assert_eq!(cpu.h, 0xC0),
+                0x6E => assert_eq!(cpu.l, 0x50),
+                0x7E => assert_eq!(cpu.a, 0xAA),
+                _ => unreachable!(),
+            }
+
+            // M-cycle #2 (the lecture [HL]→r) : un second appel tick ; the registre cible is loaded here.
+            let (c2, _) = cpu.tick(&mut bus);
+            assert_eq!(c2, 4, "${:02X} : the lecture doit consommer exactement un M-cycle (4 T)", opcode);
+            assert!(cpu.in_progress.is_none(), "l'instruction doit être achevée after the lecture");
+            match opcode {
+                0x46 => assert_eq!(cpu.b, 0xAB), // B←[HL] au 2ᵉ M-cycle
+                0x4E => assert_eq!(cpu.c, 0xAB),
+                0x56 => assert_eq!(cpu.d, 0xAB),
+                0x5E => assert_eq!(cpu.e, 0xAB),
+                0x66 => assert_eq!(cpu.h, 0xAB),
+                0x6E => assert_eq!(cpu.l, 0xAB),
+                0x7E => assert_eq!(cpu.a, 0xAB),
+                _ => unreachable!(),
+            }
+        }
+
+        // LDH A,(n8) ($F0) : 3 M-cycles distincts — fetch → lecture de n8 (A encore non chargé) → [FF00+n8]→A.
+        {
+            let mut mmu = MMU::new();
+            let mut rom = vec![0x00u8; 0x4000];
+            rom[0x0100] = 0xF0;
+            rom[0x0101] = 0xC0; // n8 → port $FFC0 (HRAM)
+            mmu.load_rom(rom);
+            let mut cpu = CPU::new();
+            cpu.pc = 0x0100;
+            cpu.a = 0xAA;
+            mmu.write(0xFFC0, 0xCD);
+
+            let mut bus = Bus::new(&mut mmu);
+            // M-cycle #1 (the fetch) : A non chargé.
+            let (c1, _) = cpu.tick(&mut bus);
+            assert_eq!(c1, 4, "$F0 : the fetch doit consommer exactement un M-cycle (4 T)");
+            assert!(cpu.in_progress.is_some(), "l'instruction doit être en cours after the fetch");
+            assert_eq!(cpu.a, 0xAA, "A non chargé pendant the fetch");
+
+            // M-cycle #2 (lecture de n8 → Z) : A encore non chargé.
+            let (c2, _) = cpu.tick(&mut bus);
+            assert_eq!(c2, 4, "$F0 : the lecture de n8 doit consommer exactement un M-cycle (4 T)");
+            assert!(cpu.in_progress.is_some(), "l'instruction doit être en cours after the lecture de n8");
+            assert_eq!(cpu.a, 0xAA, "A non chargé pendant the lecture de n8 (pas de chargement anticipé)");
+
+            // M-cycle #3 ([FFC0]→A) : A finally correct.
+            let (c3, _) = cpu.tick(&mut bus);
+            assert_eq!(c3, 4, "$F0 : the lecture doit consommer exactement un M-cycle (4 T)");
+            assert!(cpu.in_progress.is_none(), "l'instruction doit être achevée after the lecture");
+            assert_eq!(cpu.a, 0xCD, "A←[FFC0] au 3ᵉ M-cycle = n8 lu à PC+1");
+        }
+
+        // CB BIT b,(HL) : 3 M-cycles distincts — fetch $CB → sous-opcode (drapeaux not yet posés) → [HL]+drapeaux.
+        {
+            let mut mmu = MMU::new();
+            let mut rom = vec![0x00u8; 0x4000];
+            rom[0x0100] = 0xCB;
+            rom[0x0101] = 0x7E; // BIT 7,(HL)
+            mmu.load_rom(rom);
+            let mut cpu = CPU::new();
+            cpu.pc = 0x0100;
+            cpu.h = 0xC0; // HL=$C050 (WRAM)
+            cpu.l = 0x50;
+            mmu.write(0xC050, 0x80); // bit 7 posé → Z=0 au M-cycle #3
+            let f_before = cpu.f;
+
+            let mut bus = Bus::new(&mut mmu);
+            // M-cycle #1 (the fetch $CB) : drapeaux inchangés.
+            let (c1, _) = cpu.tick(&mut bus);
+            assert_eq!(c1, 4, "CB BIT b,(HL) : the fetch doit consommer exactement un M-cycle (4 T)");
+            assert!(cpu.in_progress.is_some(), "l'instruction doit être en cours after the fetch $CB");
+            assert_eq!(cpu.f, f_before, "drapeaux inchangés pendant the fetch $CB");
+
+            // M-cycle #2 (sous-opcode → Z) : drapeaux still not posés.
+            let (c2, _) = cpu.tick(&mut bus);
+            assert_eq!(c2, 4, "CB BIT b,(HL) : the lecture du sous-opcode doit consommer exactement un M-cycle (4 T)");
+            assert!(cpu.in_progress.is_some(), "l'instruction doit être en cours after the sous-opcode");
+            assert_eq!(cpu.f, f_before, "drapeaux not yet posés pendant the lecture du sous-opcode");
+
+            // M-cycle #3 ([HL]→Z + drapeaux) : Z=0 (bit 7 posé), N=0, H=1.
+            let (c3, _) = cpu.tick(&mut bus);
+            assert_eq!(c3, 4, "CB BIT b,(HL) : the lecture [HL]+drapeaux doit consommer exactement un M-cycle (4 T)");
+            assert!(cpu.in_progress.is_none(), "l'instruction doit être achevée after the drapeaux");
+            let f = cpu.flags();
+            assert!(!f.contains(Flags::Z), "Z=0 car le bit 7 de [HL]=0x80 est posé");
+            assert!(f.contains(Flags::H), "H posé par BIT");
+        }
+
+        // Horloge matérielle indépendante (the Timer) : each appel tick avance the matériel d'EXACTEMENT un M-cycle.
+        // TAC=$05 active the timer with the period la plus fine (16 T). Huit instructions portées = 16 M-cycles = 64 T,
+        // donc TIMA doit valoir 64/16 = 4 — ce qui ne tient que si each tick a bien fait progresser the matériel of 4 T.
+        let mut mmu = MMU::new();
+        let rom = vec![0x7Eu8; 0x4000]; // LD A,(HL) répété : huit instructions consécutives à $0100-$0107
+        let mut cpu = CPU::new();
+        cpu.pc = 0x0100;
+        cpu.a = 0xAA;
+        cpu.h = 0xC0; // HL=$C050 (WRAM)
+        cpu.l = 0x50;
+        mmu.load_rom(rom);
+        mmu.write(0xFF07, 0x05); // TAC : timer activé (bit 2) + period la plus fine (bits 1-0 = $01 → 16 T)
+        assert_eq!(mmu.read(0xFF05), 0x00); // TIMA à zéro au départ
+        let mut bus = Bus::new(&mut mmu);
+        for _ in 0..8 {
+            cpu.tick(&mut bus); // fetch d'une instruction (4 T)
+            cpu.tick(&mut bus); // lecture [HL]→A de l'instruction (4 T)
+        }
+        assert_eq!(cpu.pc, 0x0108); // les huit instructions ont bien été exécutées
+        assert_eq!(
+            bus.mmu.read(0xFF05), // lecture brute (pas de tick) : TIMA after 64 T
+            4,
+            "TIMA doit valoir 64 T / 16 T = 4 : each tick a avancé the matériel d'un M-cycle"
+        );
+    }
+
     /// Test exhaustif générique (étape 1) : pour chacun des opcodes non préfixés — les deux branches des
     /// conditionnelles incluses — l'instruction est exécutée isolée dans un ROM minimal et le nombre de M-cycles
     /// consommés est comparé à la table générée depuis `data/Opcodes.json`.
@@ -801,15 +1251,7 @@ mod tests {
             // ADD HL,HL / ADD HL,SP : le code consomme 4 M-cycles (« DMG »), la référence dit 2.
             "$$29 (non-cond): got 4 M-cycle(s), expected 2".into(), // ADD HL,HL
             "$$39 (non-cond): got 4 M-cycle(s), expected 2".into(), // ADD HL,SP
-            // LD r8,(HL) : le code consomme 1 M-cycle, la référence dit 2.
-            "$$46 (non-cond): got 1 M-cycle(s), expected 2".into(), // LD B,(HL)
-            "$$4E (non-cond): got 1 M-cycle(s), expected 2".into(), // LD C,(HL)
-            "$$56 (non-cond): got 1 M-cycle(s), expected 2".into(), // LD D,(HL)
-            "$$5E (non-cond): got 1 M-cycle(s), expected 2".into(), // LD E,(HL)
-            "$$66 (non-cond): got 1 M-cycle(s), expected 2".into(), // LD H,(HL)
-            "$$6E (non-cond): got 1 M-cycle(s), expected 2".into(), // LD L,(HL)
-            "$$7E (non-cond): got 1 M-cycle(s), expected 2".into(), // LD A,(HL)
-            // ALU A,(HL) : le code consomme 1 M-cycle, la référence dit 2.
+            // ALU A,(HL) : le code consomme 1 M-cycle, la référence dit 2. (hors mandat — non porté en micro-ops)
             "$$86 (non-cond): got 1 M-cycle(s), expected 2".into(), // ADD A,(HL)
             "$$8E (non-cond): got 1 M-cycle(s), expected 2".into(), // ADC A,(HL)
             "$$96 (non-cond): got 1 M-cycle(s), expected 2".into(), // SUB (HL)
@@ -822,8 +1264,6 @@ mod tests {
             "$$CB (non-cond): got 2 M-cycle(s), expected 1".into(), // CB prefix byte
             // JP HL : le code consomme 4 M-cycles, la référence dit 1.
             "$$E9 (non-cond): got 4 M-cycle(s), expected 1".into(), // JP HL
-            // LDH A,(a8) : le code consomme 2 M-cycles, la référence dit 3.
-            "$$F0 (non-cond): got 2 M-cycle(s), expected 3".into(), // LDH A,(a8)
             // JR cc non-taken : le code consomme 1 M-cycle (4 T-cycles, conforme au HW) ; la référence dit 2.
             "$$20 (not-taken): got 1 M-cycle(s), expected 2".into(), // JR NZ
             "$$28 (not-taken): got 1 M-cycle(s), expected 2".into(), // JR Z
