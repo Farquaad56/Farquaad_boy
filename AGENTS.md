@@ -10,23 +10,23 @@
 
 ## Mandat actuel
 Porter la famille `(HL)` lecture-modification-écriture :
-- **`INC (HL)`** (`$34`), **`DEC (HL)`** (`$35`) — 3 M-cycles chacun (fetch, lecture, écriture).
-- **Tous les `CB xx,(HL)` sauf `BIT`** (déjà portés au point 2) — c'est-à-dire les rotations/décalages et `RES`/`SET` sur `(HL)` : `RLC/RRC/RL/RR/SLA/SRA/SWAP/SRL (HL)` (`CB 06/0E/16/1E/26/2E/36/3E`) et `RES b,(HL)`/`SET b,(HL)` (`CB 86-BE` pairs, `CB C6-FE` pairs) — 4 M-cycles chacun (fetch CB, fetch sous-opcode, lecture, écriture).
+- **`INC (HL)`** (`$34`), **`DEC (HL)`** (`$35`) — 3 M-cycles chacun.
+- **Tous les `CB xx,(HL)` sauf `BIT`** — rotations/décalages (`RLC/RRC/RL/RR/SLA/SRA/SWAP/SRL (HL)`) et `RES`/`SET b,(HL)` — 4 M-cycles chacun.
 
-Avant d'écrire le moindre code : cite le tableau M-cycle GBCTR chapitre 6 pour chaque opcode de cette liste (comme pour les deux familles précédentes) et croise avec `Opcodes.json`. Signale toute divergence entre le compte legacy et la référence — comme `$36` en son temps — avant de l'implémenter, ne la corrige pas silencieusement.
+Avant tout code : cite le tableau M-cycle GBCTR chapitre 6 pour chaque opcode, croisé avec `Opcodes.json`. Signale toute divergence avec le compte legacy avant de l'implémenter, ne la corrige pas silencieusement (comme `$36`).
 
-Point d'attention particulier : `INC (HL)`/`DEC (HL)` et les `CB (HL)` de cette famille modifient les flags **en plus** de lire-puis-écrire — vérifie que le calcul des flags a lieu au bon M-cycle (généralement au moment de la lecture, avant l'écriture) et ne dépend pas de la valeur déjà écrite.
+Point d'attention : `INC`/`DEC`/rotations modifient les flags en plus de lire-puis-écrire — vérifie à quel M-cycle exact le calcul des flags a lieu.
 
 Méthode imposée, identique aux points précédents :
-1. Micro-programme + test d'entrelacement dédié par opcode (M-cycles séparés observables, adresse bus vérifiée où pertinent).
+1. Micro-programme + test d'entrelacement dédié par opcode.
 2. A/B `cargo test` (ensembles d'échecs, pas totaux).
-3. `cpu_instrs` (11/11 attendu) + `mooneye_timer_roms_pass` (13/13, ne doit pas régresser).
-4. Relancer `03-modify_timing.gb` de Blargg — sortie brute avant/après. Rappel : le résidu peut rester stable même si le portage est correct, comme observé sur les deux familles précédentes ; ne pas chercher à forcer un passage au vert à tout prix sans en comprendre la cause si ça ne bouge pas.
+3. `cpu_instrs` (11/11) + `mooneye_timer_roms_pass` (13/13, ne doit pas régresser).
+4. Relancer `03-modify_timing.gb` de Blargg — sortie brute avant/après, sans attente qu'elle passe forcément au vert.
 5. Ne committer qu'après mon feu vert explicite.
 
 ## Interdictions explicites
-- Ne pas porter d'autre famille au-delà de `(HL)` lecture-modification-écriture (PUSH/POP/CALL/RET/interruptions restent pour un mandat futur).
-- Ne pas toucher au PPU.
-- Ne pas retoucher `timer.rs`, `Bus::read`/`Bus::write` sans mandat explicite séparé.
+- Ne pas porter d'autre famille au-delà de ce point.
+- Ne pas toucher au PPU, ni au rendu des sprites (décalage d'une case connu, noté pour un futur mandat séparé — **pas maintenant**).
+- Ne pas retoucher `timer.rs`, `Bus::read`/`Bus::write`, ni la boot ROM sans mandat explicite séparé.
 - Ne jamais modifier ce fichier (`AGENTS.md`) toi-même.
 - Ne pas committer sans mon feu vert explicite.
