@@ -567,6 +567,7 @@ fn ld_a_hl_delta(cpu: &mut CPU, mmu: &mut MMU, delta: i16) -> u32 {
 }
 
 /// LDH [n8],A (8 T-cycles) : écrit A dans le port $FF00+n8. L'immédiat est à `cpu.pc`.
+#[allow(dead_code)] // helper LDH [n8],A : réservé à un opcode non câblé dans ce mapping (aucun dispatch ne l'appelle encore)
 fn ldh_a8(cpu: &mut CPU, mmu: &mut MMU) -> u32 {
     let n = mmu.read(cpu.pc);
     cpu.pc = cpu.pc.wrapping_add(1); // passe l'immédiat n8

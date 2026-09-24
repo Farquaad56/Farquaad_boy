@@ -137,8 +137,37 @@ pub enum MicroOp {
     StoreHlDelta(ValSrc, i8),
     /// Lit la mémoire pointée par [HL] → latch Z puis pose les drapeaux BIT depuis le bit `bit` (Z=(bit==0), N=0, H=1, C conservé), le tout dans un seul M-cycle (ex CB BIT b,(HL)).
     BitTest(u8),
+    /// INC (HL) : result = Z+1 ; écrit [HL]=result et pose les drapeaux (Z=(r==0), N=0, H=((r&$0F)==0), C inchangé). Un M-cycle.
+    IncHl,
+    /// DEC (HL) : result = Z-1 ; écrit [HL]=result et pose les drapeaux (Z=(r==0), N=1, H=((r&$0F)==$0F), C inchangé). Un M-cycle.
+    DecHl,
+    /// Rotation/décalage CB b,(HL) : transforme Z selon `kind`, écrit [HL]=result et pose les drapeaux (Z=(r==0), N=0, H=0, C=décalé). Un M-cycle.
+    RotateShiftHl(RotateKind),
+    /// RES/SET b,(HL) : efface (`is_set`=false) / pose (`is_set`=true) the bit `bit` de Z, écrit [HL]=result ; pas de drapeaux. Un M-cycle.
+    ResSetHl(bool, u8),
     /// Pas interne (aucun accès bus) — ex. calcul de drapeaux ; le matériel avance quand même d'un M-cycle.
     Internal,
+}
+
+/// Opération de rotation/décalage CB sur (HL) (D2) : l'octet lu dans Z est transformé puis réécrit en [HL].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RotateKind {
+    /// RLC b,(HL) : rotation gauche circulaire ; C=bit7 décalé.
+    Rlc,
+    /// RRC b,(HL) : rotation droite circulaire ; C=bit0 décalé.
+    Rrc,
+    /// RL b,(HL) : décalage gauche, l'ancien C entre par le bit 0 ; C=bit7.
+    Rl,
+    /// RR b,(HL) : décalage droit, l'ancien C entre par le bit 7 ; C=bit0.
+    Rr,
+    /// SLA b,(HL) : décalage gauche logique, bit 0 mis à 0 ; C=bit7 décalé.
+    Sla,
+    /// SRA b,(HL) : décalage droit arithmétique, bit 7 conservé ; C=bit0.
+    Sra,
+    /// SWAP b,(HL) : échange des deux nibbles ; C=0.
+    Swap,
+    /// SRL b,(HL) : décalage droit logique, bit 7 mis à 0 ; C=bit0 décalé.
+    Srl,
 }
 
 /// Instruction portée en cours d'exécution pas-à-pas (D2) : les micro-ops restants à exécuter. Le fetch
@@ -389,6 +418,80 @@ impl CPU {
                 self.set_flags(f);
                 fd
             }
+            MicroOp::IncHl => {
+                // M-cycle combiné : result = Z+1 ; écrit [HL]=result et pose les drapeaux — un seul accès + tick.
+                let addr = self.hl();
+                let value = self.z.wrapping_add(1);
+                let fd = bus.write(addr, value); // accès + tick (D1)
+                let c = self.flags().contains(Flags::C);
+                let mut f = Flags::empty();      // N effacé
+                if value == 0 {
+                    f |= Flags::Z;               // Z posé si le résultat vaut 0
+                }
+                if (value & 0x0F) == 0 {         // H : débordement du demi-mot bas ($0F → $xx)
+                    f |= Flags::H;
+                }
+                if c {
+                    f |= Flags::C;              // C conservé
+                }
+                self.set_flags(f);
+                fd
+            }
+            MicroOp::DecHl => {
+                // M-cycle combiné : result = Z-1 ; écrit [HL]=result et pose les drapeaux — un seul accès + tick.
+                let addr = self.hl();
+                let value = self.z.wrapping_sub(1);
+                let fd = bus.write(addr, value); // accès + tick (D1)
+                let c = self.flags().contains(Flags::C);
+                let mut f = Flags::N;            // N posé
+                if value == 0 {
+                    f |= Flags::Z;               // Z posé si le résultat vaut 0
+                }
+                if (value & 0x0F) == 0x0F {      // H : emprunt vers le bit 4 ($00 → $xx)
+                    f |= Flags::H;
+                }
+                if c {
+                    f |= Flags::C;              // C conservé
+                }
+                self.set_flags(f);
+                fd
+            }
+            MicroOp::RotateShiftHl(kind) => {
+                // M-cycle combiné : transforme Z selon `kind`, écrit [HL]=result et pose les drapeaux — un seul accès + tick.
+                let addr = self.hl();
+                let value = self.z;
+                let c_in = u8::from(self.flags().contains(Flags::C)); // C d'origine (inchangé par M1..M3)
+                let (result, carry_out) = match kind {
+                    RotateKind::Rlc => (value.rotate_left(1), (value & 0x80) != 0),
+                    RotateKind::Rrc => (value.rotate_right(1), (value & 0x01) != 0),
+                    RotateKind::Rl => ((value << 1) | c_in, (value & 0x80) != 0),
+                    RotateKind::Rr => ((value >> 1) | if c_in != 0 { 0x80 } else { 0 }, (value & 0x01) != 0),
+                    RotateKind::Sla => (value << 1, (value & 0x80) != 0),
+                    RotateKind::Sra => ((value >> 1) | (value & 0x80), (value & 0x01) != 0),
+                    RotateKind::Swap => ((value >> 4) | (value << 4), false),
+                    RotateKind::Srl => (value >> 1, (value & 0x01) != 0),
+                };
+                let fd = bus.write(addr, result); // accès + tick (D1)
+                let mut f = Flags::empty();       // N=0, H=0
+                if result == 0 {
+                    f |= Flags::Z;               // Z posé si le résultat vaut 0
+                }
+                if carry_out {
+                    f |= Flags::C;              // C = bit décalé
+                }
+                self.set_flags(f);
+                fd
+            }
+            MicroOp::ResSetHl(is_set, bit) => {
+                // M-cycle combiné : efface/pose the bit `bit` de Z, écrit [HL]=result — un seul accès + tick. Pas de drapeaux.
+                let addr = self.hl();
+                let value = if is_set {
+                    self.z | (1 << bit)
+                } else {
+                    self.z & !(1 << bit)
+                };
+                bus.write(addr, value) // accès + tick (D1) — les drapeaux ne sont pas modifiés
+            }
             MicroOp::WriteMem(addr_src, val_src) => {
                 let addr = addr_src.address(self);
                 let value = val_src.value(self);
@@ -464,6 +567,18 @@ fn ported_steps(opcode: u8, cb_sub: Option<u8>) -> Option<VecDeque<MicroOp>> {
         // LD (HL-),A : écrit A dans [HL] puis HL-=1 ; 2 M-cycles (fetch + StoreHlDelta). Pas de drapeaux.
         0x32 => steps.push_back(MicroOp::StoreHlDelta(ValSrc::A, -1)),
 
+        // --- Famille (HL) read-modify-write : INC (HL) / DEC (HL) ---
+        // GBCTR chapitre 6 : la lecture mémoire est le M-cycle avant-dernier et l'écriture + les drapeaux sont le
+        // dernier M-cycle. 3 M-cycles au total (fetch + ReadMem(Hl) + IncHl/DecHl).
+        0x34 => {
+            steps.push_back(MicroOp::ReadMem(AddrSrc::Hl)); // M2 : [HL] → Z
+            steps.push_back(MicroOp::IncHl);                // M3 : [HL]=Z+1 + drapeaux (Z, N=0, H, C inchangé)
+        }
+        0x35 => {
+            steps.push_back(MicroOp::ReadMem(AddrSrc::Hl)); // M2 : [HL] → Z
+            steps.push_back(MicroOp::DecHl);                // M3 : [HL]=Z-1 + drapeaux (Z, N=1, H, C inchangé)
+        }
+
         // --- Famille (HL) read : LD r,(HL) ---
         // Lit [HL] → Z puis charge le résultat dans le registre `r` ; 2 M-cycles (fetch + LoadReg). Pas de drapeaux.
         // GBCTR chapitre 6 : la lecture mémoire et la mise en registre sont le même M-cycle (le dernier).
@@ -496,18 +611,46 @@ fn ported_steps(opcode: u8, cb_sub: Option<u8>) -> Option<VecDeque<MicroOp>> {
             steps.push_back(MicroOp::LoadReg(ValSrc::A, AddrSrc::Wz)); // [(W<<8)|Z] → A
         }
 
-        // --- CB BIT b,(HL) : lit le sous-opcode → Z puis [HL] → Z et pose les drapeaux ; 3 M-cycles (fetch $CB + ReadPcByte + BitTest).
-        // Seules les formes BIT b,(HL) sont portées (sous-opcode ∈ {46,4E,56,5E,66,6E,76,7E}) ; les autres restent sur le chemin legacy. ---
+        // --- CB b,(HL) : lit le sous-opcode (M2), puis [HL] → Z (M3), then the last M-cycle acts on [HL]. ---
+        // Seules the formes sur (HL) are portées ; les autres restent sur le chemin legacy. GBCTR chapitre 6 : la lecture
+        // mémoire est le M-cycle avant-dernier et l'écriture (+ drapeaux, s'il y en a) is the last M-cycle.
         0xCB => {
             let sub = match cb_sub {
                 Some(s) => s,
                 None => return None, // pas de sous-opcode : non porté
             };
-            if (sub & 0xC7) != 0x46 {
-                return None; // pas BIT b,(HL) — reste sur le chemin legacy
+            if (sub & 0xC7) == 0x46 {
+                // BIT b,(HL) : 3 M-cycles (fetch $CB + ReadPcByte + BitTest). Le bit testé est dans les bits 5-3.
+                steps.push_back(MicroOp::ReadPcByte);          // M2 : sous-opcode → Z, PC+=1
+                steps.push_back(MicroOp::BitTest((sub >> 3) & 7)); // M3 : [HL] → Z + drapeaux BIT
+            } else if sub & 0x07 == 6 && (sub & 0xC0) == 0x00 {
+                // RLC/RRC/RL/RR/SLA/SRA/SWAP/SRL b,(HL) : 4 M-cycles (fetch $CB + ReadPcByte + ReadMem(Hl) + RotateShiftHl).
+                steps.push_back(MicroOp::ReadPcByte);           // M2 : sous-opcode → Z, PC+=1
+                steps.push_back(MicroOp::ReadMem(AddrSrc::Hl)); // M3 : [HL] → Z
+                let kind = match sub {
+                    0x06 => RotateKind::Rlc,
+                    0x0E => RotateKind::Rrc,
+                    0x16 => RotateKind::Rl,
+                    0x1E => RotateKind::Rr,
+                    0x26 => RotateKind::Sla,
+                    0x2E => RotateKind::Sra,
+                    0x36 => RotateKind::Swap,
+                    _ => RotateKind::Srl, // 0x3E
+                };
+                steps.push_back(MicroOp::RotateShiftHl(kind)); // M4 : [HL]=transform(Z) + drapeaux (Z, N=0, H=0, C)
+            } else if sub & 0x07 == 6 && (sub & 0xC0) == 0x80 {
+                // RES b,(HL) : efface the bit ; 4 M-cycles (fetch $CB + ReadPcByte + ReadMem(Hl) + ResSetHl). Pas de drapeaux.
+                steps.push_back(MicroOp::ReadPcByte);           // M2 : sous-opcode → Z, PC+=1
+                steps.push_back(MicroOp::ReadMem(AddrSrc::Hl)); // M3 : [HL] → Z
+                steps.push_back(MicroOp::ResSetHl(false, (sub >> 3) & 7)); // M4 : [HL]=Z & !(1<<bit)
+            } else if sub & 0x07 == 6 && (sub & 0xC0) == 0xC0 {
+                // SET b,(HL) : pose the bit ; 4 M-cycles (fetch $CB + ReadPcByte + ReadMem(Hl) + ResSetHl). Pas de drapeaux.
+                steps.push_back(MicroOp::ReadPcByte);           // M2 : sous-opcode → Z, PC+=1
+                steps.push_back(MicroOp::ReadMem(AddrSrc::Hl)); // M3 : [HL] → Z
+                steps.push_back(MicroOp::ResSetHl(true, (sub >> 3) & 7)); // M4 : [HL]=Z | (1<<bit)
+            } else {
+                return None; // autre forme CB — reste sur le chemin legacy
             }
-            steps.push_back(MicroOp::ReadPcByte);          // M2 : sous-opcode → Z, PC+=1
-            steps.push_back(MicroOp::BitTest((sub >> 3) & 7)); // M3 : [HL] → Z + drapeaux BIT
         }
 
         _ => return None,
@@ -1200,6 +1343,371 @@ mod tests {
             3,
             "TIMA doit valoir 3 sur ces 64 T (décalage structurel d'1 M-cycle, RELOAD_WINDOW_LEN) : chaque tick a avancé le matériel d'un M-cycle"
         );
+    }
+
+    /// Étape 2 : la famille (HL) read-modify-write portée en micro-ops interleave ses M-cycles exactly as GBCTR chapitre 6 —
+    /// INC/DEC (HL) at 3 M-cycles and CB rotate/shift / RES / SET b,(HL) at 4 M-cycles. The lecture de [HL] is the M-cycle
+    /// avant-dernier, l'écriture (+ les drapeaux, s'il y en a) is the last M-cycle ; [HL] et les drapeaux sont inchangés until then.
+    #[test]
+    fn ported_hl_rmw_family_interleaves_m_cycles() {
+        // --- INC (HL) ($34) : 3 M-cycles — fetch → [HL]→Z → [HL]=Z+1+drapeaux. ---
+        {
+            let mut mmu = MMU::new();
+            let mut rom = vec![0x00u8; 0x4000];
+            rom[0x0100] = 0x34; // INC (HL)
+            mmu.load_rom(rom);
+            let mut cpu = CPU::new();
+            cpu.pc = 0x0100;
+            cpu.h = 0xC0; // HL=$C050 (WRAM, toujours écritable)
+            cpu.l = 0x50;
+            mmu.write(0xC050, 0x0F); // [HL]=$0F → résultat $10 : H posé (demi-mot bas $0F→$xx), Z=0
+            let f_before = cpu.f;
+
+            let mut bus = Bus::new(&mut mmu);
+            // M-cycle #1 (the fetch) : [HL] et drapeaux inchangés.
+            let (c1, _) = cpu.tick(&mut bus);
+            assert_eq!(c1, 4, "INC (HL) : the fetch doit consommer exactement un M-cycle (4 T)");
+            assert!(cpu.in_progress.is_some(), "l'instruction doit être en cours after the fetch");
+            assert_eq!(bus.mmu.read(0xC050), 0x0F, "[HL] inchangé pendant the fetch");
+            assert_eq!(cpu.f, f_before, "drapeaux inchangés pendant the fetch");
+
+            // M-cycle #2 ([HL]→Z) : [HL] still not written, drapeaux still not posés.
+            let (c2, _) = cpu.tick(&mut bus);
+            assert_eq!(c2, 4, "INC (HL) : the lecture [HL] doit consommer exactement un M-cycle (4 T)");
+            assert!(cpu.in_progress.is_some(), "l'instruction doit être en cours after the lecture [HL]");
+            assert_eq!(bus.mmu.read(0xC050), 0x0F, "[HL] not yet written pendant the lecture (pas d'écriture anticipée)");
+            assert_eq!(cpu.f, f_before, "drapeaux not yet posés pendant the lecture [HL]");
+
+            // M-cycle #3 ([HL]=Z+1 + drapeaux) : [HL]=$10, Z=0, N=0, H=1.
+            let (c3, _) = cpu.tick(&mut bus);
+            assert_eq!(c3, 4, "INC (HL) : the écriture+drapeaux doit consommer exactement un M-cycle (4 T)");
+            assert!(cpu.in_progress.is_none(), "l'instruction doit être achevée after the drapeaux");
+            assert_eq!(bus.mmu.read(0xC050), 0x10, "[HL]=$0F+1=$10 au 3ᵉ M-cycle");
+            let f = cpu.flags();
+            assert!(!f.contains(Flags::Z), "Z=0 car le résultat $10 n'est pas nul");
+            assert!(!f.contains(Flags::N), "N=0 par INC");
+            assert!(f.contains(Flags::H), "H posé : demi-mot bas passe de $0F à $xx");
+        }
+
+        // --- DEC (HL) ($35) : 3 M-cycles — fetch → [HL]→Z → [HL]=Z-1+drapeaux. ---
+        {
+            let mut mmu = MMU::new();
+            let mut rom = vec![0x00u8; 0x4000];
+            rom[0x0100] = 0x35; // DEC (HL)
+            mmu.load_rom(rom);
+            let mut cpu = CPU::new();
+            cpu.pc = 0x0100;
+            cpu.h = 0xC0;
+            cpu.l = 0x50;
+            mmu.write(0xC050, 0x00); // [HL]=$00 → résultat $FF : H posé (demi-mot bas $00→$xx), Z=0, N=1
+            let f_before = cpu.f;
+
+            let mut bus = Bus::new(&mut mmu);
+            let (c1, _) = cpu.tick(&mut bus);
+            assert_eq!(c1, 4, "DEC (HL) : the fetch doit consommer exactement un M-cycle (4 T)");
+            assert!(cpu.in_progress.is_some(), "l'instruction doit être en cours after the fetch");
+            assert_eq!(bus.mmu.read(0xC050), 0x00, "[HL] inchangé pendant the fetch");
+            assert_eq!(cpu.f, f_before, "drapeaux inchangés pendant the fetch");
+
+            let (c2, _) = cpu.tick(&mut bus);
+            assert_eq!(c2, 4, "DEC (HL) : the lecture [HL] doit consommer exactement un M-cycle (4 T)");
+            assert!(cpu.in_progress.is_some(), "l'instruction doit être en cours after the lecture [HL]");
+            assert_eq!(bus.mmu.read(0xC050), 0x00, "[HL] not yet written pendant the lecture");
+            assert_eq!(cpu.f, f_before, "drapeaux not yet posés pendant the lecture [HL]");
+
+            let (c3, _) = cpu.tick(&mut bus);
+            assert_eq!(c3, 4, "DEC (HL) : the écriture+drapeaux doit consommer exactement un M-cycle (4 T)");
+            assert!(cpu.in_progress.is_none(), "l'instruction doit être achevée after the drapeaux");
+            assert_eq!(bus.mmu.read(0xC050), 0xFF, "[HL]=$00-1=$FF au 3ᵉ M-cycle");
+            let f = cpu.flags();
+            assert!(!f.contains(Flags::Z), "Z=0 car le résultat $FF n'est pas nul");
+            assert!(f.contains(Flags::N), "N posé par DEC");
+            assert!(f.contains(Flags::H), "H posé : demi-mot bas passe de $00 à $xx (emprunt)");
+        }
+
+        // --- CB RLC b,(HL) ($CB 06) : 4 M-cycles — fetch $CB → sous-opcode → [HL]→Z → [HL]=RLC(Z)+drapeaux. ---
+        {
+            let mut mmu = MMU::new();
+            let mut rom = vec![0x00u8; 0x4000];
+            rom[0x0100] = 0xCB;
+            rom[0x0101] = 0x06; // RLC (HL)
+            mmu.load_rom(rom);
+            let mut cpu = CPU::new();
+            cpu.pc = 0x0100;
+            cpu.h = 0xC0;
+            cpu.l = 0x50;
+            mmu.write(0xC050, 0x80); // [HL]=$80 → RLC → $01 : C posé (bit7 décalé), Z=0
+            let f_before = cpu.f;
+
+            let mut bus = Bus::new(&mut mmu);
+            for m in 1..=3 {
+                let (c, _) = cpu.tick(&mut bus);
+                assert_eq!(c, 4, "CB RLC b,(HL) : M-cycle #{m} doit consommer exactement un M-cycle (4 T)");
+                assert!(cpu.in_progress.is_some(), "l'instruction doit être en cours before the last M-cycle");
+                assert_eq!(bus.mmu.read(0xC050), 0x80, "[HL] not yet written before the last M-cycle");
+                assert_eq!(cpu.f, f_before, "drapeaux not yet posés before the last M-cycle");
+            }
+            let (c4, _) = cpu.tick(&mut bus);
+            assert_eq!(c4, 4, "CB RLC b,(HL) : the écriture+drapeaux doit consommer exactement un M-cycle (4 T)");
+            assert!(cpu.in_progress.is_none(), "l'instruction doit être achevée after the drapeaux");
+            assert_eq!(bus.mmu.read(0xC050), 0x01, "[HL]=$80 RLC → $01 au 4ᵉ M-cycle");
+            let f = cpu.flags();
+            assert!(!f.contains(Flags::Z), "Z=0 car le résultat $01 n'est pas nul");
+            assert!(!f.contains(Flags::N), "N=0 par RLC");
+            assert!(!f.contains(Flags::H), "H=0 par RLC");
+            assert!(f.contains(Flags::C), "C posé : bit7 de $80 décalé");
+        }
+
+        // --- CB SWAP b,(HL) ($CB 36) : 4 M-cycles — [HL]=SWAP(Z)+drapeaux (Z, N=0, H=0, C effacé). ---
+        {
+            let mut mmu = MMU::new();
+            let mut rom = vec![0x00u8; 0x4000];
+            rom[0x0100] = 0xCB;
+            rom[0x0101] = 0x36; // SWAP (HL)
+            mmu.load_rom(rom);
+            let mut cpu = CPU::new();
+            cpu.pc = 0x0100;
+            cpu.h = 0xC0;
+            cpu.l = 0x50;
+            mmu.write(0xC050, 0xAB); // [HL]=$AB → SWAP → $BA : Z=0, H=0, C effacé (même si C était posé)
+            let f_before = cpu.f | Flags::C.bits(); // C posé à l'avance pour vérifier qu'il est effacé
+            cpu.f = f_before;
+
+            let mut bus = Bus::new(&mut mmu);
+            for m in 1..=3 {
+                let (c, _) = cpu.tick(&mut bus);
+                assert_eq!(c, 4, "CB SWAP b,(HL) : M-cycle #{m} doit consommer exactement un M-cycle (4 T)");
+                assert!(cpu.in_progress.is_some(), "l'instruction doit être en cours before the last M-cycle");
+                assert_eq!(bus.mmu.read(0xC050), 0xAB, "[HL] not yet written before the last M-cycle");
+            }
+            let (c4, _) = cpu.tick(&mut bus);
+            assert_eq!(c4, 4, "CB SWAP b,(HL) : the écriture+drapeaux doit consommer exactement un M-cycle (4 T)");
+            assert!(cpu.in_progress.is_none(), "l'instruction doit être achevée after the drapeaux");
+            assert_eq!(bus.mmu.read(0xC050), 0xBA, "[HL]=$AB SWAP → $BA au 4ᵉ M-cycle");
+            let f = cpu.flags();
+            assert!(!f.contains(Flags::Z), "Z=0 car le résultat $BA n'est pas nul");
+            assert!(!f.contains(Flags::H), "H=0 par SWAP");
+            assert!(!f.contains(Flags::C), "C effacé par SWAP (même si C était posé)");
+        }
+
+        // --- CB RES b,(HL) ($CB A6 = RES 4,(HL)) : 4 M-cycles — [HL]=Z & !(1<<bit) ; pas de drapeaux. ---
+        {
+            let mut mmu = MMU::new();
+            let mut rom = vec![0x00u8; 0x4000];
+            rom[0x0100] = 0xCB;
+            rom[0x0101] = 0xA6; // RES 4,(HL)
+            mmu.load_rom(rom);
+            let mut cpu = CPU::new();
+            cpu.pc = 0x0100;
+            cpu.h = 0xC0;
+            cpu.l = 0x50;
+            mmu.write(0xC050, 0xFF); // [HL]=$FF → RES 4 → $EF (bit 4 effacé) ; drapeaux inchangés
+            let f_before = Flags::Z.bits() | Flags::C.bits(); // F=$B1 : Z et C posés à préserver
+            cpu.f = f_before;
+
+            let mut bus = Bus::new(&mut mmu);
+            for m in 1..=3 {
+                let (c, _) = cpu.tick(&mut bus);
+                assert_eq!(c, 4, "CB RES b,(HL) : M-cycle #{m} doit consommer exactement un M-cycle (4 T)");
+                assert!(cpu.in_progress.is_some(), "l'instruction doit être en cours before the last M-cycle");
+                assert_eq!(bus.mmu.read(0xC050), 0xFF, "[HL] not yet written before the last M-cycle");
+                assert_eq!(cpu.f, f_before, "drapeaux inchangés before the last M-cycle");
+            }
+            let (c4, _) = cpu.tick(&mut bus);
+            assert_eq!(c4, 4, "CB RES b,(HL) : the écriture doit consommer exactement un M-cycle (4 T)");
+            assert!(cpu.in_progress.is_none(), "l'instruction doit être achevée after the écriture");
+            assert_eq!(bus.mmu.read(0xC050), 0xEF, "[HL]=$FF RES 4 → $EF au 4ᵉ M-cycle");
+            assert_eq!(cpu.f, f_before, "drapeaux inchangés par RES (Z et C préservés)");
+        }
+
+        // --- CB SET b,(HL) ($CB CE = SET 1,(HL)) : 4 M-cycles — [HL]=Z | (1<<bit) ; pas de drapeaux. ---
+        {
+            let mut mmu = MMU::new();
+            let mut rom = vec![0x00u8; 0x4000];
+            rom[0x0100] = 0xCB;
+            rom[0x0101] = 0xCE; // SET 1,(HL)
+            mmu.load_rom(rom);
+            let mut cpu = CPU::new();
+            cpu.pc = 0x0100;
+            cpu.h = 0xC0;
+            cpu.l = 0x50;
+            mmu.write(0xC050, 0x00); // [HL]=$00 → SET 1 → $02 (bit 1 posé) ; drapeaux inchangés
+            let f_before = Flags::Z.bits() | Flags::N.bits(); // F=$C0 : Z et N posés à préserver
+            cpu.f = f_before;
+
+            let mut bus = Bus::new(&mut mmu);
+            for m in 1..=3 {
+                let (c, _) = cpu.tick(&mut bus);
+                assert_eq!(c, 4, "CB SET b,(HL) : M-cycle #{m} doit consommer exactement un M-cycle (4 T)");
+                assert!(cpu.in_progress.is_some(), "l'instruction doit être en cours before the last M-cycle");
+                assert_eq!(bus.mmu.read(0xC050), 0x00, "[HL] not yet written before the last M-cycle");
+                assert_eq!(cpu.f, f_before, "drapeaux inchangés before the last M-cycle");
+            }
+            let (c4, _) = cpu.tick(&mut bus);
+            assert_eq!(c4, 4, "CB SET b,(HL) : the écriture doit consommer exactement un M-cycle (4 T)");
+            assert!(cpu.in_progress.is_none(), "l'instruction doit être achevée after the écriture");
+            assert_eq!(bus.mmu.read(0xC050), 0x02, "[HL]=$00 SET 1 → $02 au 4ᵉ M-cycle");
+            assert_eq!(cpu.f, f_before, "drapeaux inchangés par SET (Z et N préservés)");
+        }
+
+        // --- Couverture exhaustive : un cas par opcode individuel de la famille — [HL] et les drapeaux restent inchangés until the last M-cycle. ---
+        fn tick_sequence(bytes: &[u8], initial: u8) -> Vec<(u8, u8)> {
+            let mut mmu = MMU::new();
+            let mut rom = vec![0x00u8; 0x4000]; // ROM minimal : NOP partout
+            for (i, b) in bytes.iter().enumerate() {
+                rom[0x0100 + i] = *b;
+            }
+            mmu.load_rom(rom);
+            let mut cpu = CPU::new();
+            cpu.pc = 0x0100;
+            cpu.h = 0xC0; // HL=$C050 (WRAM, toujours écritable)
+            cpu.l = 0x50;
+            cpu.f = Flags::empty().bits(); // F=0 : tout drapeau posé avant le dernier M-cycle est détecté
+            mmu.write(0xC050, initial);
+            let mut bus = Bus::new(&mut mmu);
+            let mut seq = Vec::new();
+            loop {
+                let (_, _) = cpu.tick(&mut bus);
+                seq.push((bus.mmu.read(0xC050), cpu.f));
+                if cpu.in_progress.is_none() {
+                    break;
+                }
+            }
+            seq
+        }
+
+        // (octets de l'opcode, [HL] initial, [HL] attendu au dernier M-cycle) — un cas par opcode individuel.
+        let cases: &[(&[u8], u8, u8)] = &[
+            (&[0x34], 0x0F, 0x10), // INC (HL) : $0F → $10
+            (&[0x35], 0x00, 0xFF), // DEC (HL) : $00 → $FF
+            (&[0xCB, 0x06], 0x80, 0x01), // RLC b,(HL)
+            (&[0xCB, 0x0E], 0x01, 0x80), // RRC b,(HL)
+            (&[0xCB, 0x16], 0x7F, 0xFE), // RL b,(HL) (C=0)
+            (&[0xCB, 0x1E], 0x80, 0x40), // RR b,(HL) (C=0)
+            (&[0xCB, 0x26], 0x7F, 0xFE), // SLA b,(HL)
+            (&[0xCB, 0x2E], 0x80, 0xC0), // SRA b,(HL)
+            (&[0xCB, 0x36], 0xAB, 0xBA), // SWAP b,(HL)
+            (&[0xCB, 0x3E], 0x81, 0x40), // SRL b,(HL)
+            (&[0xCB, 0x86], 0xFF, 0xFE), // RES 0,(HL)
+            (&[0xCB, 0x8E], 0xFF, 0xFD), // RES 1,(HL)
+            (&[0xCB, 0x96], 0xFF, 0xFB), // RES 2,(HL)
+            (&[0xCB, 0x9E], 0xFF, 0xF7), // RES 3,(HL)
+            (&[0xCB, 0xA6], 0xFF, 0xEF), // RES 4,(HL)
+            (&[0xCB, 0xAE], 0xFF, 0xDF), // RES 5,(HL)
+            (&[0xCB, 0xB6], 0xFF, 0xBF), // RES 6,(HL)
+            (&[0xCB, 0xBE], 0xFF, 0x7F), // RES 7,(HL)
+            (&[0xCB, 0xC6], 0x00, 0x01), // SET 0,(HL)
+            (&[0xCB, 0xCE], 0x00, 0x02), // SET 1,(HL)
+            (&[0xCB, 0xD6], 0x00, 0x04), // SET 2,(HL)
+            (&[0xCB, 0xDE], 0x00, 0x08), // SET 3,(HL)
+            (&[0xCB, 0xE6], 0x00, 0x10), // SET 4,(HL)
+            (&[0xCB, 0xEE], 0x00, 0x20), // SET 5,(HL)
+            (&[0xCB, 0xF6], 0x00, 0x40), // SET 6,(HL)
+            (&[0xCB, 0xFE], 0x00, 0x80), // SET 7,(HL)
+        ];
+
+        for &(bytes, initial, expected_final) in cases {
+            let seq = tick_sequence(bytes, initial);
+            let n = seq.len();
+            assert_eq!(n, if bytes[0] == 0xCB { 4 } else { 3 }, "M-cycle count pour {:02X?}", bytes);
+            for (i, (hl, f)) in seq.iter().enumerate() {
+                if i < n - 1 {
+                    assert_eq!(*hl, initial, "[HL] doit rester ${:02X} avant le dernier M-cycle ({:02X?}, M#{})", initial, bytes, i + 1);
+                    assert_eq!(*f, 0, "drapeaux doivent rester F=0 before the last M-cycle ({:02X?}, M#{})", bytes, i + 1);
+                } else {
+                    assert_eq!(*hl, expected_final, "[HL] doit valoir ${:02X} au dernier M-cycle ({:02X?})", expected_final, bytes);
+                }
+            }
+        }
+    }
+
+    /// Étape 2 : la famille (HL) read-modify-write portée en micro-ops produit les mêmes effets d'observation que le chemin
+    /// legacy — [HL], drapeaux, PC — pour INC/DEC (HL), tous the CB rotate/shift b,(HL), et tous the CB RES/SET b,(HL).
+    #[test]
+    fn ported_hl_rmw_family_matches_legacy_side_effects() {
+        // Exécute l'instruction placée à $0100 (opcode + opérandes) with [HL]=mem_val and F=flags, then renvoie ([HL], F).
+        fn run(bytes: &[u8], mem_val: u8, flags: u8) -> (u8, u8) {
+            let mut mmu = MMU::new();
+            let mut rom = vec![0x00u8; 0x4000]; // ROM minimal : NOP partout
+            for (i, b) in bytes.iter().enumerate() {
+                rom[0x0100 + i] = *b;
+            }
+            mmu.load_rom(rom);
+            let mut cpu = CPU::new();
+            cpu.pc = 0x0100;
+            cpu.h = 0xC0; // HL=$C050 (WRAM, toujours écritable)
+            cpu.l = 0x50;
+            cpu.f = flags;
+            mmu.write(0xC050, mem_val);
+            let mut bus = Bus::new(&mut mmu);
+            loop {
+                let (_, _) = cpu.tick(&mut bus);
+                if cpu.in_progress.is_none() {
+                    break;
+                }
+            }
+            (bus.mmu.read(0xC050), cpu.f)
+        }
+
+        // --- INC (HL) : [HL]=old+1 ; Z=(r==0), N=0, H=((r&$0F)==0), C inchangé. ---
+        for &mem_val in &[0x00u8, 0x0F, 0x7F, 0xFF] {
+            let (res, f) = run(&[0x34], mem_val, Flags::C.bits()); // C posé à l'avance : doit être préservé
+            assert_eq!(res, mem_val.wrapping_add(1), "INC (HL) [HL]=${:02X}", mem_val);
+            let fl = Flags::from_bits_truncate(f);
+            assert!(!fl.contains(Flags::N), "INC (HL) : N=0");
+            assert_eq!(fl.contains(Flags::Z), res == 0, "INC (HL) : Z=(r==0)");
+            assert_eq!(fl.contains(Flags::H), (res & 0x0F) == 0, "INC (HL) : H=((r&$0F)==0)");
+            assert!(fl.contains(Flags::C), "INC (HL) : C préservé");
+        }
+
+        // --- DEC (HL) : [HL]=old-1 ; Z=(r==0), N=1, H=((r&$0F)==$0F), C inchangé. ---
+        for &mem_val in &[0x00u8, 0x10, 0x80, 0xFF] {
+            let (res, f) = run(&[0x35], mem_val, Flags::C.bits()); // C posé à l'avance : doit être préservé
+            assert_eq!(res, mem_val.wrapping_sub(1), "DEC (HL) [HL]=${:02X}", mem_val);
+            let fl = Flags::from_bits_truncate(f);
+            assert!(fl.contains(Flags::N), "DEC (HL) : N=1");
+            assert_eq!(fl.contains(Flags::Z), res == 0, "DEC (HL) : Z=(r==0)");
+            assert_eq!(fl.contains(Flags::H), (res & 0x0F) == 0x0F, "DEC (HL) : H=((r&$0F)==$0F)");
+            assert!(fl.contains(Flags::C), "DEC (HL) : C préservé");
+        }
+
+        // --- CB rotate/shift b,(HL) : [HL]=transform(old) ; Z=(r==0), N=0, H=0, C=décalé. ---
+        let cases: &[(u8, u8, u8)] = &[
+            (0x06, 0x80, 0x01), // RLC : $80 → $01
+            (0x0E, 0x01, 0x80), // RRC : $01 → $80
+            (0x16, 0x7F, 0xFE), // RL (C=0) : $7F → $FE
+            (0x1E, 0x80, 0x40), // RR (C=0) : $80 → $40
+            (0x26, 0x7F, 0xFE), // SLA : $7F → $FE
+            (0x2E, 0x80, 0xC0), // SRA : $80 → $C0
+            (0x36, 0xAB, 0xBA), // SWAP : $AB → $BA
+            (0x3E, 0x81, 0x40), // SRL : $81 → $40
+        ];
+        for &(sub, mem_val, expected) in cases {
+            let (res, f) = run(&[0xCB, sub], mem_val, Flags::empty().bits());
+            assert_eq!(res, expected, "CB ${:02X} b,(HL) [HL]=${:02X}", sub, mem_val);
+            let fl = Flags::from_bits_truncate(f);
+            assert!(!fl.contains(Flags::N), "CB rotate/shift : N=0");
+            assert!(!fl.contains(Flags::H), "CB rotate/shift : H=0");
+            assert_eq!(fl.contains(Flags::Z), res == 0, "CB rotate/shift : Z=(r==0)");
+        }
+
+        // --- CB RES b,(HL) : [HL]=old & !(1<<bit) ; pas de drapeaux. ---
+        for bit in 0..=7u8 {
+            let sub = 0x86 | (bit << 3); // RES b,(HL)
+            let f_before = Flags::Z.bits() | Flags::N.bits() | Flags::C.bits();
+            let (res, f) = run(&[0xCB, sub], 0xFF, f_before);
+            assert_eq!(res, 0xFF & !(1 << bit), "CB RES {} b,(HL)", bit);
+            assert_eq!(f, f_before, "CB RES {} : drapeaux inchangés", bit);
+        }
+
+        // --- CB SET b,(HL) : [HL]=old | (1<<bit) ; pas de drapeaux. ---
+        for bit in 0..=7u8 {
+            let sub = 0xC6 | (bit << 3); // SET b,(HL)
+            let f_before = Flags::Z.bits() | Flags::N.bits() | Flags::C.bits();
+            let (res, f) = run(&[0xCB, sub], 0x00, f_before);
+            assert_eq!(res, 1 << bit, "CB SET {} b,(HL)", bit);
+            assert_eq!(f, f_before, "CB SET {} : drapeaux inchangés", bit);
+        }
     }
 
     /// Test exhaustif générique (étape 1) : pour chacun des opcodes non préfixés — les deux branches des
