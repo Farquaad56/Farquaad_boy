@@ -1,33 +1,32 @@
 # Consigne de travail (en vigueur)
 
-**Chantier : corriger `timer.rs` (incrément TIMA et fenêtre de rechargement), phase 2 — correctif, sous condition.**
+**Exécuter l'Étape 2, point 3 du plan de refactoring CPU/Bus : porter la famille `(HL)` lecture-modification-écriture en micro-op.**
 
 ## Acquis (terminé, committé, ne pas retoucher sans mandat explicite)
-- Étape 1 (`d2701a1`), Étape 2 points 1 et 2 — familles `(HL)` écriture et lecture portées en micro-op (`12c107b`, `e6d662c`), rebranchement `step()` neutre.
-- Phase 1 de ce chantier (investigation) : cause racine identifiée et vérifiée indépendamment sur le code réel (clone du HEAD, lecture directe de `timer.rs`), deux bugs précis, pas une question d'ordre `Bus::read`/`Bus::write` global comme supposé initialement :
-  1. `tick()` fait avancer TIMA via un accumulateur de phase séparé (`timer_counter: u32`), découplé du compteur système partagé (`counter: u16`) que lit `DIV`. Une écriture sur `DIV` (`write_div`) remet `counter` à zéro mais ne touche jamais `timer_counter` → confirmé cause du fail de `div_write.s`.
-  2. `increment_tima()` recharge TMA dans TIMA **immédiatement** au débordement, sans jamais laisser TIMA lisible à `$00` pendant la fenêtre d'1 M-cycle documentée par Pan Docs/Mooneye → confirmé cause des fails de `tima_reload.s`, `tima_write_reloading.s`, `tma_write_reloading.s`.
-- Diagnostic Mooneye avec le code actuel (13 ROMs `acceptance/timer/`) : seul `rapid_toggle.s` passe ; les 12 autres échouent, tous rattachés aux deux causes ci-dessus.
+- Étape 1 : wrapper `Bus` + `Cpu::tick` + `MicroOp` + latches W/Z + table de cycles depuis `data/Opcodes.json` (`d2701a1`).
+- Étape 2 point 1 — `(HL)` écriture (`$70-75, $77, $36, $22, $32`), `$36` corrigé à 3 M-cycles (`12c107b`).
+- Étape 2 point 2 — `(HL)` lecture (`$46-7E, $0A, $1A, $F2, $F0, $FA, CB xx,(HL)` lecture seule/`BIT`) (`e6d662c`).
+- Chantier Timer : détection de front sur compteur partagé + fenêtre de rechargement `$00`, 13 ROMs Mooneye `acceptance/timer/` comme garde-fou permanent (`ca1aa54`, `0393a24`, `9ec315f`).
 
 ## Mandat actuel
-Corriger `timer.rs`, et uniquement `timer.rs`, pour :
+Porter la famille `(HL)` lecture-modification-écriture :
+- **`INC (HL)`** (`$34`), **`DEC (HL)`** (`$35`) — 3 M-cycles chacun (fetch, lecture, écriture).
+- **Tous les `CB xx,(HL)` sauf `BIT`** (déjà portés au point 2) — c'est-à-dire les rotations/décalages et `RES`/`SET` sur `(HL)` : `RLC/RRC/RL/RR/SLA/SRA/SWAP/SRL (HL)` (`CB 06/0E/16/1E/26/2E/36/3E`) et `RES b,(HL)`/`SET b,(HL)` (`CB 86-BE` pairs, `CB C6-FE` pairs) — 4 M-cycles chacun (fetch CB, fetch sous-opcode, lecture, écriture).
 
-1. **Dériver l'incrément de TIMA d'une détection de front sur le compteur système partagé (`counter`)**, pas d'un accumulateur séparé. Le mécanisme existe déjà et fonctionne pour les quirks d'écriture (`TAC_TRIGGER_BITS`, utilisé par `write_div`/`write_tac`) — il faut l'appliquer aussi au tick périodique normal : à chaque avancement de `counter`, détecter la transition 1→0 du bit sélectionné par `TAC_TRIGGER_BITS[tac & 0x03]` et déclencher `increment_tima()` sur cette transition, pas sur un seuil de cycles accumulés. Vérifie s'il est possible qu'un seul appel à `tick(cycles)` franchisse plusieurs fronts (selon la granularité d'appel réelle — M-cycle = 4 T, période minimale 16 T, donc a priori un seul front par appel, mais démontre-le plutôt que de le supposer) ; si oui, la détection doit gérer ce cas correctement.
-2. **Ajouter la fenêtre de rechargement `$00`** : après un débordement, TIMA doit rester lisible à `$00` pendant exactement 1 M-cycle avant que TMA n'y soit copié. Pendant cette fenêtre précise :
-   - une écriture sur TIMA doit être ignorée (`tima_write_reloading.s`) ;
-   - une écriture sur TMA doit modifier la valeur qui sera effectivement chargée (`tma_write_reloading.s`).
+Avant d'écrire le moindre code : cite le tableau M-cycle GBCTR chapitre 6 pour chaque opcode de cette liste (comme pour les deux familles précédentes) et croise avec `Opcodes.json`. Signale toute divergence entre le compte legacy et la référence — comme `$36` en son temps — avant de l'implémenter, ne la corrige pas silencieusement.
 
-Avant d'écrire le moindre code : relis les 5 sources assembleur Mooneye déjà lues en phase 1 (`div_write.s`, `tim00-11(_div_trigger).s`, `tima_reload.s`, `tima_write_reloading.s`, `tma_write_reloading.s`) et extrais-en un tableau exact des transitions d'état attendues (quel registre, quel M-cycle, quelle valeur), comme on l'a fait pour les tableaux M-cycle GBCTR — pas d'implémentation à l'aveugle.
+Point d'attention particulier : `INC (HL)`/`DEC (HL)` et les `CB (HL)` de cette famille modifient les flags **en plus** de lire-puis-écrire — vérifie que le calcul des flags a lieu au bon M-cycle (généralement au moment de la lecture, avant l'écriture) et ne dépend pas de la valeur déjà écrite.
 
-## Critère de sortie
-- Les 12 ROMs Mooneye `acceptance/timer/` actuellement en échec doivent passer (les 13, `rapid_toggle.s` inclus, doivent rester verts).
-- Les tests unitaires Rust existants de `timer.rs` (`div_increments_every_256_t_cycles`, `tima_periods_per_tac_select`, `overflow_reloads_tma_and_raises_interrupt_one_cycle_later`, `tac_write_can_tick_tima`, etc.) doivent rester verts — comparaison A/B, ensembles d'échecs, pas seulement totaux.
-- `cpu_instrs.gb` : 11/11 (ne doit pas être affecté, mais à vérifier).
-- Relancer `01-read_timing.gb` et `02-write_timing.gb` de Blargg : rapporter si le résidu observé sur les deux familles déjà portées (`$F0/$FA/CB xx,(HL)` et le groupe `$46..$7E/$F2/$0A/$1A`) évolue — c'est la confirmation croisée qu'on attend depuis le début de ce chantier.
+Méthode imposée, identique aux points précédents :
+1. Micro-programme + test d'entrelacement dédié par opcode (M-cycles séparés observables, adresse bus vérifiée où pertinent).
+2. A/B `cargo test` (ensembles d'échecs, pas totaux).
+3. `cpu_instrs` (11/11 attendu) + `mooneye_timer_roms_pass` (13/13, ne doit pas régresser).
+4. Relancer `03-modify_timing.gb` de Blargg — sortie brute avant/après. Rappel : le résidu peut rester stable même si le portage est correct, comme observé sur les deux familles précédentes ; ne pas chercher à forcer un passage au vert à tout prix sans en comprendre la cause si ça ne bouge pas.
+5. Ne committer qu'après mon feu vert explicite.
 
 ## Interdictions explicites
-- Ne toucher qu'à `timer.rs`. Ne pas modifier `Bus::read`/`Bus::write`, `mmu.rs`, ni le dispatch des micro-op CPU.
-- Ne pas porter de nouvelle famille d'instructions pendant ce chantier.
+- Ne pas porter d'autre famille au-delà de `(HL)` lecture-modification-écriture (PUSH/POP/CALL/RET/interruptions restent pour un mandat futur).
 - Ne pas toucher au PPU.
+- Ne pas retoucher `timer.rs`, `Bus::read`/`Bus::write` sans mandat explicite séparé.
 - Ne jamais modifier ce fichier (`AGENTS.md`) toi-même.
-- Ne pas committer sans mon feu vert explicite. Rapport d'abord (tableau des transitions attendues extrait des sources Mooneye), implémentation ensuite, seulement après confirmation que le tableau est correct.
+- Ne pas committer sans mon feu vert explicite.
