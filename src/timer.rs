@@ -15,19 +15,27 @@
 //!     | 10           | 64 T-cycles  | 65536 Hz   |
 //!     | 11           | 256 T-cycles | 16384 Hz   |
 //! - Quand TIMA déborde (passe de $FF à $00), il est rechargé depuis TMA ($FF06) et le
-//!   drapeau Timer (bit 2 de IF, $FF0F) est levé un cycle plus tard.
+//!   drapeau Timer (bit 2 de IF, $FF0F) est levé un cycle plus tard. Le rechargement n'est pas lisible
+//!   immédiatement : TIMA se lit `$00` pendant une fenêtre de rechargement d'1 M-cycle (4 T-cycles),
+//!   au cours de laquelle une écriture sur TIMA est ignorée et une écriture sur TMA change la valeur qui sera
+//!   effectivement chargée dans TIMA (Pan Docs « Timer » / Mooneye `tima_reload.s`,
+//!   `tima_write_reloading.s`, `tma_write_reloading.s`).
 //! - Comportement obscur : écrire $FF04 remet tout le compteur système à zéro ; si le bit
 //!   sélectionné était à 1, la remise à zéro envoie un « timer tick » immédiat (TIMA peut
 //!   s'incrémenter — et même déborder — sur une simple écriture de DIV). De même, écrire TAC
-//!   peut envoyer un unique tick quand le bit sélectionné passe d'un état à 1 vers un état à 0.
+//!   peut envoyer un tick unique quand le bit sélectionné passe d'un état à 1 vers un état à 0.
 
 /// Bits du compteur système sélectionnés par TAC (bits 1-0) pour l'incrément de TIMA.
 const TAC_TRIGGER_BITS: [u16; 4] = [1 << 9, 1 << 3, 1 << 5, 1 << 7];
 
+/// Durée de la fenêtre de rechargement en T-cycles : exactement 1 M-cycle (4 T). Cette même constante est
+/// le décalage structurel d'1 M-cycle par lequel l'action d'un front (l'incrément de TIMA) est retardée
+/// relativement au wrap physique du bit sélectionné.
+const RELOAD_WINDOW_LEN: u32 = 4;
+
 /// Timer de l'émulateur (registres $FF04-$FF07), synchronisé sur les T-cycles.
 #[allow(clippy::upper_case_acronyms)]
 #[derive(Default)]
-
 pub struct Timer {
     /// Compteur système interne : s'incrémente à chaque T-cycle quelle que soit la valeur de TAC ;
     /// DIV = bits [15..8]. Placé à $AB00 dans l'état post-boot ROM (DIV se lit alors $AB — PanDocs « Power Up Sequence »).
@@ -38,8 +46,9 @@ pub struct Timer {
     tma: u8,
     /// Registre TAC ($FF07) : seuls les bits 2-0 sont écriturables (bit 2 = enable).
     tac: u8,
-    /// Accumulateur de phase : T-cycles écoulés depuis le dernier tick de TIMA.
-    timer_counter: u32,
+    /// Valeur du compteur système (à la fin du tick) à laquelle le dernier débordement PÉRIODIQUE de TIMA a été appliqué.
+    /// La fenêtre de rechargement `$00` est active tant que `(counter - last_overflow) mod 2^16 < RELOAD_WINDOW_LEN`.
+    last_overflow: Option<u32>,
     /// Débordement en attente : l'interruption Timer sera levée au prochain `tick` (un cycle plus tard).
     pending_irq: bool,
 }
@@ -56,9 +65,13 @@ impl Timer {
         (self.counter >> 8) as u8
     }
 
-    /// Lecture de TIMA ($FF05).
+    /// Lecture de TIMA ($FF05) : se lit `$00` pendant la fenêtre de rechargement.
     pub fn read_tima(&self) -> u8 {
-        self.tima
+        if self.in_reload_window() {
+            0
+        } else {
+            self.tima
+        }
     }
 
     /// Lecture de TMA ($FF06).
@@ -81,18 +94,28 @@ impl Timer {
         let old = self.counter;
         self.counter = 0;
         if self.is_enabled() && (old & Self::trigger_bit(self.tac)) != 0 {
-            self.increment_tima();
+            if self.increment_tima() {
+                self.pending_irq = true;
+            }
         }
     }
 
-    /// Écriture de TIMA ($FF05).
+    /// Écriture de TIMA ($FF05) : ignorée pendant la fenêtre de rechargement.
     pub fn write_tima(&mut self, value: u8) {
-        self.tima = value;
+        if !self.in_reload_window() {
+            self.tima = value;
+        }
     }
 
-    /// Écriture de TMA ($FF06).
+    /// Écriture de TMA ($FF06) : toujours effective — y compris pendant la fenêtre de rechargement, où elle change
+    /// la valeur qui sera effectivement chargée dans TIMA (Mooneye `tma_write_reloading.s`).
     pub fn write_tma(&mut self, value: u8) {
         self.tma = value;
+        if self.in_reload_window() {
+            // TIMA suit la nouvelle valeur de TMA pendant la fenêtre : au débordement suivant (ou à la fin de la
+            // fenêtre), TIMA est rechargé avec cette valeur.
+            self.tima = value;
+        }
     }
 
     /// Écriture de TAC ($FF07) : seuls les bits 2-0 sont pris en compte.
@@ -107,7 +130,9 @@ impl Timer {
         if old_enabled && (self.counter & old_bit) != 0 {
             let new_bit = Self::trigger_bit(self.tac);
             if !self.is_enabled() || (self.counter & new_bit) == 0 {
-                self.increment_tima();
+                if self.increment_tima() {
+                    self.pending_irq = true;
+                }
             }
         }
     }
@@ -115,8 +140,8 @@ impl Timer {
     /// Fait avancer le timer de `cycles` T-cycles.
     /// Renvoie true si l'interruption Timer doit être levée (l'appelant doit alors poser le bit 2 du registre IF).
     pub fn tick(&mut self, cycles: u32) -> bool {
-        // Débordement en attente (depuis un tick précédent ou une écriture DIV/TAC) : levé maintenant,
-        // soit « un cycle plus tard » par rapport au débordement — Pan Docs « Timer Obscure Behaviour ».
+        // Débordement en attente (depuis un tick précédent ou une écriture DIV/TAC) : levé maintenant, soit « un cycle plus tard »
+        // par rapport au débordement — Pan Docs « Timer Obscure Behaviour ».
         let mut interrupt = false;
         if self.pending_irq {
             self.pending_irq = false;
@@ -124,7 +149,9 @@ impl Timer {
         }
 
         // DIV compte toujours (« DIV is always counting ») : le compteur système avance quelle que soit la valeur de TAC.
-        self.counter = self.counter.wrapping_add(cycles as u16);
+        let c0 = self.counter as u32;
+        let c1 = c0 + cycles;
+        self.counter = (c1 % 0x10000) as u16;
 
         if self.is_enabled() {
             let freq = match self.tac & 0x03 {
@@ -134,10 +161,26 @@ impl Timer {
                 _ => 256,
             };
 
-            self.timer_counter += cycles;
-            while self.timer_counter >= freq {
-                self.timer_counter -= freq;
-                self.increment_tima();
+            // Fronts 1→0 du bit sélectionné : les wraps w = k·freq (k ≥ 1) dont le point effectif e = w + RELOAD_WINDOW_LEN
+            // tombe dans [c0, c1). Le décalage d'1 M-cycle (+RELOAD_WINDOW_LEN) retarde l'action de chaque front relativement au
+            // wrap physique ; la borne haute stricte (e < c1) est l'off-by-one qui retarde l'incrément de 1 T-cycle.
+            // Le compte couvre tous les fronts franchis par ce tick — a priori un seul (la granularité d'appel est ≥ 4 T-cycles
+            // et la période minimale est de 16 T), mais la formule gère correctement le cas où une seule avance en franchit plusieurs.
+            let a = c0.saturating_sub(RELOAD_WINDOW_LEN).max(freq);
+            let b = c1.saturating_sub(RELOAD_WINDOW_LEN);
+            let fronts = if b > a {
+                ((b - 1) / freq).saturating_sub((a - 1) / freq)
+            } else {
+                0
+            };
+
+            for _ in 0..fronts {
+                if self.increment_tima() {
+                    // Le débordement périodique démarre la fenêtre de rechargement `$00` (active tant que le compteur système
+                    // est à moins de RELOAD_WINDOW_LEN T-cycles de c1, la fin de ce tick).
+                    self.last_overflow = Some(c1 % 0x10000);
+                    self.pending_irq = true;
+                }
             }
         }
 
@@ -154,17 +197,23 @@ impl Timer {
         TAC_TRIGGER_BITS[(tac & 0x03) as usize]
     }
 
-    /// Incrémente TIMA ; un débordement le recharge depuis TMA et met l'interruption en attente (levée au prochain `tick`).
-    fn increment_tima(&mut self) {
+    /// Incrémente TIMA de 1 ; renvoie `true` si cela a débordé (TIMA rechargé depuis TMA).
+    fn increment_tima(&mut self) -> bool {
         if self.tima == 0xFF {
-            log::debug!(
-                "TIMA débordement : rechargé depuis TMA=${:02X}, interruption Timer en attente",
-                self.tma
-            );
+            log::debug!("TIMA débordement : rechargé depuis TMA=${:02X}", self.tma);
             self.tima = self.tma;
-            self.pending_irq = true;
+            true
         } else {
             self.tima += 1;
+            false
+        }
+    }
+
+    /// La fenêtre de rechargement `$00` est-elle active (TIMA se lit `$00`, écriture de TIMA ignorée) ?
+    fn in_reload_window(&self) -> bool {
+        match self.last_overflow {
+            Some(ov) => (self.counter as u32).wrapping_sub(ov) < RELOAD_WINDOW_LEN,
+            None => false,
         }
     }
 }
@@ -226,13 +275,15 @@ mod tests {
         for (tac, period) in [(0x04u8, 1024u32), (0x05, 16), (0x06, 64), (0x07, 256)] {
             let mut t = Timer::new();
             t.write_tac(tac);
-            t.tick(period - 1);
-            assert_eq!(t.read_tima(), 0, "TAC=${tac:02X} : pas encore d'incrément");
+            // L'action du front est retardée par un décalage structurel d'1 M-cycle (+RELOAD_WINDOW_LEN) relativement au
+            // wrap physique : l'incrément ne devient visible que lorsque le compteur système a dépassé period + RELOAD_WINDOW_LEN.
+            t.tick(period + 4);
+            assert_eq!(t.read_tima(), 0, "TAC=${tac:02X} : pas encore d'incrément (décalage structurel d'1 M-cycle)");
             t.tick(1);
             assert_eq!(
                 t.read_tima(),
                 1,
-                "TAC=${tac:02X} : incrémenté à la période exacte"
+                "TAC=${tac:02X} : incrémenté à la période + décalage structurel d'1 M-cycle"
             );
         }
     }
@@ -240,32 +291,34 @@ mod tests {
     #[test]
     fn overflow_reloads_tma_and_raises_interrupt_one_cycle_later() {
         let mut t = Timer::new();
-        t.write_tac(0x07); // select 11 : tick toutes les 256 T-cycles
+        t.write_tac(0x07); // sélection 11 : tick toutes les 256 T-cycles
         t.write_tma(0x33);
         t.write_tima(0xFF);
 
-        assert!(!t.tick(256)); // le bit sélectionné passe à 0 → TIMA déborde, rechargé depuis TMA…
-        assert_eq!(t.read_tima(), 0x33);
-        assert!(t.tick(1)); // …mais l'interruption n'est demandée que le cycle suivant
+        assert!(!t.tick(261)); // compteur = 261 > e = 260 : le front déborde, rechargé depuis TMA ; interruption en attente (pas encore levée)
+        assert_eq!(t.read_tima(), 0x00); // …mais TIMA se lit `$00` pendant la fenêtre de rechargement d'1 M-cycle…
+        assert!(t.tick(4)); // …lève l'interruption (un cycle plus tard que le débordement) et passe la fenêtre
+        assert_eq!(t.read_tima(), 0x33); // …rechargé depuis TMA une fois la fenêtre passée
         assert!(!t.tick(1)); // et ne se répète pas (état de rechargement terminé)
     }
 
     #[test]
     fn tma_ff_divides_the_selected_clock() {
-        // TMA = $FF : every increment is an overflow → interruption à chaque tick du timer.
+        // TMA = $FF : chaque incrément est un débordement → interruption à chaque tick du timer.
         let mut t = Timer::new();
-        t.write_tac(0x05); // select 01 : tick toutes les 16 T-cycles
+        t.write_tac(0x05); // sélection 01 : tick toutes les 16 T-cycles
         t.write_tma(0xFF);
 
-        assert!(!t.tick(4_096)); // le 256e incrément (TIMA $FF → débordement) met l'interruption en attente…
-        assert_eq!(t.read_tima(), 0xFF); // …rechargé depuis TMA ($FF)
-        assert!(t.tick(1)); // …et demandée un cycle plus tard
+        assert!(!t.tick(4_101)); // compteur = 4101 > e = 4100 : le 256e incrément (w = 4096) déborde → interruption en attente, pas encore levée
+        assert_eq!(t.read_tima(), 0x00); // …TIMA se lit `$00` pendant la fenêtre de rechargement…
+        assert!(t.tick(4)); // …lève l'interruption (un cycle plus tard) et passe la fenêtre
+        assert_eq!(t.read_tima(), 0xFF); // …rechargé depuis TMA ($FF) une fois la fenêtre passée
     }
 
     #[test]
     fn div_write_resets_the_system_counter_and_can_tick_tima() {
         let mut t = Timer::new();
-        t.write_tac(0x05); // select 01 : bit 3 du compteur système
+        t.write_tac(0x05); // sélection 01 : bit 3 du compteur système
         t.tick(8); // compteur = 8 : le bit sélectionné est à 1
 
         t.write_div(0x42); // la valeur écrite est ignorée…
@@ -286,30 +339,30 @@ mod tests {
         t.tick(8); // bit 3 du compteur à 1
 
         t.write_div(0x00); // le « timer tick » envoyé par la remise à zéro déborde TIMA…
-        assert_eq!(t.read_tima(), 0x55); // …rechargé depuis TMA, interruption en attente
+        assert_eq!(t.read_tima(), 0x55); // …rechargé depuis TMA, interruption en attente (pas de fenêtre : quirk immédiat)
         assert!(t.tick(1)); // …demandée un cycle plus tard
     }
 
     #[test]
     fn tac_write_can_tick_tima() {
         let mut t = Timer::new();
-        // Le bit sélectionné (bit 7) est à 0 : changer la selection n'envoie pas de tick.
-        t.write_tac(0x07); // activé, select 11 (bit 7)
-        t.write_tac(0x05); // select 01 (bit 3) : l'ancien bit sélectionné est à 0 → pas de tick
+        // Le bit sélectionné (bit 7) est à 0 : changer la sélection n'envoie pas de tick.
+        t.write_tac(0x07); // activé, sélection 11 (bit 7)
+        t.write_tac(0x05); // sélection 01 (bit 3) : l'ancien bit sélectionné est à 0 → pas de tick
         assert_eq!(t.read_tima(), 0);
 
-        // Le bit sélectionné (bit 7) est à 1 et the new one (bit 3) is 0 : single tick.
-        t.write_tac(0x07); // select 11 (bit 7) : l'ancien bit sélectionné (bit 3, compteur = 0) est à 0 → pas de tick
+        // Le bit sélectionné (bit 7) est à 1 et le nouveau (bit 3) est à 0 : tick unique.
+        t.write_tac(0x07); // sélection 11 (bit 7) : l'ancien bit sélectionné (bit 3, compteur = 0) est à 0 → pas de tick
         assert_eq!(t.read_tima(), 0);
         t.tick(128); // compteur = 128 : bit 7 à 1, bit 3 à 0
-        t.write_tac(0x05); // select 01 (bit 3) : l'ancien bit sélectionné (bit 7) est à 1 et the new one is 0 → tick unique
+        t.write_tac(0x05); // sélection 01 (bit 3) : l'ancien bit sélectionné (bit 7) est à 1 et le nouveau est à 0 → tick unique
         assert_eq!(t.read_tima(), 1);
     }
 
     #[test]
     fn tac_write_disabling_the_timer_ticks_once() {
         let mut t = Timer::new();
-        t.write_tac(0x05); // activé, select 01 (bit 3)
+        t.write_tac(0x05); // activé, sélection 01 (bit 3)
         t.tick(8); // bit 3 à 1
 
         t.write_tac(0x01); // timer désactivé alors que le bit sélectionné est à 1 → tick unique
@@ -332,18 +385,18 @@ mod tests {
     #[test]
     fn overflow_reload_then_plain_writes() {
         let mut t = Timer::new();
-        t.write_tac(0x07); // select 11 : tick toutes les 256 T-cycles
+        t.write_tac(0x07); // sélection 11 : tick toutes les 256 T-cycles
         t.write_tma(0x33);
         t.write_tima(0xFF);
 
-        assert!(!t.tick(256)); // débordement : TIMA rechargé depuis TMA, interruption en attente…
-        assert_eq!(t.read_tima(), 0x33);
-        assert!(t.tick(1)); // …levée un cycle plus tard
+        assert!(!t.tick(261)); // débordement (e = 260 franchi) : TIMA rechargé depuis TMA, interruption en attente…
+        assert_eq!(t.read_tima(), 0x00); // …se lit `$00` pendant la fenêtre de rechargement d'1 M-cycle
+        assert!(t.tick(4)); // …levée un cycle plus tard et passe la fenêtre
 
-        t.write_tma(0x44); // écriture simple : pas de fenêtre de rechargement particulière…
+        t.write_tma(0x44); // écriture simple hors fenêtre : pas de recopie…
         assert_eq!(t.read_tma(), 0x44);
         assert_eq!(t.read_tima(), 0x33); // …TIMA n'est pas recopié depuis TMA avant le prochain tick
-        t.write_tima(0x55); // écriture simple : prise en compte immédiatement
+        t.write_tima(0x55); // écriture simple hors fenêtre : prise en compte immédiatement
         assert_eq!(t.read_tima(), 0x55);
     }
 }
