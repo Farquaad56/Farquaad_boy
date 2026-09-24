@@ -832,8 +832,10 @@ mod tests {
         }
 
         // Horloge matérielle indépendante (le Timer) : chaque appel tick avance le matériel d'EXACTEMENT un M-cycle.
-        // TAC=$05 active le timer avec la période la plus fine (16 T). Huit instructions portées = 16 M-cycles = 64 T,
-        // donc TIMA doit valoir 64/16 = 4 — ce qui ne tient que si chaque tick a bien fait progresser le matériel de 4 T.
+        // TAC=$05 active le timer avec la période la plus fine (16 T). Huit instructions portées = 16 M-cycles = 64 T.
+        // Le décalage structurel d'1 M-cycle (RELOAD_WINDOW_LEN) retarde l'action de chaque front relativement au wrap physique :
+        // sur ces 64 T, seuls les fronts aux points effectifs e=20/36/52 tombent dans la fenêtre (le 4ᵉ, à e=68, passe au-delà),
+        // donc TIMA doit valoir 3 — ce qui ne tient que si chaque tick a bien fait progresser le matériel de 4 T.
         let mut mmu = MMU::new();
         let rom = vec![0x77u8; 0x4000]; // LD (HL),A répété : huit instructions consécutives à $0100-$0107
         let mut cpu = CPU::new();
@@ -852,8 +854,8 @@ mod tests {
         assert_eq!(cpu.pc, 0x0108); // les huit instructions ont bien été exécutées
         assert_eq!(
             bus.mmu.read(0xFF05), // lecture brute (pas de tick) : TIMA après 64 T
-            4,
-            "TIMA doit valoir 64 T / 16 T = 4 : chaque tick a avancé le matériel d'un M-cycle"
+            3,
+            "TIMA doit valoir 3 sur ces 64 T (décalage structurel d'1 M-cycle, RELOAD_WINDOW_LEN) : chaque tick a avancé le matériel d'un M-cycle"
         );
     }
 
@@ -1172,9 +1174,11 @@ mod tests {
             assert!(f.contains(Flags::H), "H posé par BIT");
         }
 
-        // Horloge matérielle indépendante (the Timer) : each appel tick avance the matériel d'EXACTEMENT un M-cycle.
-        // TAC=$05 active the timer with the period la plus fine (16 T). Huit instructions portées = 16 M-cycles = 64 T,
-        // donc TIMA doit valoir 64/16 = 4 — ce qui ne tient que si each tick a bien fait progresser the matériel of 4 T.
+        // Horloge matérielle indépendante (le Timer) : chaque appel tick avance le matériel d'EXACTEMENT un M-cycle.
+        // TAC=$05 active le timer avec la période la plus fine (16 T). Huit instructions portées = 16 M-cycles = 64 T.
+        // Le décalage structurel d'1 M-cycle (RELOAD_WINDOW_LEN) retarde l'action de chaque front relativement au wrap physique :
+        // sur ces 64 T, seuls les fronts aux points effectifs e=20/36/52 tombent dans la fenêtre (le 4ᵉ, à e=68, passe au-delà),
+        // donc TIMA doit valoir 3 — ce qui ne tient que si chaque tick a bien fait progresser le matériel de 4 T.
         let mut mmu = MMU::new();
         let rom = vec![0x7Eu8; 0x4000]; // LD A,(HL) répété : huit instructions consécutives à $0100-$0107
         let mut cpu = CPU::new();
@@ -1192,9 +1196,9 @@ mod tests {
         }
         assert_eq!(cpu.pc, 0x0108); // les huit instructions ont bien été exécutées
         assert_eq!(
-            bus.mmu.read(0xFF05), // lecture brute (pas de tick) : TIMA after 64 T
-            4,
-            "TIMA doit valoir 64 T / 16 T = 4 : each tick a avancé the matériel d'un M-cycle"
+            bus.mmu.read(0xFF05), // lecture brute (pas de tick) : TIMA après 64 T
+            3,
+            "TIMA doit valoir 3 sur ces 64 T (décalage structurel d'1 M-cycle, RELOAD_WINDOW_LEN) : chaque tick a avancé le matériel d'un M-cycle"
         );
     }
 

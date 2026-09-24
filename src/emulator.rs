@@ -608,7 +608,10 @@ mod tests {
         emu.run_tcycles(300); // > 256 : le débordement a eu lieu (+ un cycle pour lever le drapeau)
 
         assert_eq!(emu.mmu.io[0x0F] & 0x04, 0x04); // bit 2 de IF levé par le débordement de TIMA
-        assert_eq!(emu.mmu.read(0xFF05), 0x33); // TIMA rechargé depuis TMA
+        // Le compteur démarre aligné sur un front de période 256 ($AB00 = 171×256) : deux fronts tombent dans la fenêtre de
+        // run_tcycles(300) (w=$AB00 et w=$AC20, points effectifs e=w+4). Le premier déborde TIMA (rechargé depuis TMA=$33),
+        // le second l'incrémente d'un pas → $34.
+        assert_eq!(emu.mmu.read(0xFF05), 0x34); // TIMA rechargé depuis TMA ($33) puis incrémenté d'un pas (2ᵉ front de période 256)
         assert_eq!(emu.mmu.read(0xFF04), 0xAC); // DIV a avancé d'un pas : compteur $AB00 (post-boot) + ~300 T-cycles → $ACxx
     }
 
@@ -1121,6 +1124,117 @@ mod tests {
         for (frame, pc, sp, tima) in &samples {
             println!("      frame {:>5} : PC=${:04X} SP=${:04X} TIMA={:02X}", frame, pc, sp, tima);
         }
+    }
+
+    // Garde-fou de non-régression permanent : exécute les 13 ROMs Mooneye `acceptance/timer/` headless et vérifie que chacune
+    // produit exactement les valeurs de registres attendues par sa source assembleur. C'est le seul test automatisé couvrant
+    // l'ensemble des comportements Timer validés par la suite Mooneye (incrément de TIMA, fenêtre de rechargement `$00`,
+    // écritures DIV/TAC/TMA) — il doit rester vert à chaque modification du timer.
+    /// Valeurs attendues des registres capturés par `setup_assertions` (HRAM $FF89-$FF90 : f,a,c,b,e,d,l,h),
+    /// extraites des sources assembleur Mooneye (`acceptance/timer/*.s`). `None` = registre non vérifié.
+    struct TimerExpected {
+        b: Option<u8>,
+        c: Option<u8>,
+        d: Option<u8>,
+        e: Option<u8>,
+        h: Option<u8>,
+        l: Option<u8>,
+    }
+
+    /// Vérifie que les 13 ROMs Mooneye `acceptance/timer/` produisent exactement les valeurs de registres
+    /// attendues par leurs sources (passage du test = toutes les assertions satisfaites) — garde-fou permanent, pas de repli silencieux.
+    #[test]
+    fn mooneye_timer_roms_pass() {
+        const MAX_FRAMES: u32 = 400;
+        let cases: &[(&str, TimerExpected)] = &[
+            // div_write : pas de setup_assertions — passe si aucune interruption timer ne se déclenche (pas de "FAIL" en série).
+            ("div_write.gb", TimerExpected { b: None, c: None, d: None, e: None, h: None, l: None }),
+            // rapid_toggle : assert_b $FF / assert_c $D9 (l'interruption se déclenche au bon moment).
+            ("rapid_toggle.gb", TimerExpected { b: Some(0xFF), c: Some(0xD9), d: None, e: None, h: None, l: None }),
+            // timXX : assert_d / assert_e (frontière exacte d'incrément après reset du compteur DIV).
+            ("tim00_div_trigger.gb", TimerExpected { b: None, c: None, d: Some(0x04), e: Some(0x05), h: None, l: None }),
+            ("tim00.gb", TimerExpected { b: None, c: None, d: Some(0x04), e: Some(0x05), h: None, l: None }),
+            ("tim01_div_trigger.gb", TimerExpected { b: None, c: None, d: Some(0x0A), e: Some(0x0B), h: None, l: None }),
+            ("tim01.gb", TimerExpected { b: None, c: None, d: Some(0x08), e: Some(0x09), h: None, l: None }),
+            ("tim10_div_trigger.gb", TimerExpected { b: None, c: None, d: Some(0x05), e: Some(0x06), h: None, l: None }),
+            ("tim10.gb", TimerExpected { b: None, c: None, d: Some(0x04), e: Some(0x05), h: None, l: None }),
+            ("tim11_div_trigger.gb", TimerExpected { b: None, c: None, d: Some(0x04), e: Some(0x05), h: None, l: None }),
+            ("tim11.gb", TimerExpected { b: None, c: None, d: Some(0x04), e: Some(0x05), h: None, l: None }),
+            // tima_reload : fenêtre $00 puis rechargement depuis TMA.
+            ("tima_reload.gb", TimerExpected { b: Some(0xFE), c: Some(0xFE), d: Some(0xFF), e: Some(0x00), h: Some(0xFF), l: Some(0x00) }),
+            // tima_write_reloading : écriture TIMA ignorée pendant la fenêtre de rechargement.
+            ("tima_write_reloading.gb", TimerExpected { b: None, c: Some(0xFE), d: Some(0x80), e: Some(0x7F), h: None, l: Some(0x7F) }),
+            // tma_write_reloading : écriture TMA modifie la valeur effectivement rechargée.
+            ("tma_write_reloading.gb", TimerExpected { b: None, c: Some(0xFE), d: Some(0x7F), e: Some(0x7F), h: None, l: Some(0xFE) }),
+        ];
+
+        let mut all_pass = true;
+        for (rom_name, exp) in cases {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("rom")
+                .join("Mooneye-gb")
+                .join("acceptance")
+                .join("timer")
+                .join(rom_name);
+            let rom = std::fs::read(&path)
+                .unwrap_or_else(|err| panic!("impossible de lire {} : {err}", path.display()));
+            let mut emu = Emulator::new();
+            emu.load_rom(rom);
+            let mut out: Vec<u8> = Vec::new();
+            // div_write tourne une boucle de 65536 itérations (~40 frames) : on ne s'arrête pas sur un PC « figé »
+            // (faux positif possible en milieu de boucle), on laisse courir jusqu'à la fin. Les autres ROMs s'arrêtent
+            // dès qu'elles tournent dans leur `quit@halt` (PC identique sur 3 frames consécutives).
+            let is_div = *rom_name == "div_write.gb";
+            let mut last_pc: [u16; 3] = [0; 3];
+            for _ in 0..MAX_FRAMES {
+                emu.run_tcycles(FRAME_TCYCLES);
+                out.extend(emu.mmu.serial.take_transcript());
+                if !is_div {
+                    last_pc.rotate_left(1);
+                    last_pc[2] = emu.cpu.pc;
+                    if last_pc[0] == last_pc[1] && last_pc[1] == last_pc[2] {
+                        break; // PC figé : la ROM est dans sa boucle d'arrêt.
+                    }
+                }
+            }
+
+            // Registres capturés par setup_assertions (HRAM $FF89-$FF90) + registres vivants en contrôle croisé.
+            let hram = |addr: u16| emu.mmu.read(addr);
+            let (cap_c, cap_b, cap_e, cap_d, cap_l, cap_h) =
+                (hram(0xFF8B), hram(0xFF8C), hram(0xFF8D), hram(0xFF8E), hram(0xFF8F), hram(0xFF90));
+            let live_b = emu.cpu.b;
+            let live_c = emu.cpu.c;
+            let live_e = emu.cpu.e;
+            let live_d = emu.cpu.d;
+            let live_l = emu.cpu.l;
+            let live_h = emu.cpu.h;
+
+            // div_write : passe si aucune interruption timer ne s'est déclenchée (pas de chaîne "FAIL" en série).
+            // Les autres ROMs : on compare les registres CAPTURÉS par setup_assertions (ce que quit_check_asserts
+            // confronte aux constantes attendues) — pas les registres vivants, que la logique de `quit` écrase ensuite.
+            let text = String::from_utf8_lossy(&out);
+            let pass = if is_div {
+                !text.contains("FAIL")
+            } else {
+                let mut ok = true;
+                if let Some(v) = exp.b { ok &= cap_b == v; }
+                if let Some(v) = exp.c { ok &= cap_c == v; }
+                if let Some(v) = exp.d { ok &= cap_d == v; }
+                if let Some(v) = exp.e { ok &= cap_e == v; }
+                if let Some(v) = exp.h { ok &= cap_h == v; }
+                if let Some(v) = exp.l { ok &= cap_l == v; }
+                ok
+            };
+            all_pass &= pass;
+            println!(
+                "{} {} : PC=${:04X} | capturé b={:02X} c={:02X} d={:02X} e={:02X} h={:02X} l={:02X} | vivant b={:02X} c={:02X} d={:02X} e={:02X} h={:02X} l={:02X}",
+                if pass { "PASS" } else { "FAIL" },
+                rom_name, emu.cpu.pc,
+                cap_b, cap_c, cap_d, cap_e, cap_h, cap_l,
+                live_b, live_c, live_d, live_e, live_h, live_l,
+            );
+        }
+        assert!(all_pass, "au moins une ROM Mooneye timer ne produit pas les valeurs attendues");
     }
 
     /// Smoke test visuel headless : charge la ROM réelle Tetris.GB (NROM 32 KiB) et vérifie que le rendu du
