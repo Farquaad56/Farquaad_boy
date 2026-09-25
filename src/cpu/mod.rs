@@ -107,7 +107,73 @@ impl ValSrc {
             ValSrc::E => cpu.e = value,
             ValSrc::H => cpu.h = value,
             ValSrc::L => cpu.l = value,
-            ValSrc::W | ValSrc::Z => {} // pas un registre cible valide pour LoadReg
+            ValSrc::W | ValSrc::Z => {} // pas un registre cible valide for LoadReg
+        }
+    }
+}
+
+/// Source of the 16-bit value pushed on the stack in a micro-op (D2): a register pair or PC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushSrc {
+    /// Register pair BC.
+    Bc,
+    /// Register pair DE.
+    De,
+    /// Register pair HL.
+    Hl,
+    /// Register pair AF.
+    Af,
+    /// Program counter PC (CALL / RST / interrupt dispatch).
+    Pc,
+}
+
+impl PushSrc {
+    /// Resolves the 16-bit value to push from the current state of the CPU.
+    fn value(&self, cpu: &CPU) -> u16 {
+        match self {
+            PushSrc::Bc => ((cpu.b as u16) << 8) | cpu.c as u16,
+            PushSrc::De => ((cpu.d as u16) << 8) | cpu.e as u16,
+            PushSrc::Hl => cpu.hl(),
+            PushSrc::Af => cpu.af(),
+            PushSrc::Pc => cpu.pc,
+        }
+    }
+}
+
+/// The 16-bit register pair written back by a POP in a micro-op (D2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reg16 {
+    /// Register pair BC.
+    Bc,
+    /// Register pair DE.
+    De,
+    /// Register pair HL.
+    Hl,
+    /// Register pair AF (F receives bits 7..4 only).
+    Af,
+}
+
+impl Reg16 {
+    /// Writes the latches W (msb) / Z (lsb) back into the register pair.
+    fn store(&self, cpu: &mut CPU) {
+        match self {
+            Reg16::Bc => {
+                cpu.b = cpu.w;
+                cpu.c = cpu.z;
+            }
+            Reg16::De => {
+                cpu.d = cpu.w;
+                cpu.e = cpu.z;
+            }
+            Reg16::Hl => {
+                cpu.h = cpu.w;
+                cpu.l = cpu.z;
+            }
+            Reg16::Af => {
+                cpu.a = cpu.w;
+                // F reçoit les bits 7..4 uniquement (octet bas préservé via set_flags) — identique au chemin legacy.
+                cpu.set_flags(Flags::from_bits_truncate(cpu.z));
+            }
         }
     }
 }
@@ -116,7 +182,7 @@ impl ValSrc {
 /// Les instructions portées en micro-ops sont exécutées pas-à-pas : [`CPU::tick`] consomme un micro-op de
 /// [`InProgress::steps`] par appel, jusqu'à épuisement. Étape 2 : seules les familles portées produisent des
 /// séquences ; toutes les autres instructions restent sur le chemin atomique legacy.
-#[allow(dead_code)] // Étape 2 : `FetchOpcode` / `ReadMem` / `StorePcByte` / `Internal` ne sont pas encore construits par une famille portée ; portés plus tard.
+#[allow(dead_code)] // Étape 2 : `FetchOpcode` / `ReadMem` / `StorePcByte` ne sont pas encore construits par une famille portée ; portés plus tard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MicroOp {
     /// Lit l'opcode à PC → latch Z ; le PC avance d'un octet.
@@ -147,6 +213,32 @@ pub enum MicroOp {
     ResSetHl(bool, u8),
     /// Pas interne (aucun accès bus) — ex. calcul de drapeaux ; le matériel avance quand même d'un M-cycle.
     Internal,
+
+    // --- Famille PUSH / CALL / RST / dispatch d'interruption (D2) ---
+    /// SP = SP - 1 (interne, aucun accès bus). M2 of PUSH rr, M4 of CALL/RST/dispatch.
+    DecSp,
+    /// Écrit l'octet HAUT de `src` dans [SP] puis SP -= 1 — un seul accès + tick. (PUSH rr / CALL / RST / dispatch)
+    PushHigh(PushSrc),
+    /// Écrit l'octet BAS de `src` dans [SP] — un seul accès + tick. Pas de changement de PC (PUSH rr).
+    PushLow(PushSrc),
+    /// Écrit l'octet bas de PC dans [SP] puis PC = WZ (depuis les latches) — un seul accès + tick. (CALL a16 / CALL cc,a16)
+    PushLowJumpWz,
+    /// Écrit l'octet bas de PC dans [SP] puis PC = `target` (vecteur de restart fixe) — un seul accès + tick. (RST n8)
+    PushLowSetPc(u16),
+
+    // --- Famille POP / RET / RETI (D2) ---
+    /// Z = read[SP] ; SP += 1 — un seul accès + tick. (POP rr / RET lsb)
+    PopToZ,
+    /// W = read[SP] ; SP += 1 ; puis `reg` = WZ (writeback) — un seul accès + tick. (POP rr msb)
+    PopMsb(Reg16),
+    /// W = read[SP] ; SP += 1 — un seul accès + tick. Pas de writeback (RET / RETI msb).
+    PopToW,
+    /// PC = WZ (depuis les latches) — aucun accès bus, mais le matériel avance d'un M-cycle. (RET)
+    SetPcWz,
+    /// PC = WZ ; IME = 1 — aucun accès bus, but the matériel advances d'un M-cycle. (RETI)
+    Reti,
+    /// PC = `target` (vecteur fixe) — aucun accès bus, but the matériel advances d'un M-cycle. (dispatch d'interruption)
+    SetPc(u16),
 }
 
 /// Opération de rotation/décalage CB sur (HL) (D2) : l'octet lu dans Z est transformé puis réécrit en [HL].
@@ -292,9 +384,14 @@ impl CPU {
 
         // Check for interrupts before fetching the next opcode (also exits HALT — see handle_interrupts).
         // Accès brut au MMU via le champ public du bus (pas de tick par accès) ; l'avancement est fait en bloc.
-        let int_cycles = opcodes::handle_interrupts(self, bus.mmu);
-        if let Some(cycles) = int_cycles {
-            return (cycles, bus.advance(cycles)); // un halt_bug posé par la sortie de HALT persiste jusqu'au fetch suivant
+        let int_steps = opcodes::handle_interrupts(self, bus.mmu);
+        if let Some(steps) = int_steps {
+            // Le dispatch d'interruption (5 M-cycles) est exécuté pas-à-pas via le mécanisme D2 : le premier M-cycle
+            // (Internal) is consommé ici ; les 4 suivants sont avancés par the ticks qui suivent. Un halt_bug posé par la
+            // sortie de HALT persiste jusqu'au fetch suivant (il n'est pas posé quand une interruption est servie).
+            self.in_progress = Some(InProgress { steps });
+            let frame_done = bus.tick_m_cycle();
+            return (4, frame_done);
         }
 
         // If halted and no interrupt is pending, consume 4 T-cycles (HALT loop).
@@ -344,7 +441,7 @@ impl CPU {
         // Pour le préfixe CB, l'octet sous-opcode est lu brutalement (décodage) afin de construire le programme ; il est
         // re-lu par ReadPcByte au M-cycle suivant (M2), qui consomme ce M-cycle et avance le PC.
         let cb_sub = if opcode == 0xCB { Some(bus.mmu.read(self.pc)) } else { None };
-        if let Some(steps) = ported_steps(opcode, cb_sub) {
+        if let Some(steps) = ported_steps(self, opcode, cb_sub) {
             self.in_progress = Some(InProgress { steps });
             let frame_done = bus.tick_m_cycle(); // le fetch (lu brutalement ci-dessus) a consommé un M-cycle
             return (4, frame_done);
@@ -362,6 +459,18 @@ impl CPU {
         }
         let frame_done = bus.advance(cycles);
         (cycles, frame_done)
+    }
+
+    /// Exécute une séquence de micro-ops pas-à-pas (mécanisme D2) : chaque micro-op consomme un M-cycle via [`CPU::tick`].
+    /// Renvoie le total de T-cycles consommés. Utilisé par les tests pour exécuter le dispatch d'interruption construit
+    /// par [`opcodes::handle_interrupts`] sans repasser par la détection (IME est déjà désactivé au moment du service).
+    pub fn run_micro_ops(&mut self, bus: &mut Bus, steps: VecDeque<MicroOp>) -> u32 {
+        let mut total = 0;
+        self.in_progress = Some(InProgress { steps });
+        while self.in_progress.is_some() {
+            total += self.tick(bus).0;
+        }
+        total
     }
 
     /// Exécute un M-cycle d'une instruction portée en cours d'exécution pas-à-pas (mécanisme D2). Consomme
@@ -518,6 +627,75 @@ impl CPU {
             MicroOp::Internal => {
                 bus.idle_m_cycle() // pas interne : aucun accès bus, mais le matériel avance d'un M-cycle
             }
+            MicroOp::DecSp => {
+                self.sp = self.sp.wrapping_sub(1); // SP -= 1 — pas d'accès bus, but the matériel advances d'un M-cycle
+                bus.idle_m_cycle()
+            }
+            MicroOp::PushHigh(src) => {
+                // M-cycle combiné : écrit l'octet haut de `src` dans [SP] puis SP -= 1 — un seul accès + tick.
+                let value = src.value(self);
+                let addr = self.sp;
+                let fd = bus.write(addr, (value >> 8) as u8); // accès + tick (D1) : octet haut à [SP]
+                self.sp = self.sp.wrapping_sub(1);            // SP -= 1
+                fd
+            }
+            MicroOp::PushLow(src) => {
+                // M-cycle combiné : écrit l'octet bas de `src` dans [SP] — un seul accès + tick.
+                let value = src.value(self);
+                bus.write(self.sp, (value & 0xFF) as u8) // accès + tick (D1) : octet bas à [SP]
+            }
+            MicroOp::PushLowJumpWz => {
+                // M-cycle combiné : écrit l'octet bas de PC dans [SP] puis PC = WZ — un seul accès + tick.
+                let value = self.pc;
+                let fd = bus.write(self.sp, (value & 0xFF) as u8); // accès + tick (D1) : octet bas à [SP]
+                self.pc = ((self.w as u16) << 8) | self.z as u16;  // PC = WZ
+                fd
+            }
+            MicroOp::PushLowSetPc(target) => {
+                // M-cycle combiné : écrit l'octet bas de PC dans [SP] puis PC = target — un seul accès + tick.
+                let value = self.pc;
+                let fd = bus.write(self.sp, (value & 0xFF) as u8); // accès + tick (D1) : octet bas à [SP]
+                self.pc = target;                                  // PC = vecteur de restart
+                fd
+            }
+            MicroOp::PopToZ => {
+                // M-cycle combiné : Z = read[SP] puis SP += 1 — un seul accès + tick.
+                let (value, fd) = bus.read(self.sp); // accès + tick (D1)
+                self.z = value;
+                self.sp = self.sp.wrapping_add(1);   // SP += 1
+                fd
+            }
+            MicroOp::PopMsb(reg) => {
+                // M-cycle combiné : W = read[SP] puis SP += 1, then `reg` = WZ (writeback) — un seul accès + tick.
+                let (value, fd) = bus.read(self.sp); // accès + tick (D1)
+                self.w = value;
+                self.sp = self.sp.wrapping_add(1);   // SP += 1
+                reg.store(self);                     // registre ← WZ
+                fd
+            }
+            MicroOp::PopToW => {
+                // M-cycle combiné : W = read[SP] puis SP += 1 — un seul accès + tick.
+                let (value, fd) = bus.read(self.sp); // accès + tick (D1)
+                self.w = value;
+                self.sp = self.sp.wrapping_add(1);   // SP += 1
+                fd
+            }
+            MicroOp::SetPcWz => {
+                // M-cycle combiné : PC = WZ — pas d'accès bus, but the matériel advances d'un M-cycle.
+                self.pc = ((self.w as u16) << 8) | self.z as u16;
+                bus.idle_m_cycle()
+            }
+            MicroOp::Reti => {
+                // M-cycle combiné : PC = WZ ; IME = 1 — pas d'accès bus, but the matériel advances d'un M-cycle.
+                self.pc = ((self.w as u16) << 8) | self.z as u16;
+                self.ime = true; // RETI réactive IME (le bit IF correspondant a déjà été effacé par le matériel au moment du service)
+                bus.idle_m_cycle()
+            }
+            MicroOp::SetPc(target) => {
+                // M-cycle combiné : PC = target — pas d'accès bus, but the matériel advances d'un M-cycle.
+                self.pc = target;
+                bus.idle_m_cycle()
+            }
         };
 
         if prog.steps.is_empty() {
@@ -542,7 +720,7 @@ impl CPU {
 /// le chemin atomique legacy. Le fetch a déjà consommé un M-cycle dans [`CPU::tick`] ; chaque micro-op ci-dessous en
 /// consomme un supplémentaire, donc le total = 1 + steps.len() doit égaler le nombre de M-cycles du chemin legacy
 /// (vérifié contre `expected_cycles`).
-fn ported_steps(opcode: u8, cb_sub: Option<u8>) -> Option<VecDeque<MicroOp>> {
+fn ported_steps(cpu: &CPU, opcode: u8, cb_sub: Option<u8>) -> Option<VecDeque<MicroOp>> {
     let mut steps = VecDeque::new();
     match opcode {
         // --- Famille (HL) write ---
@@ -651,6 +829,79 @@ fn ported_steps(opcode: u8, cb_sub: Option<u8>) -> Option<VecDeque<MicroOp>> {
             } else {
                 return None; // autre forme CB — reste sur le chemin legacy
             }
+        }
+
+        // --- Famille PUSH rr : 4 M-cycles (fetch + DecSp + PushHigh + PushLow). Pas de drapeaux. ---
+        // GBCTR chapitre 6 : SP-=1 (M2), [SP]=msb(rr) & SP-=1 (M3), [SP]=lsb(rr) (M4). L'octet haut est poussé en premier.
+        0xC5 => { steps.push_back(MicroOp::DecSp); steps.push_back(MicroOp::PushHigh(PushSrc::Bc)); steps.push_back(MicroOp::PushLow(PushSrc::Bc)); }
+        0xD5 => { steps.push_back(MicroOp::DecSp); steps.push_back(MicroOp::PushHigh(PushSrc::De)); steps.push_back(MicroOp::PushLow(PushSrc::De)); }
+        0xE5 => { steps.push_back(MicroOp::DecSp); steps.push_back(MicroOp::PushHigh(PushSrc::Hl)); steps.push_back(MicroOp::PushLow(PushSrc::Hl)); }
+        0xF5 => { steps.push_back(MicroOp::DecSp); steps.push_back(MicroOp::PushHigh(PushSrc::Af)); steps.push_back(MicroOp::PushLow(PushSrc::Af)); }
+
+        // --- Famille POP rr : 3 M-cycles (fetch + PopToZ + PopMsb). Pas de drapeaux. ---
+        // GBCTR chapitre 6 : [SP]→lsb & SP+=1 (M2), [SP]→msb & SP+=1 & reg=WZ (M3). L'octet bas est poppé en premier.
+        0xC1 => { steps.push_back(MicroOp::PopToZ); steps.push_back(MicroOp::PopMsb(Reg16::Bc)); }
+        0xD1 => { steps.push_back(MicroOp::PopToZ); steps.push_back(MicroOp::PopMsb(Reg16::De)); }
+        0xE1 => { steps.push_back(MicroOp::PopToZ); steps.push_back(MicroOp::PopMsb(Reg16::Hl)); }
+        0xF1 => { steps.push_back(MicroOp::PopToZ); steps.push_back(MicroOp::PopMsb(Reg16::Af)); }
+
+        // --- Famille CALL a16 / CALL cc,a16 : 6 M-cycles pris, 3 non taken. Pas de drapeaux. ---
+        // GBCTR chapitre 6 : lsb→Z (M2), msb→W (M3), SP-=1 (M4), [SP]=msb(PC) & SP-=1 (M5), [SP]=lsb(PC) & PC=WZ (M6).
+        0xC4 | 0xCC | 0xD4 | 0xDC => {
+            let cond = (opcode >> 3) & 3; // bits 4-3 : 0=NZ, 1=Z, 2=NC, 3=C
+            let f = cpu.flags();
+            let taken = match cond {
+                0 => !f.contains(Flags::Z), // NZ
+                1 => f.contains(Flags::Z),  // Z
+                2 => !f.contains(Flags::C), // NC
+                _ => f.contains(Flags::C),  // C
+            };
+            steps.push_back(MicroOp::ReadPcByte);    // M2 : lsb → Z, PC+=1
+            steps.push_back(MicroOp::ReadPcByteW);   // M3 : msb → W, PC+=1 (passe les 2 octets)
+            if taken {
+                steps.push_back(MicroOp::DecSp);              // M4 : SP -= 1
+                steps.push_back(MicroOp::PushHigh(PushSrc::Pc)); // M5 : [SP]=msb(PC) & SP-=1
+                steps.push_back(MicroOp::PushLowJumpWz);        // M6 : [SP]=lsb(PC) & PC=WZ
+            }
+        }
+        0xCD => {
+            steps.push_back(MicroOp::ReadPcByte);    // M2 : lsb → Z, PC+=1
+            steps.push_back(MicroOp::ReadPcByteW);   // M3 : msb → W, PC+=1
+            steps.push_back(MicroOp::DecSp);              // M4 : SP -= 1
+            steps.push_back(MicroOp::PushHigh(PushSrc::Pc)); // M5 : [SP]=msb(PC) & SP-=1
+            steps.push_back(MicroOp::PushLowJumpWz);        // M6 : [SP]=lsb(PC) & PC=WZ
+        }
+
+        // --- Famille RET / RET cc / RETI : 4 (RET/RETI), 5 pris / 2 non taken (RET cc). Pas de drapeaux. ---
+        // GBCTR chapitre 6 : [SP]→lsb & SP+=1 (M2), [SP]→msb & SP+=1 (M3), PC=WZ (M4) [+ IME=1 for RETI].
+        0xC9 => { steps.push_back(MicroOp::PopToZ); steps.push_back(MicroOp::PopToW); steps.push_back(MicroOp::SetPcWz); }
+        0xD9 => { steps.push_back(MicroOp::PopToZ); steps.push_back(MicroOp::PopToW); steps.push_back(MicroOp::Reti); }
+        0xC0 | 0xC8 | 0xD0 | 0xD8 => {
+            let cond = (opcode >> 3) & 3; // bits 4-3 : 0=NZ, 1=Z, 2=NC, 3=C
+            let f = cpu.flags();
+            let taken = match cond {
+                0 => !f.contains(Flags::Z), // NZ
+                1 => f.contains(Flags::Z),  // Z
+                2 => !f.contains(Flags::C), // NC
+                _ => f.contains(Flags::C),  // C
+            };
+            if taken {
+                steps.push_back(MicroOp::PopToZ);   // M2 : [SP]→lsb & SP+=1
+                steps.push_back(MicroOp::PopToW);   // M3 : [SP]→msb & SP+=1
+                steps.push_back(MicroOp::SetPcWz);  // M4 : PC=WZ (premier demi-saut)
+                steps.push_back(MicroOp::Internal);  // M5 : second demi-saut (pas interne) — total 5 M-cycles
+            } else {
+                steps.push_back(MicroOp::Internal);  // M2 : condition non prise (pas interne) — total 2 M-cycles
+            }
+        }
+
+        // --- Famille RST n8 : 4 M-cycles. Pas de drapeaux. ---
+        // GBCTR chapitre 6 : SP-=1 (M2), [SP]=msb(PC) & SP-=1 (M3), [SP]=lsb(PC) & PC=n*8 (M4). L'octet haut est poussé en premier.
+        0xC7 | 0xCF | 0xD7 | 0xDF | 0xE7 | 0xEF | 0xF7 | 0xFF => {
+            let n7 = (opcode & 0x38) >> 3; // bits 5-3 : numéro de restart (vecteur = n7 * 8)
+            steps.push_back(MicroOp::DecSp);                    // M2 : SP -= 1
+            steps.push_back(MicroOp::PushHigh(PushSrc::Pc));   // M3 : [SP]=msb(PC) & SP-=1
+            steps.push_back(MicroOp::PushLowSetPc((n7 as u16) << 3)); // M4 : [SP]=lsb(PC) & PC=n*8
         }
 
         _ => return None,
@@ -1619,6 +1870,471 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Étape 2 point 4 : la famille PUSH rr portée en micro-ops consomme exactement 4 M-cycles (fetch + DecSp + PushHigh + PushLow),
+    /// l'octet haut est poussé en premier, and SP is decremented by 2 — vérifié M-cycle par M-cycle pour chaque opcode individuel.
+    #[test]
+    fn ported_push_family_interleaves_m_cycles() {
+        // (opcode, valeur du registre 16 bits poussé) — un cas par opcode individuel.
+        let cases: &[(u8, u16)] = &[
+            (0xC5, 0x1234), // PUSH BC
+            (0xD5, 0x5678), // PUSH DE
+            (0xE5, 0xC050), // PUSH HL
+            (0xF5, 0xABCD), // PUSH AF
+        ];
+        for &(opcode, reg_val) in cases {
+            let mut mmu = MMU::new();
+            let mut rom = vec![0x00u8; 0x4000];
+            rom[0x0100] = opcode;
+            mmu.load_rom(rom);
+            let mut cpu = CPU::new();
+            cpu.pc = 0x0100;
+            cpu.sp = 0xC050; // pile dans WRAM (toujours lisible/écritable)
+            match opcode {
+                0xC5 => { cpu.b = (reg_val >> 8) as u8; cpu.c = reg_val as u8; }
+                0xD5 => { cpu.d = (reg_val >> 8) as u8; cpu.e = reg_val as u8; }
+                0xE5 => { cpu.h = (reg_val >> 8) as u8; cpu.l = reg_val as u8; }
+                _ => { cpu.a = (reg_val >> 8) as u8; cpu.f = reg_val as u8; }
+            }
+            let msb = (reg_val >> 8) as u8;
+            let lsb = reg_val as u8;
+
+            let mut bus = Bus::new(&mut mmu);
+            // M-cycle #1 (le fetch) : SP inchangé, pile non écrite.
+            let (c1, _) = cpu.tick(&mut bus);
+            assert_eq!(c1, 4, "${:02X} : le fetch doit consommer exactement un M-cycle (4 T)", opcode);
+            assert!(cpu.in_progress.is_some(), "l'instruction doit être en cours après the fetch");
+            assert_eq!(cpu.sp, 0xC050, "${:02X} : SP inchangé pendant the fetch", opcode);
+
+            // M-cycle #2 (DecSp) : SP -= 1, pile non écrite encore.
+            let (c2, _) = cpu.tick(&mut bus);
+            assert_eq!(c2, 4, "${:02X} : DecSp doit consommer exactement un M-cycle (4 T)", opcode);
+            assert!(cpu.in_progress.is_some(), "l'instruction doit être en cours après DecSp");
+            assert_eq!(cpu.sp, 0xC04F, "${:02X} : SP décrémenté de 1 after DecSp", opcode);
+
+            // M-cycle #3 (PushHigh) : [SP]=msb & SP-=1. L'octet haut est écrit en premier.
+            let (c3, _) = cpu.tick(&mut bus);
+            assert_eq!(c3, 4, "${:02X} : PushHigh doit consommer exactement un M-cycle (4 T)", opcode);
+            assert!(cpu.in_progress.is_some(), "l'instruction doit être en cours after PushHigh");
+            assert_eq!(cpu.sp, 0xC04E, "${:02X} : SP décrémenté de 1 after PushHigh", opcode);
+            assert_eq!(bus.mmu.read(0xC04F), msb, "${:02X} : l'octet haut doit être écrit à [SP] au M-cycle #3", opcode);
+
+            // M-cycle #4 (PushLow) : [SP]=lsb. L'instruction is achevée.
+            let (c4, _) = cpu.tick(&mut bus);
+            assert_eq!(c4, 4, "${:02X} : PushLow doit consommer exactement un M-cycle (4 T)", opcode);
+            assert!(cpu.in_progress.is_none(), "l'instruction doit être achevée after PushLow");
+            assert_eq!(bus.mmu.read(0xC04E), lsb, "${:02X} : l'octet bas doit être écrit à [SP] au M-cycle #4", opcode);
+        }
+    }
+
+    /// Étape 2 point 4 : la famille POP rr portée en micro-ops consomme exactement 3 M-cycles (fetch + PopToZ + PopMsb),
+    /// l'octet bas is poppé en premier, and SP is incremented by 2 — vérifié M-cycle par M-cycle pour chaque opcode individuel.
+    #[test]
+    fn ported_pop_family_interleaves_m_cycles() {
+        // (opcode, valeur attendue du registre 16 bits après le POP) — un cas par opcode individuel.
+        // Pour AF : l'octet bas doit être une combinaison de drapeaux valide (bits 3-0 = 0), car F est masqué via set_flags.
+        let cases: &[(u8, u16)] = &[
+            (0xC1, 0x1234), // POP BC
+            (0xD1, 0x5678), // POP DE
+            (0xE1, 0xC050), // POP HL
+            (0xF1, 0xABD0), // POP AF : F=$D0 (Z|N|C) — octet bas déjà valide
+        ];
+        for &(opcode, expected_reg) in cases {
+            let mut mmu = MMU::new();
+            let mut rom = vec![0x00u8; 0x4000];
+            rom[0x0100] = opcode;
+            mmu.load_rom(rom);
+            let mut cpu = CPU::new();
+            cpu.pc = 0x0100;
+            cpu.sp = 0xC050; // pile dans WRAM
+            // La pile contient [SP]=lsb et [SP+1]=msb (comme après un PUSH).
+            mmu.write(0xC050, expected_reg as u8);         // lsb à [SP]
+            mmu.write(0xC051, (expected_reg >> 8) as u8); // msb à [SP+1]
+
+            let mut bus = Bus::new(&mut mmu);
+            // M-cycle #1 (le fetch) : SP inchangé, registre non modifié.
+            let (c1, _) = cpu.tick(&mut bus);
+            assert_eq!(c1, 4, "${:02X} : le fetch doit consommer exactement un M-cycle (4 T)", opcode);
+            assert!(cpu.in_progress.is_some(), "l'instruction doit être en cours après the fetch");
+            assert_eq!(cpu.sp, 0xC050, "${:02X} : SP inchangé pendant the fetch", opcode);
+
+            // M-cycle #2 (PopToZ) : Z=[SP] (=lsb), SP+=1. Le registre n'est pas encore chargé.
+            let (c2, _) = cpu.tick(&mut bus);
+            assert_eq!(c2, 4, "${:02X} : PopToZ doit consommer exactement un M-cycle (4 T)", opcode);
+            assert!(cpu.in_progress.is_some(), "l'instruction doit être en cours after PopToZ");
+            assert_eq!(cpu.sp, 0xC051, "${:02X} : SP incrémenté de 1 after PopToZ", opcode);
+
+            // M-cycle #3 (PopMsb) : W=[SP] (=msb), SP+=1, reg=WZ. L'instruction is achevée.
+            let (c3, _) = cpu.tick(&mut bus);
+            assert_eq!(c3, 4, "${:02X} : PopMsb doit consommer exactement un M-cycle (4 T)", opcode);
+            assert!(cpu.in_progress.is_none(), "l'instruction doit être achevée after PopMsb");
+            assert_eq!(cpu.sp, 0xC052, "${:02X} : SP incrémenté de 1 after PopMsb (total +2)", opcode);
+            let reg_val = match opcode {
+                0xC1 => ((cpu.b as u16) << 8) | cpu.c as u16,
+                0xD1 => ((cpu.d as u16) << 8) | cpu.e as u16,
+                0xE1 => ((cpu.h as u16) << 8) | cpu.l as u16,
+                _ => ((cpu.a as u16) << 8) | cpu.f as u16,
+            };
+            assert_eq!(reg_val, expected_reg, "${:02X} : le registre doit valoir ${:04X} after the POP", opcode, expected_reg);
+        }
+    }
+
+    /// Étape 2 point 4 : CALL a16 ($CD) consomme exactement 6 M-cycles (fetch + ReadPcByte + ReadPcByteW + DecSp + PushHigh + PushLowJumpWz),
+    /// l'octet haut du PC is poussé en premier, and the CPU saute à la cible — vérifié M-cycle par M-cycle.
+    #[test]
+    fn ported_call_a16_interleaves_m_cycles() {
+        let mut mmu = MMU::new();
+        let mut rom = vec![0x00u8; 0x4000];
+        rom[0x0100] = 0xCD; // CALL a16
+        rom[0x0101] = 0x34; // lsb de la cible ($1234)
+        rom[0x0102] = 0x12; // msb de la cible
+        mmu.load_rom(rom);
+        let mut cpu = CPU::new();
+        cpu.pc = 0x0100;
+        cpu.sp = 0xC050;
+
+        let mut bus = Bus::new(&mut mmu);
+        // M-cycle #1 (le fetch) : SP inchangé.
+        let (c1, _) = cpu.tick(&mut bus);
+        assert_eq!(c1, 4, "CALL a16 : le fetch doit consommer exactement un M-cycle (4 T)");
+        assert!(cpu.in_progress.is_some(), "l'instruction doit être en cours après the fetch");
+        assert_eq!(cpu.sp, 0xC050, "SP inchangé pendant the fetch");
+
+        // M-cycle #2 (ReadPcByte) : Z=lsb(cible), PC passe l'octet bas.
+        let (c2, _) = cpu.tick(&mut bus);
+        assert_eq!(c2, 4, "CALL a16 : ReadPcByte doit consommer exactement un M-cycle (4 T)");
+        assert!(cpu.in_progress.is_some(), "l'instruction doit être en cours after ReadPcByte");
+        assert_eq!(cpu.z, 0x34, "Z=lsb(cible)=$34 au M-cycle #2");
+        assert_eq!(cpu.pc, 0x0102, "PC passe l'octet bas au M-cycle #2");
+
+        // M-cycle #3 (ReadPcByteW) : W=msb(cible), PC passe l'octet haut.
+        let (c3, _) = cpu.tick(&mut bus);
+        assert_eq!(c3, 4, "CALL a16 : ReadPcByteW doit consommer exactement un M-cycle (4 T)");
+        assert!(cpu.in_progress.is_some(), "l'instruction doit être en cours after ReadPcByteW");
+        assert_eq!(cpu.w, 0x12, "W=msb(cible)=$12 au M-cycle #3");
+        assert_eq!(cpu.pc, 0x0103, "PC passe l'octet haut au M-cycle #3");
+
+        // M-cycle #4 (DecSp) : SP-=1.
+        let (c4, _) = cpu.tick(&mut bus);
+        assert_eq!(c4, 4, "CALL a16 : DecSp doit consommer exactement un M-cycle (4 T)");
+        assert!(cpu.in_progress.is_some(), "l'instruction doit être en cours after DecSp");
+        assert_eq!(cpu.sp, 0xC04F, "SP décrémenté de 1 au M-cycle #4");
+
+        // M-cycle #5 (PushHigh) : [SP]=msb(PC), SP-=1. L'octet haut du PC is poussé en premier.
+        let (c5, _) = cpu.tick(&mut bus);
+        assert_eq!(c5, 4, "CALL a16 : PushHigh doit consommer exactement un M-cycle (4 T)");
+        assert!(cpu.in_progress.is_some(), "l'instruction doit être en cours after PushHigh");
+        assert_eq!(cpu.sp, 0xC04E, "SP décrémenté de 1 au M-cycle #5");
+        assert_eq!(bus.mmu.read(0xC04F), 0x01, "[SP]=msb(PC)=$01 au M-cycle #5 (PC=0x0103)");
+
+        // M-cycle #6 (PushLowJumpWz) : [SP]=lsb(PC), PC=cible. L'instruction is achevée.
+        let (c6, _) = cpu.tick(&mut bus);
+        assert_eq!(c6, 4, "CALL a16 : PushLowJumpWz doit consommer exactement un M-cycle (4 T)");
+        assert!(cpu.in_progress.is_none(), "l'instruction doit être achevée after PushLowJumpWz");
+        assert_eq!(bus.mmu.read(0xC04E), 0x03, "[SP]=lsb(PC)=$03 au M-cycle #6 (PC=0x0103)");
+        assert_eq!(cpu.pc, 0x1234, "PC=cible=$1234 au M-cycle #6");
+    }
+
+    /// Étape 2 point 4 : CALL cc,a16 ($C4/$CC/$D4/$DC) consomme 6 M-cycles pris / 3 non taken — vérifié M-cycle par M-cycle.
+    #[test]
+    fn ported_call_cc_interleaves_m_cycles() {
+        // (opcode, flags pour which the condition is taken, flags for which it's not taken)
+        let cases: &[(u8, u8, u8)] = &[
+            (0xC4, 0x00, Flags::Z.bits()), // CALL NZ,a16 : taken si Z=0 ; not taken if Z=1
+            (0xCC, Flags::Z.bits(), 0x00), // CALL Z,a16 : taken if Z=1 ; not taken if Z=0
+            (0xD4, 0x00, Flags::C.bits()), // CALL NC,a16 : taken if C=0 ; not taken if C=1
+            (0xDC, Flags::C.bits(), 0x00), // CALL C,a16 : taken if C=1 ; not taken if C=0
+        ];
+        for &(opcode, flags_taken, flags_not) in cases {
+            // --- Cas pris : 6 M-cycles. ---
+            {
+                let mut mmu = MMU::new();
+                let mut rom = vec![0x00u8; 0x4000];
+                rom[0x0100] = opcode;
+                rom[0x0101] = 0x34; // lsb de la cible ($1234)
+                rom[0x0102] = 0x12; // msb de la cible
+                mmu.load_rom(rom);
+                let mut cpu = CPU::new();
+                cpu.pc = 0x0100;
+                cpu.sp = 0xC050;
+                cpu.f = flags_taken;
+
+                let mut bus = Bus::new(&mut mmu);
+                for m in 1..=6 {
+                    let (c, _) = cpu.tick(&mut bus);
+                    assert_eq!(c, 4, "${:02X} pris : M-cycle #{} doit consommer exactement un M-cycle (4 T)", opcode, m);
+                    if m < 6 {
+                        assert!(cpu.in_progress.is_some(), "${:02X} pris : l'instruction doit être en cours au M-cycle #{}", opcode, m);
+                    }
+                }
+                assert!(cpu.in_progress.is_none(), "${:02X} pris : l'instruction doit être achevée", opcode);
+                assert_eq!(cpu.pc, 0x1234, "${:02X} pris : PC=cible=$1234", opcode);
+                assert_eq!(cpu.sp, 0xC04E, "${:02X} pris : SP décrémenté de 2", opcode);
+            }
+
+            // --- Cas non taken : 3 M-cycles (fetch + ReadPcByte + ReadPcByteW). ---
+            {
+                let mut mmu = MMU::new();
+                let mut rom = vec![0x00u8; 0x4000];
+                rom[0x0100] = opcode;
+                rom[0x0101] = 0x34; // lsb de la cible (toujours lu, même si non taken)
+                rom[0x0102] = 0x12; // msb de la cible
+                mmu.load_rom(rom);
+                let mut cpu = CPU::new();
+                cpu.pc = 0x0100;
+                cpu.sp = 0xC050;
+                cpu.f = flags_not;
+
+                let mut bus = Bus::new(&mut mmu);
+                for m in 1..=3 {
+                    let (c, _) = cpu.tick(&mut bus);
+                    assert_eq!(c, 4, "${:02X} non taken : M-cycle #{} doit consommer exactement un M-cycle (4 T)", opcode, m);
+                    if m < 3 {
+                        assert!(cpu.in_progress.is_some(), "${:02X} non taken : l'instruction doit être en cours au M-cycle #{}", opcode, m);
+                    }
+                }
+                assert!(cpu.in_progress.is_none(), "${:02X} non taken : l'instruction doit être achevée", opcode);
+                assert_eq!(cpu.pc, 0x0103, "${:02X} non taken : PC passe les 2 octets de l'opérande (pas de saut)", opcode);
+                assert_eq!(cpu.sp, 0xC050, "${:02X} non taken : SP inchangé", opcode);
+            }
+        }
+    }
+
+    /// Étape 2 point 4 : RET ($C9) consomme exactly 4 M-cycles (fetch + PopToZ + PopToW + SetPcWz), and the CPU returns to the address on the stack — vérifié M-cycle par M-cycle.
+    #[test]
+    fn ported_ret_interleaves_m_cycles() {
+        let mut mmu = MMU::new();
+        let mut rom = vec![0x00u8; 0x4000];
+        rom[0x0100] = 0xC9; // RET
+        mmu.load_rom(rom);
+        let mut cpu = CPU::new();
+        cpu.pc = 0x0100;
+        cpu.sp = 0xC050;
+        mmu.write(0xC050, 0x34); // lsb de l'adresse de retour ($1234)
+        mmu.write(0xC051, 0x12); // msb de l'adresse de retour
+
+        let mut bus = Bus::new(&mut mmu);
+        // M-cycle #1 (le fetch) : SP inchangé.
+        let (c1, _) = cpu.tick(&mut bus);
+        assert_eq!(c1, 4, "RET : le fetch doit consommer exactement un M-cycle (4 T)");
+        assert!(cpu.in_progress.is_some(), "l'instruction doit être en cours après the fetch");
+        assert_eq!(cpu.sp, 0xC050, "SP inchangé pendant the fetch");
+
+        // M-cycle #2 (PopToZ) : Z=[SP] (=lsb), SP+=1.
+        let (c2, _) = cpu.tick(&mut bus);
+        assert_eq!(c2, 4, "RET : PopToZ doit consommer exactement un M-cycle (4 T)");
+        assert!(cpu.in_progress.is_some(), "l'instruction doit être en cours after PopToZ");
+        assert_eq!(cpu.z, 0x34, "Z=lsb(retour)=$34 au M-cycle #2");
+        assert_eq!(cpu.sp, 0xC051, "SP incrémenté de 1 au M-cycle #2");
+
+        // M-cycle #3 (PopToW) : W=[SP] (=msb), SP+=1.
+        let (c3, _) = cpu.tick(&mut bus);
+        assert_eq!(c3, 4, "RET : PopToW doit consommer exactement un M-cycle (4 T)");
+        assert!(cpu.in_progress.is_some(), "l'instruction doit être en cours after PopToW");
+        assert_eq!(cpu.w, 0x12, "W=msb(retour)=$12 au M-cycle #3");
+        assert_eq!(cpu.sp, 0xC052, "SP incrémenté de 1 au M-cycle #3 (total +2)");
+
+        // M-cycle #4 (SetPcWz) : PC=WZ. L'instruction is achevée.
+        let (c4, _) = cpu.tick(&mut bus);
+        assert_eq!(c4, 4, "RET : SetPcWz doit consommer exactement un M-cycle (4 T)");
+        assert!(cpu.in_progress.is_none(), "l'instruction doit être achevée after SetPcWz");
+        assert_eq!(cpu.pc, 0x1234, "PC=adresse de retour=$1234 au M-cycle #4");
+    }
+
+    /// Étape 2 point 4 : RETI ($D9) consomme exactly 4 M-cycles (fetch + PopToZ + PopToW + Reti), and the CPU returns to the address on the stack while réactivant IME — vérifié M-cycle par M-cycle.
+    #[test]
+    fn ported_reti_interleaves_m_cycles() {
+        let mut mmu = MMU::new();
+        let mut rom = vec![0x00u8; 0x4000];
+        rom[0x0100] = 0xD9; // RETI
+        mmu.load_rom(rom);
+        let mut cpu = CPU::new();
+        cpu.pc = 0x0100;
+        cpu.sp = 0xC050;
+        cpu.ime = false; // IME désactivé avant RETI : doit être réactivé
+        mmu.write(0xC050, 0x34); // lsb de l'adresse de retour ($1234)
+        mmu.write(0xC051, 0x12); // msb de l'adresse de retour
+
+        let mut bus = Bus::new(&mut mmu);
+        for m in 1..=3 {
+            let (c, _) = cpu.tick(&mut bus);
+            assert_eq!(c, 4, "RETI : M-cycle #{} doit consommer exactly un M-cycle (4 T)", m);
+            assert!(cpu.in_progress.is_some(), "l'instruction doit être en cours au M-cycle #{}", m);
+        }
+        let (c4, _) = cpu.tick(&mut bus);
+        assert_eq!(c4, 4, "RETI : le dernier M-cycle doit consommer exactly un M-cycle (4 T)");
+        assert!(cpu.in_progress.is_none(), "l'instruction doit être achevée");
+        assert_eq!(cpu.pc, 0x1234, "PC=adresse de retour=$1234");
+        assert!(cpu.ime, "IME must be réactivé by RETI");
+    }
+
+    /// Étape 2 point 4 : RET cc ($C0/$C8/$D0/$D8) consomme 5 M-cycles pris / 2 non taken — vérifié M-cycle par M-cycle.
+    #[test]
+    fn ported_ret_cc_interleaves_m_cycles() {
+        // (opcode, flags for which the condition is taken, flags for which it's not taken)
+        let cases: &[(u8, u8, u8)] = &[
+            (0xC0, 0x00, Flags::Z.bits()), // RET NZ : taken if Z=0 ; not taken if Z=1
+            (0xC8, Flags::Z.bits(), 0x00), // RET Z : taken if Z=1 ; not taken if Z=0
+            (0xD0, 0x00, Flags::C.bits()), // RET NC : taken if C=0 ; not taken if C=1
+            (0xD8, Flags::C.bits(), 0x00), // RET C : taken if C=1 ; not taken if C=0
+        ];
+        for &(opcode, flags_taken, flags_not) in cases {
+            // --- Cas pris : 5 M-cycles. ---
+            {
+                let mut mmu = MMU::new();
+                let mut rom = vec![0x00u8; 0x4000];
+                rom[0x0100] = opcode;
+                mmu.load_rom(rom);
+                let mut cpu = CPU::new();
+                cpu.pc = 0x0100;
+                cpu.sp = 0xC050;
+                cpu.f = flags_taken;
+                mmu.write(0xC050, 0x34); // lsb de l'adresse de retour ($1234)
+                mmu.write(0xC051, 0x12); // msb
+
+                let mut bus = Bus::new(&mut mmu);
+                for m in 1..=5 {
+                    let (c, _) = cpu.tick(&mut bus);
+                    assert_eq!(c, 4, "${:02X} pris : M-cycle #{} doit consommer exactly un M-cycle (4 T)", opcode, m);
+                    if m < 5 {
+                        assert!(cpu.in_progress.is_some(), "${:02X} pris : l'instruction doit être en cours au M-cycle #{}", opcode, m);
+                    }
+                }
+                assert!(cpu.in_progress.is_none(), "${:02X} pris : l'instruction doit être achevée", opcode);
+                assert_eq!(cpu.pc, 0x1234, "${:02X} pris : PC=adresse de retour=$1234", opcode);
+                assert_eq!(cpu.sp, 0xC052, "${:02X} pris : SP incrémenté de 2", opcode);
+            }
+
+            // --- Cas non taken : 2 M-cycles (fetch + Internal). ---
+            {
+                let mut mmu = MMU::new();
+                let mut rom = vec![0x00u8; 0x4000];
+                rom[0x0100] = opcode;
+                mmu.load_rom(rom);
+                let mut cpu = CPU::new();
+                cpu.pc = 0x0100;
+                cpu.sp = 0xC050;
+                cpu.f = flags_not;
+
+                let mut bus = Bus::new(&mut mmu);
+                for m in 1..=2 {
+                    let (c, _) = cpu.tick(&mut bus);
+                    assert_eq!(c, 4, "${:02X} non taken : M-cycle #{} doit consommer exactly un M-cycle (4 T)", opcode, m);
+                    if m < 2 {
+                        assert!(cpu.in_progress.is_some(), "${:02X} non taken : l'instruction doit être en cours au M-cycle #{}", opcode, m);
+                    }
+                }
+                assert!(cpu.in_progress.is_none(), "${:02X} non taken : l'instruction doit être achevée", opcode);
+                assert_eq!(cpu.pc, 0x0101, "${:02X} non taken : PC passe l'opcode (pas de retour)", opcode);
+                assert_eq!(cpu.sp, 0xC050, "${:02X} non taken : SP inchangé", opcode);
+            }
+        }
+    }
+
+    /// Étape 2 point 4 : RST n8 ($C7/$CF/$D7/$DF/$E7/$EF/$F7/$FF) consomme exactly 4 M-cycles (fetch + DecSp + PushHigh + PushLowSetPc),
+    /// l'octet haut du PC is poussé en premier, and the CPU saute au vecteur n*8 — vérifié M-cycle par M-cycle pour chaque opcode individuel.
+    #[test]
+    fn ported_rst_family_interleaves_m_cycles() {
+        // (opcode, vecteur attendu = n7 * 8) — un cas par opcode individuel.
+        let cases: &[(u8, u16)] = &[
+            (0xC7, 0x00), // RST $00
+            (0xCF, 0x08), // RST $08
+            (0xD7, 0x10), // RST $10
+            (0xDF, 0x18), // RST $18
+            (0xE7, 0x20), // RST $20
+            (0xEF, 0x28), // RST $28
+            (0xF7, 0x30), // RST $30
+            (0xFF, 0x38), // RST $38
+        ];
+        for &(opcode, vector) in cases {
+            let mut mmu = MMU::new();
+            let mut rom = vec![0x00u8; 0x4000];
+            rom[0x0100] = opcode;
+            mmu.load_rom(rom);
+            let mut cpu = CPU::new();
+            cpu.pc = 0x0100;
+            cpu.sp = 0xC050;
+
+            let mut bus = Bus::new(&mut mmu);
+            // M-cycle #1 (le fetch) : SP inchangé.
+            let (c1, _) = cpu.tick(&mut bus);
+            assert_eq!(c1, 4, "${:02X} : le fetch doit consommer exactly un M-cycle (4 T)", opcode);
+            assert!(cpu.in_progress.is_some(), "l'instruction doit être en cours après the fetch");
+            assert_eq!(cpu.sp, 0xC050, "${:02X} : SP inchangé pendant the fetch", opcode);
+
+            // M-cycle #2 (DecSp) : SP-=1.
+            let (c2, _) = cpu.tick(&mut bus);
+            assert_eq!(c2, 4, "${:02X} : DecSp doit consommer exactly un M-cycle (4 T)", opcode);
+            assert!(cpu.in_progress.is_some(), "l'instruction doit être en cours after DecSp");
+            assert_eq!(cpu.sp, 0xC04F, "${:02X} : SP décrémenté de 1 au M-cycle #2", opcode);
+
+            // M-cycle #3 (PushHigh) : [SP]=msb(PC), SP-=1. L'octet haut is poussé en premier.
+            let (c3, _) = cpu.tick(&mut bus);
+            assert_eq!(c3, 4, "${:02X} : PushHigh doit consommer exactly un M-cycle (4 T)", opcode);
+            assert!(cpu.in_progress.is_some(), "l'instruction doit être en cours after PushHigh");
+            assert_eq!(cpu.sp, 0xC04E, "${:02X} : SP décrémenté de 1 au M-cycle #3", opcode);
+            assert_eq!(bus.mmu.read(0xC04F), 0x01, "${:02X} : [SP]=msb(PC)=$01 au M-cycle #3 (PC=0x0101)", opcode);
+
+            // M-cycle #4 (PushLowSetPc) : [SP]=lsb(PC), PC=vecteur. L'instruction is achevée.
+            let (c4, _) = cpu.tick(&mut bus);
+            assert_eq!(c4, 4, "${:02X} : PushLowSetPc doit consommer exactly un M-cycle (4 T)", opcode);
+            assert!(cpu.in_progress.is_none(), "l'instruction doit être achevée after PushLowSetPc");
+            assert_eq!(bus.mmu.read(0xC04E), 0x01, "${:02X} : [SP]=lsb(PC)=$01 au M-cycle #4 (PC=0x0101)", opcode);
+            assert_eq!(cpu.pc, vector, "${:02X} : PC=vecteur=${:02X} au M-cycle #4", opcode, vector);
+        }
+    }
+
+    /// Étape 2 point 4 : le dispatch d'interruption consomme exactly 5 M-cycles (2 internes + DecSp + PushHigh + PushLowSetPc),
+    /// l'octet haut du PC is poussé en premier, and the CPU saute au vecteur — vérifié M-cycle par M-cycle.
+    #[test]
+    fn ported_interrupt_dispatch_interleaves_m_cycles() {
+        let mut mmu = MMU::new();
+        let rom = vec![0x00u8; 0x4000]; // ROM minimal : NOP partout
+        mmu.load_rom(rom);
+        let mut cpu = CPU::new();
+        cpu.pc = 0x0150;
+        cpu.sp = 0xC050;
+        cpu.ime = true;
+        mmu.io[0x0F] = 0x01; // V-Blank en attente
+        mmu.ie = 0x01;       // V-Blank activée
+
+        let steps = crate::cpu::opcodes::handle_interrupts(&mut cpu, &mut mmu).expect("une interruption est servie");
+        assert_eq!(steps.len(), 5, "le dispatch d'interruption doit contenir exactly 5 micro-ops (5 M-cycles)");
+        cpu.in_progress = Some(InProgress { steps });
+
+        let mut bus = Bus::new(&mut mmu);
+        // M-cycle #1 (Internal) : aucun changement.
+        let (c1, _) = cpu.tick(&mut bus);
+        assert_eq!(c1, 4, "interrupt dispatch : M-cycle #1 doit consommer exactly un M-cycle (4 T)");
+        assert!(cpu.in_progress.is_some(), "le dispatch doit être en cours au M-cycle #1");
+        assert_eq!(cpu.sp, 0xC050, "SP inchangé au M-cycle #1");
+
+        // M-cycle #2 (Internal) : aucun changement.
+        let (c2, _) = cpu.tick(&mut bus);
+        assert_eq!(c2, 4, "interrupt dispatch : M-cycle #2 doit consommer exactly un M-cycle (4 T)");
+        assert!(cpu.in_progress.is_some(), "le dispatch doit être en cours au M-cycle #2");
+        assert_eq!(cpu.sp, 0xC050, "SP inchangé au M-cycle #2");
+
+        // M-cycle #3 (DecSp) : SP-=1.
+        let (c3, _) = cpu.tick(&mut bus);
+        assert_eq!(c3, 4, "interrupt dispatch : M-cycle #3 doit consommer exactly un M-cycle (4 T)");
+        assert!(cpu.in_progress.is_some(), "le dispatch doit être en cours au M-cycle #3");
+        assert_eq!(cpu.sp, 0xC04F, "SP décrémenté de 1 au M-cycle #3");
+
+        // M-cycle #4 (PushHigh) : [SP]=msb(PC), SP-=1. L'octet haut is poussé en premier.
+        let (c4, _) = cpu.tick(&mut bus);
+        assert_eq!(c4, 4, "interrupt dispatch : M-cycle #4 doit consommer exactly un M-cycle (4 T)");
+        assert!(cpu.in_progress.is_some(), "le dispatch doit être en cours au M-cycle #4");
+        assert_eq!(cpu.sp, 0xC04E, "SP décrémenté de 1 au M-cycle #4");
+        assert_eq!(bus.mmu.read(0xC04F), 0x01, "[SP]=msb(PC)=$01 au M-cycle #4 (PC=0x0150)");
+
+        // M-cycle #5 (PushLowSetPc) : [SP]=lsb(PC), PC=vecteur. Le dispatch is achevée.
+        let (c5, _) = cpu.tick(&mut bus);
+        assert_eq!(c5, 4, "interrupt dispatch : M-cycle #5 doit consommer exactly un M-cycle (4 T)");
+        assert!(cpu.in_progress.is_none(), "le dispatch doit être achevée au M-cycle #5");
+        assert_eq!(bus.mmu.read(0xC04E), 0x50, "[SP]=lsb(PC)=$50 au M-cycle #5 (PC=0x0150)");
+        assert_eq!(cpu.pc, 0x40, "PC=vecteur V-Blank=$40 au M-cycle #5");
     }
 
     /// Étape 2 : la famille (HL) read-modify-write portée en micro-ops produit les mêmes effets d'observation que le chemin
